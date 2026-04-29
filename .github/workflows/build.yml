@@ -7,11 +7,16 @@ on:
         description: 'Build iOS IPA'
         type: boolean
         default: true
-           
+
 jobs:
   build_ios:
     runs-on: macos-latest
     if: ${{ inputs.build_ios }}
+
+    defaults:
+      run:
+        working-directory: app
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,8 +28,8 @@ jobs:
       - name: 💾 • Cache Node Modules
         uses: actions/cache@v4
         with:
-          path: node_modules
-          key: node-modules-${{ hashFiles('package.json') }}
+          path: app/node_modules
+          key: node-modules-${{ hashFiles('app/package.json') }}
           restore-keys: |
             node-modules-
 
@@ -35,9 +40,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ios/Pods
+            app/ios/Pods
             ~/.cocoapods
-          key: pods-${{ hashFiles('ios/Podfile.lock') }}
+          key: pods-${{ hashFiles('app/ios/Podfile.lock') }}
           restore-keys: |
             pods-
 
@@ -73,5 +78,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Movix
-          path: ios/build/Movix.ipa
+          path: app/ios/build/Movix.ipa
           if-no-files-found: error
