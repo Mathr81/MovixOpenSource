@@ -219,8 +219,8 @@ export default function SettingsScreen() {
 
         <Text style={styles.hint}>
           {uiPrefs.proxyEnabled
-            ? "Les requêtes du userscript passent par le proxy natif (contourne le CORS et injecte les headers). Si certaines sources ne se lancent pas, essaie de le désactiver."
-            : "Proxy désactivé : les requêtes s'exécutent directement dans le WebView (cookies de la page, soumises au CORS). La page est rechargée à chaque changement."}
+            ? "L'extension Movix est injectée : le site la détecte et route ses requêtes via le proxy natif (contourne le CORS, injecte les headers). Si certaines sources ne se lancent pas, désactive-le."
+            : "Extension désactivée : le site ne la détecte plus et utilise son propre chemin de requêtes. La page est rechargée à chaque changement."}
         </Text>
       </View>
 

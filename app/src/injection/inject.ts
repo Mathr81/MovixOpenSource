@@ -4,9 +4,13 @@ import { USERSCRIPT_SOURCE } from './userscript-source';
 
 export interface InjectOptions {
   /**
-   * Quand false, GM_xmlhttpRequest court-circuite le bridge natif et exécute
-   * les requêtes directement dans le WebView (cookies de la page, soumis au
-   * CORS). Utile quand le proxy natif casse certaines sources.
+   * Quand false, le userscript Movix n'est PAS injecté : le site ne détecte
+   * alors plus l'extension (drapeaux __MOVIX_EXTENSION_INSTALLED, etc.) et
+   * n'essaie pas de router ses requêtes via le proxy natif. Il retombe sur
+   * son propre chemin réseau — utile pour les sources que le proxy casse.
+   *
+   * Le bridge runtime et le cast shim restent injectés (capture console de
+   * debug + Chromecast).
    */
   proxyEnabled?: boolean;
 }
@@ -16,19 +20,17 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const bridge = buildBridgeRuntime();
   const castShim = buildCastShim();
 
-  // Flag lu par le bridge runtime (avant sa définition de GM_xmlhttpRequest).
-  const proxyFlag = `window.__MOVIX_PROXY_ENABLED = ${proxyEnabled ? 'true' : 'false'};`;
+  const userscript = proxyEnabled
+    ? `// --- Userscript Movix ---\n${USERSCRIPT_SOURCE}`
+    : '// --- Userscript Movix non injecté (proxy intégré désactivé) ---';
 
   // Cast shim FIRST — must be on window before any page JS runs.
   return `
-${proxyFlag}
-
 ${castShim}
 
 ${bridge}
 
-// --- Userscript Movix ---
-${USERSCRIPT_SOURCE}
+${userscript}
 
 true;
 `;
