@@ -1,16 +1,18 @@
-name: Build Applications
+name: Build iOS IPA (Unsigned)
 
 on:
   workflow_dispatch:
     inputs:
       build_ios:
-        description: 'Build iOS IPA'
+        description: 'Build iOS IPA (unsigned)'
         type: boolean
         default: true
 
 jobs:
   build_ios:
+    name: Build iOS IPA (unsigned)
     runs-on: macos-latest
+    timeout-minutes: 60
     if: ${{ inputs.build_ios }}
 
     defaults:
@@ -18,7 +20,8 @@ jobs:
         working-directory: app
 
     steps:
-      - uses: actions/checkout@v4
+      - name: ⬇️ • Checkout
+        uses: actions/checkout@v4
 
       - name: 📀 • Setup Node.js
         uses: actions/setup-node@v4
@@ -29,12 +32,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/node_modules
-          key: node-modules-${{ hashFiles('app/package.json') }}
+          key: node-modules-${{ hashFiles('app/package-lock.json') }}
           restore-keys: |
             node-modules-
 
       - name: 🗂️ • Install Node Dependencies
-        run: npm install --no-package-lock --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
+
+      - name: 💎 • Setup Ruby & CocoaPods 1.16.2
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: 🛠️ • Install xcpretty
+        run: gem install xcpretty --no-document
 
       - name: 💾 • Cache CocoaPods
         uses: actions/cache@v4
@@ -48,35 +60,43 @@ jobs:
 
       - name: 🍫 • Install CocoaPods
         run: |
-          cd ios
-          pod install
+          gem install cocoapods -v 1.16.2 --no-document
+          cd ios && pod install
 
-      - name: 🏗️ • Build iOS
+      - name: 📖 • Read app version
+        id: version
+        run: echo "version=$(jq -r '.version' version.json)" >> "$GITHUB_OUTPUT"
+
+      - name: 🏗️ • Build iOS Release
         run: |
+          set -eo pipefail
           cd ios
-          xcodebuild -workspace Movix.xcworkspace \
-                     -scheme "Movix" \
-                     -configuration Release \
-                     -destination generic/platform=iOS \
-                     -derivedDataPath ./build \
-                     IPHONEOS_DEPLOYMENT_TARGET=15.1 \
-                     CODE_SIGN_STYLE=Manual \
-                     CODE_SIGNING_ALLOWED=NO \
-                     CODE_SIGN_IDENTITY="" \
-                     ENABLE_USER_SCRIPT_SANDBOXING=NO
+          xcodebuild \
+            -workspace MovixApp.xcworkspace \
+            -scheme MovixApp \
+            -configuration Release \
+            -destination generic/platform=iOS \
+            -derivedDataPath ./build \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            2>&1 | xcpretty --color
 
-      - name: 📦 • Bundle IPA
+      - name: 📦 • Package IPA
         run: |
           cd ios
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/Movix.app Payload/
-          zip -r Movix.ipa Payload
-          mv Movix.ipa build/Movix.ipa
+          cp -r build/Build/Products/Release-iphoneos/MovixApp.app Payload/
+          zip -r MovixApp-${{ steps.version.outputs.version }}.ipa Payload
+          mv MovixApp-${{ steps.version.outputs.version }}.ipa build/
           rm -rf Payload
 
-      - name: 🌍 • Upload IPA
+      - name: 🌍 • Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Movix
-          path: app/ios/build/Movix.ipa
+          name: Movix-iOS-${{ steps.version.outputs.version }}
+          path: app/ios/build/MovixApp-${{ steps.version.outputs.version }}.ipa
+          retention-days: 30
           if-no-files-found: error
