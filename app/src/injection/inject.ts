@@ -1,5 +1,6 @@
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
+import { buildMediaSession } from './media-session';
 import { USERSCRIPT_SOURCE } from './userscript-source';
 
 export interface InjectOptions {
@@ -19,16 +20,21 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const { proxyEnabled = true } = options;
   const bridge = buildBridgeRuntime();
   const castShim = buildCastShim();
+  const mediaSession = buildMediaSession();
 
   const userscript = proxyEnabled
     ? `// --- Userscript Movix ---\n${USERSCRIPT_SOURCE}`
     : '// --- Userscript Movix non injecté (proxy intégré désactivé) ---';
 
   // Cast shim FIRST — must be on window before any page JS runs.
+  // Media Session : toujours injecté (jaquette notif + contrôles écran
+  // verrouillé + auto-PiP), indépendant du proxy.
   return `
 ${castShim}
 
 ${bridge}
+
+${mediaSession}
 
 ${userscript}
 

@@ -7,6 +7,7 @@
  */
 
 import { type RefObject } from 'react';
+import { NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   getCurrentDeviceName,
@@ -379,6 +380,22 @@ export async function handleBridgeMessage(
       const level = (p.level as LogLevel) || 'log';
       const args = Array.isArray(p.args) ? (p.args as unknown[]) : [];
       pushLog(level, 'web', args);
+      return;
+    }
+    // État de lecture (Media Session) — pilote le PiP Android via onUserLeaveHint.
+    // Sur iOS l'auto-PiP est géré nativement par WebKit (no-op ici).
+    if (p.type === 'MEDIA_PLAYBACK') {
+      if (Platform.OS === 'android') {
+        const playing = p.playing === true;
+        const pip = NativeModules.PipModule as
+          | { setVideoPlaying?: (b: boolean) => void }
+          | undefined;
+        try {
+          pip?.setVideoPlaying?.(playing);
+        } catch {
+          // Module absent (vieux build) — ignore silencieusement.
+        }
+      }
       return;
     }
   }

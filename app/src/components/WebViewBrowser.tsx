@@ -123,6 +123,11 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         mediaPlaybackRequiresUserAction={false}
         allowsInlineMediaPlayback={true}
         allowsFullscreenVideo={true}
+        // Picture-in-Picture : permet de garder la vidéo flottante quand on
+        // quitte l'app (iOS auto-PiP via video.autoPictureInPicture).
+        allowsPictureInPictureMediaPlayback={true}
+        // AirPlay natif depuis le lecteur web.
+        allowsAirPlayForMediaPlayback={true}
         allowsBackForwardNavigationGestures={true}
         // Sécurité
         originWhitelist={['https://*', 'http://*', 'about:*', 'blob:*']}
