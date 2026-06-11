@@ -216,6 +216,45 @@ export function buildBridgeRuntime(): string {
   // unsafeWindow = window (pas de sandboxing dans le WebView)
   window.unsafeWindow = window;
 
+  // --- iOS AirPlay picker acceleration ---
+  // HLSPlayer's startAirPlay() destroys the HLS.js instance (MSE is
+  // incompatible with AirPlay), sets video.src to the native URL, then
+  // waits for 'loadedmetadata' before calling webkitShowPlaybackTargetPicker().
+  // That wait (buffering a remote manifest) adds several seconds of delay.
+  // webkitShowPlaybackTargetPicker() does not need metadata to be loaded —
+  // it just shows the system AirPlay sheet. We dispatch a synthetic
+  // 'loadedmetadata' immediately after load() is called on an AirPlay-
+  // configured video with a real (non-blob) source, so the picker appears
+  // without waiting for the content to buffer.
+  (function() {
+    if (typeof HTMLVideoElement === 'undefined') return;
+    if (typeof HTMLVideoElement.prototype.webkitShowPlaybackTargetPicker !== 'function') return;
+
+    var _origLoad = HTMLVideoElement.prototype.load;
+    HTMLVideoElement.prototype.load = function() {
+      var video = this;
+      var src = video.src;
+      var isAirPlaySetup = src &&
+        src.indexOf('blob:') !== 0 &&
+        src !== location.href &&
+        video.getAttribute('x-webkit-airplay') === 'allow';
+
+      var result = _origLoad.call(video);
+
+      if (isAirPlaySetup) {
+        // Use setTimeout so we're still in the user-gesture activation chain
+        // (same as the existing async/await chain in startAirPlay).
+        setTimeout(function() {
+          if (video.readyState < 1) {
+            video.dispatchEvent(new Event('loadedmetadata'));
+          }
+        }, 0);
+      }
+
+      return result;
+    };
+  })();
+
   console.log('[Movix App] Bridge runtime initialisé');
 })();
 true;
