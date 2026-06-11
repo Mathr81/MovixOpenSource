@@ -1,4 +1,4 @@
-import { DeviceEventEmitter, NativeModules } from 'react-native';
+import { DeviceEventEmitter, NativeModules, Platform } from 'react-native';
 
 export type CastSessionState = 'idle' | 'starting' | 'connected' | 'ending';
 
@@ -29,6 +29,7 @@ function ensureModule(): CastModuleType {
 }
 
 export async function isCastSupported(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
   try {
     return await ensureModule().isSupported();
   } catch (err) {

@@ -1,7 +1,8 @@
 import React, { useState, useCallback, useEffect, memo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
 import {
     ArrowLeft, ArrowRight, Film, Tv, Calendar, Search,

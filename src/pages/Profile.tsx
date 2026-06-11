@@ -3,7 +3,8 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { X, Camera, Info, Film, Heart, Eye, List, Trash2 as TrashIcon, Bell, BellRing, Clock, Edit3, Monitor, Smartphone, Tablet, Copy, Settings, Shield, Activity, Play, Snowflake, Share2, Link2, Loader2, Globe, GripVertical } from 'lucide-react';
 import { Plus, Trash2, ArrowLeft, Calendar, Edit2, MoreVertical, Pencil } from 'lucide-react';
 import axios from 'axios';

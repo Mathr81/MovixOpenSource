@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useParams, Link } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Film, Calendar, Star, ArrowLeft, Info, Grid, List, Eye, EyeOff, Building, MapPin, Languages, DollarSign, TrendingUp, Heart, Bookmark, Plus } from 'lucide-react';
 import AddToListMenu from '../components/AddToListMenu';
 import { encodeId } from '../utils/idEncoder';

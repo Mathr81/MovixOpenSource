@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import emojiData from '@emoji-mart/data/sets/14/apple.json';
 
 interface EmojiAutocompleteProps {
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -16,21 +15,44 @@ interface EmojiMatch {
   name: string;
 }
 
-const allEmojis: EmojiMatch[] = Object.values((emojiData as any).emojis).map((e: any) => ({
-  id: e.id,
-  native: e.skins?.[0]?.native || '',
-  name: e.name,
-}));
+// Lazy-loaded module-level emoji index. Built once on first lookup that has 2+
+// chars after a `:`. The dataset is ~150 KB minified so we don't want it in the
+// initial bundle for routes that mount the textarea but never type a colon.
+let emojiIndexPromise: Promise<{
+  all: EmojiMatch[];
+  aliases: Record<string, string>;
+  byId: Record<string, any>;
+}> | null = null;
 
-const searchEmojis = (query: string): EmojiMatch[] => {
+const getEmojiIndex = () => {
+  if (emojiIndexPromise) return emojiIndexPromise;
+  emojiIndexPromise = (async () => {
+    const dataMod = await import('@emoji-mart/data/sets/14/apple.json');
+    const data: any = (dataMod as any).default ?? dataMod;
+    const all: EmojiMatch[] = Object.values(data.emojis).map((e: any) => ({
+      id: e.id,
+      native: e.skins?.[0]?.native || '',
+      name: e.name,
+    }));
+    return {
+      all,
+      aliases: data.aliases || {},
+      byId: data.emojis,
+    };
+  })();
+  return emojiIndexPromise;
+};
+
+const searchEmojisAsync = async (query: string): Promise<EmojiMatch[]> => {
   const q = query.toLowerCase();
   if (q.length < 2) return [];
 
-  const aliases = (emojiData as any).aliases || {};
+  const { all, aliases, byId } = await getEmojiIndex();
+
   const aliasMatches: EmojiMatch[] = [];
   for (const [alias, emojiId] of Object.entries(aliases)) {
     if (alias.startsWith(q)) {
-      const emoji = (emojiData as any).emojis[emojiId as string];
+      const emoji = byId[emojiId as string];
       if (emoji) {
         aliasMatches.push({
           id: alias,
@@ -41,7 +63,7 @@ const searchEmojis = (query: string): EmojiMatch[] => {
     }
   }
 
-  const idMatches = allEmojis.filter(
+  const idMatches = all.filter(
     (e) => e.id.startsWith(q) || e.id.includes(q)
   );
 
@@ -132,41 +154,47 @@ const EmojiAutocomplete: React.FC<EmojiAutocompleteProps> = ({ textareaRef, valu
       return;
     }
 
-    const matches = searchEmojis(result.query);
-    if (matches.length === 0) {
-      setShow(false);
-      setSuggestions([]);
-      return;
-    }
+    let cancelled = false;
+    (async () => {
+      const matches = await searchEmojisAsync(result.query);
+      if (cancelled) return;
+      if (matches.length === 0) {
+        setShow(false);
+        setSuggestions([]);
+        return;
+      }
 
-    setSuggestions(matches);
-    setColonIndex(result.colonIndex);
-    setSelectedIndex(0);
-    setShow(true);
+      setSuggestions(matches);
+      setColonIndex(result.colonIndex);
+      setSelectedIndex(0);
+      setShow(true);
 
-    // Position fixe dans le viewport (pour le portail)
-    const textarea = textareaRef.current;
-    if (textarea) {
-      const caretPos = getCaretCoordinates(textarea, result.colonIndex);
-      const textareaRect = textarea.getBoundingClientRect();
-      const lineHeight = parseInt(getComputedStyle(textarea).lineHeight) || 20;
+      // Position fixe dans le viewport (pour le portail)
+      const textarea = textareaRef.current;
+      if (textarea) {
+        const caretPos = getCaretCoordinates(textarea, result.colonIndex);
+        const textareaRect = textarea.getBoundingClientRect();
+        const lineHeight = parseInt(getComputedStyle(textarea).lineHeight) || 20;
 
-      // Position absolue du caret dans le viewport
-      const caretViewportTop = textareaRect.top + caretPos.top;
-      const caretViewportLeft = textareaRect.left + caretPos.left;
+        // Position absolue du caret dans le viewport
+        const caretViewportTop = textareaRect.top + caretPos.top;
+        const caretViewportLeft = textareaRect.left + caretPos.left;
 
-      // Déterminer si afficher au-dessus ou en-dessous
-      const dropdownHeight = Math.min(matches.length * 40, 280);
-      const spaceBelow = window.innerHeight - caretViewportTop - lineHeight;
-      const showAbove = spaceBelow < dropdownHeight + 20;
+        // Déterminer si afficher au-dessus ou en-dessous
+        const dropdownHeight = Math.min(matches.length * 40, 280);
+        const spaceBelow = window.innerHeight - caretViewportTop - lineHeight;
+        const showAbove = spaceBelow < dropdownHeight + 20;
 
-      setFixedPos({
-        top: showAbove
-          ? caretViewportTop - dropdownHeight - 4
-          : caretViewportTop + lineHeight + 4,
-        left: Math.max(8, Math.min(caretViewportLeft, window.innerWidth - DROPDOWN_WIDTH - 8)),
-      });
-    }
+        setFixedPos({
+          top: showAbove
+            ? caretViewportTop - dropdownHeight - 4
+            : caretViewportTop + lineHeight + 4,
+          left: Math.max(8, Math.min(caretViewportLeft, window.innerWidth - DROPDOWN_WIDTH - 8)),
+        });
+      }
+    })();
+
+    return () => { cancelled = true; };
   }, [value, getQuery, textareaRef]);
 
   const insertEmoji = useCallback((emoji: EmojiMatch) => {

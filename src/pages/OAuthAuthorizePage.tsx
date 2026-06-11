@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Link, useLocation, useSearchParams } from 'react-router-dom';
+import { useLocation, useSearchParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
-import { motion } from 'framer-motion';
-import { ArrowRight, Crown, ExternalLink, List, ShieldCheck, UserRound, UserRoundCog } from 'lucide-react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ArrowRight, Bell, BellPlus, BookmarkMinus, BookmarkPlus, ChevronDown, Crown, ExternalLink, Eye, EyeOff, FilePenLine, FolderPlus, FolderX, Heart, HeartHandshake, HeartOff, History, Library, List, ListChecks, ListMinus, ListPlus, PlayCircle, ShieldCheck, Star, StarOff, UserRound, UserRoundCog } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { discordAuth } from '../services/discordAuth';
 import { googleAuth } from '../services/googleAuth';
@@ -20,6 +21,7 @@ interface OAuthPreviewResponse {
     description?: string | null;
     homepageUrl?: string | null;
     logoUrl?: string | null;
+    iconUrl?: string | null;
     publicClient: boolean;
     requirePkce: boolean;
     allowedScopes: string[];
@@ -107,6 +109,201 @@ function formatTokenLifetime(ms: number, t: (key: string, options?: Record<strin
   return t('oauthAuthorize.tokenLifetimeHours', { count: hours });
 }
 
+// ─── Carte humoristique : ce que l'app NE demande PAS ─────────────────────
+// Affichée juste après la vraie liste de permissions. Pour rappeler aux gens
+// qu'ils donnent uniquement un accès limité — pas tous les droits sur leur
+// vie. Les strings vivent dans les fichiers i18n via la clé
+// `oauthAuthorize.fakeNotRequested` (array). Le fallback ci-dessous sert si
+// le bundle de traduction n'a pas chargé.
+const FAKE_NOT_REQUESTED_FALLBACK: string[] = [
+  'Hacker la NASA depuis ton frigo connecté',
+  'Te révéler les vrais codes de la Matrice',
+  'T\'expliquer le sens de la vie (spoiler : 42)',
+  'Te dire qui gagnera la Coupe du Monde 2034',
+  'Te dévoiler l\'identité réelle de Satoshi Nakamoto',
+  'Voler ton chat Pamplemousse à 3h du matin',
+  'Repasser ton chien à la vapeur',
+  'Dompter un lion adulte dans ton salon',
+  'Te faire pousser des dreadlocks en 48h',
+  'Te faire passer pour le Pape François',
+  'Réparer le télescope Hubble par WhatsApp',
+  'T\'envoyer en orbite basse sans casque',
+  'Convertir ton grille-pain en mineur de bitcoin',
+  'T\'apprendre l\'allemand en 12h chrono',
+  'Te masser les épaules pendant ton Zoom RH',
+  'Convaincre ton ex que c\'était sa faute',
+  'Bloquer ta belle-mère sur Facebook ET LinkedIn',
+  'Te désinscrire de tes 47 newsletters dormantes',
+  'Cacher ta télécommande dans le frigo',
+  'Reprogrammer ta machine à laver en mandarin',
+  'Cuire ton riz pendant exactement 17 minutes',
+  'Te chanter La Traviata sous la douche',
+  'T\'inscrire à Tinder en ton absence',
+  'Swiper à droite sur tous les profils de chats',
+  'Te faire perdre 5 kg en 2 jours (pas légal)',
+  'Te trouver un appart à Paris pour 400€/mois',
+  'Te calculer tes impôts en pré-vision 2030',
+  'Crier "ALEXAAA" dans tes oreilles à 4h du mat',
+  'Te commander 200 cure-dents sur Amazon',
+  'Voler les Ferrero Rocher cachés dans ton placard',
+  'Te chanter une berceuse en klingon',
+  'T\'expliquer pourquoi tes AirPods disparaissent',
+  'Régler ton réveil à 3h33 pile chaque nuit',
+  'Repeindre ton plafond en rose flashy à 4h du mat',
+  'Booter Windows XP sur ton iPhone',
+  'Installer Internet Explorer 6 par nostalgie',
+  'Mettre à jour Adobe Flash Player une dernière fois',
+  'Désinstaller McAfee qui spam depuis 2014',
+  'Cracker le WiFi du voisin (« Livebox-3F2A »)',
+  'Coller 12 stickers Hello Kitty sur ton frigo',
+  'Te faire devenir VIP gratis (jamais. JAMAIS.)',
+  'Servir un mojito à ton chat chaque vendredi',
+  'Te faire les ongles en gel pendant que tu dors',
+  'Couper tes cheveux à la tondeuse pour chien',
+  'Choisir ton fond d\'écran à ton insu (un cactus)',
+  'Envoyer un sms passif-agressif à ton ex',
+  'Te faire un CV avec WordArt 1997',
+  'T\'apprendre à tricoter une écharpe en mohair',
+  'Te donner la météo précise sur Mars',
+  'Te révéler la vérité sur le Père Noël',
+  'Décliner tes invitations LinkedIn par insultes',
+  'Te désinscrire de TikTok pendant ton sommeil',
+  'Te filer un cours de salsa cubaine en visio',
+  'Voler la TV 4K de ton voisin silencieusement',
+  'Réparer ton aspirateur qui refuse de démarrer',
+  'T\'organiser un dîner romantique avec ton boulanger',
+  'Cirer ton parquet flottant à la main',
+  'Faire ta lessive de noirs un mardi 13',
+  'Te commander une pizza 4 fromages à 2h du mat',
+  'T\'aider à craquer le code de Vinci',
+  'T\'apprendre à siffler en avalant',
+  'Te coiffer en hérisson sans gel',
+  'Te répondre à ton mail RH compliqué',
+  'Te trouver l\'âme sœur sur Vinted',
+  'T\'expliquer la blockchain à ta grand-mère',
+  'Tatouer "VIP" sur ton avant-bras pendant ta sieste',
+  'T\'apprendre à parler aux chats couramment',
+  'Te coder un site WordPress en COBOL',
+  'Te faire passer ton permis bateau en piscine',
+  'T\'envoyer Jeff Bezos en cadeau d\'anniversaire',
+  'Te transformer en NFT contre ton gré',
+  'T\'apprendre la danse classique pendant la sieste',
+  'Te révéler tous les codes du Konami',
+  'Te livrer ton café en drone à 6h pile',
+  'Te faire pleurer devant un sketch des Inconnus',
+  'T\'envoyer une lettre manuscrite en sumérien',
+  'Te trouver un job de testeur de matelas chez IKEA',
+  'T\'apprendre le solfège en braille inversé',
+  'Te faire un calendrier de l\'avent thème pickles',
+  'Voler ton vélo et te le rendre vendredi prochain',
+  'Te tricoter un pull pour ton aspirateur',
+];
+
+const FakePermissionsTeasingCard: React.FC = () => {
+  const { t } = useTranslation();
+  // Charge la liste traduite via returnObjects (i18next), avec fallback en
+  // dur si la clé n'existe pas (ex : bundle de traduction incomplet).
+  const fakeListRaw = t('oauthAuthorize.fakeNotRequested', { returnObjects: true });
+  const fakeList = Array.isArray(fakeListRaw) && fakeListRaw.length > 0
+    ? (fakeListRaw as string[])
+    : FAKE_NOT_REQUESTED_FALLBACK;
+  // useMemo sur la longueur — évite que les changements de référence du
+  // tableau retourné par t() repick une nouvelle ligne à chaque re-render.
+  const randomIdx = useMemo(
+    () => Math.floor(Math.random() * fakeList.length),
+    [fakeList.length],
+  );
+  const randomFake = fakeList[randomIdx] ?? '';
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5">
+      <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+        🚫 {t('oauthAuthorize.fakeNotRequestedTitle', 'Ce que Movix ne demande pas')}
+      </p>
+      <div className="mt-2 flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2">
+        <span className="shrink-0 text-red-400/70 leading-none">✗</span>
+        <p className="min-w-0 flex-1 text-sm text-gray-300 leading-snug">{randomFake}</p>
+      </div>
+    </div>
+  );
+};
+
+// ─── Accordéon des permissions demandées ────────────────────────────────
+// Fermé par défaut (les utilisateurs voient déjà le nombre via le badge),
+// ouvert au clic. Animation height + opacity via framer-motion.
+interface PermissionsAccordionProps {
+  requestedScopes: {
+    scope: string;
+    icon: typeof UserRound;
+    title: string;
+    description: string;
+  }[];
+  label: string;
+}
+
+const PermissionsAccordion: React.FC<PermissionsAccordionProps> = ({ requestedScopes, label }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20">
+      <button
+        type="button"
+        onClick={() => setIsOpen((v) => !v)}
+        aria-expanded={isOpen}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left transition-colors hover:bg-white/[0.02] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40 rounded-xl"
+      >
+        <div className="flex items-center gap-2">
+          <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+            {label}
+          </p>
+          <span className="rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[0.6rem] font-medium text-gray-300">
+            {requestedScopes.length}
+          </span>
+        </div>
+        <motion.div
+          animate={{ rotate: isOpen ? 180 : 0 }}
+          transition={{ duration: 0.2, ease: 'easeOut' }}
+          className="text-gray-400"
+        >
+          <ChevronDown className="h-4 w-4" />
+        </motion.div>
+      </button>
+      <AnimatePresence initial={false}>
+        {isOpen && (
+          <motion.div
+            key="content"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{
+              height: { duration: 0.28, ease: [0.4, 0, 0.2, 1] },
+              opacity: { duration: 0.18, ease: 'easeOut' },
+            }}
+            className="overflow-hidden"
+          >
+            <div className="space-y-1.5 px-3 pb-3 pt-1">
+              {requestedScopes.map((scopeItem) => {
+                const Icon = scopeItem.icon;
+                return (
+                  <div
+                    key={scopeItem.scope}
+                    className="flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2"
+                  >
+                    <div className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-red-200">
+                      <Icon className="h-3.5 w-3.5" />
+                    </div>
+                    <p className="min-w-0 truncate text-sm font-medium text-white">
+                      {scopeItem.title}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
 const OAuthAuthorizePage: React.FC = () => {
   const { t } = useTranslation();
   const location = useLocation();
@@ -180,6 +377,39 @@ const OAuthAuthorizePage: React.FC = () => {
       'profile.manage': { icon: UserRoundCog, titleKey: 'oauthAuthorize.scopes.profileManage.title', descKey: 'oauthAuthorize.scopes.profileManage.description' },
       'vip.read': { icon: ShieldCheck, titleKey: 'oauthAuthorize.scopes.vipRead.title', descKey: 'oauthAuthorize.scopes.vipRead.description' },
       'vip.manage': { icon: Crown, titleKey: 'oauthAuthorize.scopes.vipManage.title', descKey: 'oauthAuthorize.scopes.vipManage.description' },
+      // Favoris
+      'favorites.read':   { icon: Heart,       titleKey: 'oauthAuthorize.scopes.favoritesRead.title',   descKey: 'oauthAuthorize.scopes.favoritesRead.description' },
+      'favorites.add':    { icon: HeartHandshake, titleKey: 'oauthAuthorize.scopes.favoritesAdd.title',    descKey: 'oauthAuthorize.scopes.favoritesAdd.description' },
+      'favorites.remove': { icon: HeartOff,        titleKey: 'oauthAuthorize.scopes.favoritesRemove.title', descKey: 'oauthAuthorize.scopes.favoritesRemove.description' },
+      // Listes personnalisées
+      'lists.read':        { icon: Library,      titleKey: 'oauthAuthorize.scopes.listsRead.title',        descKey: 'oauthAuthorize.scopes.listsRead.description' },
+      'lists.create':      { icon: FolderPlus,   titleKey: 'oauthAuthorize.scopes.listsCreate.title',      descKey: 'oauthAuthorize.scopes.listsCreate.description' },
+      'lists.rename':      { icon: FilePenLine,  titleKey: 'oauthAuthorize.scopes.listsRename.title',      descKey: 'oauthAuthorize.scopes.listsRename.description' },
+      'lists.delete':      { icon: FolderX,      titleKey: 'oauthAuthorize.scopes.listsDelete.title',      descKey: 'oauthAuthorize.scopes.listsDelete.description' },
+      'lists.add-item':    { icon: ListPlus,     titleKey: 'oauthAuthorize.scopes.listsAddItem.title',     descKey: 'oauthAuthorize.scopes.listsAddItem.description' },
+      'lists.remove-item': { icon: ListMinus,    titleKey: 'oauthAuthorize.scopes.listsRemoveItem.title',  descKey: 'oauthAuthorize.scopes.listsRemoveItem.description' },
+      // Watchlist
+      'watchlist.read':    { icon: ListChecks,    titleKey: 'oauthAuthorize.scopes.watchlistRead.title',    descKey: 'oauthAuthorize.scopes.watchlistRead.description' },
+      'watchlist.add':     { icon: BookmarkPlus,  titleKey: 'oauthAuthorize.scopes.watchlistAdd.title',     descKey: 'oauthAuthorize.scopes.watchlistAdd.description' },
+      'watchlist.remove':  { icon: BookmarkMinus, titleKey: 'oauthAuthorize.scopes.watchlistRemove.title',  descKey: 'oauthAuthorize.scopes.watchlistRemove.description' },
+      // Historique
+      'history.read':   { icon: History, titleKey: 'oauthAuthorize.scopes.historyRead.title',   descKey: 'oauthAuthorize.scopes.historyRead.description' },
+      'history.add':    { icon: Eye,     titleKey: 'oauthAuthorize.scopes.historyAdd.title',    descKey: 'oauthAuthorize.scopes.historyAdd.description' },
+      'history.remove': { icon: EyeOff,  titleKey: 'oauthAuthorize.scopes.historyRemove.title', descKey: 'oauthAuthorize.scopes.historyRemove.description' },
+      // Continue watching
+      'continue-watching.read': { icon: PlayCircle, titleKey: 'oauthAuthorize.scopes.continueWatchingRead.title', descKey: 'oauthAuthorize.scopes.continueWatchingRead.description' },
+      // Alertes
+      'alerts.read':   { icon: Bell,     titleKey: 'oauthAuthorize.scopes.alertsRead.title',   descKey: 'oauthAuthorize.scopes.alertsRead.description' },
+      'alerts.manage': { icon: BellPlus, titleKey: 'oauthAuthorize.scopes.alertsManage.title', descKey: 'oauthAuthorize.scopes.alertsManage.description' },
+      // Ratings (notes personnelles)
+      'ratings.read':   { icon: Star,    titleKey: 'oauthAuthorize.scopes.ratingsRead.title',   descKey: 'oauthAuthorize.scopes.ratingsRead.description' },
+      'ratings.manage': { icon: StarOff, titleKey: 'oauthAuthorize.scopes.ratingsManage.title', descKey: 'oauthAuthorize.scopes.ratingsManage.description' },
+      // Note : `comments.read`, `wishboard.read`, `shared-lists.read`,
+      // `live-tv.read`, `vip-invoices.read` ont été retirés car les routes
+      // backend correspondantes sont soit publiques (top10, wishboard,
+      // shared-lists), soit utilisent un autre scope (vip.manage pour les
+      // invoices, x-access-key pour live TV). Les outils MCP marchent toujours
+      // — ils n'avaient juste pas besoin de scope OAuth dédié.
     };
 
     return (preview?.request.scopes || []).map((scope) => {
@@ -340,11 +570,18 @@ const OAuthAuthorizePage: React.FC = () => {
                 <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
                   <div className="flex items-center gap-3">
                     <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-white/5">
-                      {preview.client.logoUrl ? (
-                        <img src={preview.client.logoUrl} alt={preview.client.clientName} className="h-full w-full object-cover" />
-                      ) : (
-                        <ShieldCheck className="h-5 w-5 text-red-300" />
-                      )}
+                      {(() => {
+                        // iconUrl est servie par l'API (`/oauth-icons/...`) — préfixée par API_URL.
+                        // logoUrl peut être absolue (legacy) → on l'utilise telle quelle si présente.
+                        const iconSrc = preview.client.iconUrl
+                          ? `${API_URL}${preview.client.iconUrl}`
+                          : preview.client.logoUrl || null;
+                        return iconSrc ? (
+                          <img src={iconSrc} alt={preview.client.clientName} className="h-full w-full object-cover" />
+                        ) : (
+                          <ShieldCheck className="h-5 w-5 text-red-300" />
+                        );
+                      })()}
                     </div>
                     <div className="min-w-0 flex-1">
                       <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
@@ -392,26 +629,10 @@ const OAuthAuthorizePage: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5">
-                  <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
-                    {t('oauthAuthorize.permissionsLabel')}
-                  </p>
-                  <div className="mt-2 space-y-1.5">
-                    {requestedScopes.map((scopeItem) => {
-                      const Icon = scopeItem.icon;
-                      return (
-                        <div key={scopeItem.scope} className="flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2">
-                          <div className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-red-200">
-                            <Icon className="h-3.5 w-3.5" />
-                          </div>
-                          <p className="min-w-0 truncate text-sm font-medium text-white">
-                            {scopeItem.title}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
+                <PermissionsAccordion requestedScopes={requestedScopes} label={t('oauthAuthorize.permissionsLabel')} />
+
+                <FakePermissionsTeasingCard />
+
 
                 {authToken ? (
                   <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/10 px-3 py-2.5">

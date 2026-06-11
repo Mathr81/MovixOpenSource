@@ -58,16 +58,18 @@ function configure(deps) {
 // getFtvNextActionHash -- dynamically retrieve the Next.js server action hash
 // ---------------------------------------------------------------------------
 /**
- * Récupère dynamiquement le hash next-action depuis la page /recherche/
+ * Récupère dynamiquement le hash next-action depuis la page /recherche/.
  * Ce hash change à chaque redéploiement de france.tv (Next.js Server Actions).
  *
  * Étapes :
  * 1. GET https://www.france.tv/recherche/
- * 2. Trouver le <script src="/_next/static/chunks/app/recherche/page-XXXX.js">
- * 3. GET ce fichier JS
- * 4. Extraire le hash de createServerReference("HASH", ...)
+ * 2. Fallback rapide : essayer d'extraire $ACTION_ID_HASH inliné dans le HTML
+ * 3. Sinon, scanner TOUS les chunks /_next/static/chunks/*.js en parallèle
+ *    et chercher createServerReference("HASH", ..., "searchAction") dans chacun.
+ *    On exige le marqueur "searchAction" pour ne pas confondre avec les autres
+ *    Server Actions que Turbopack peut grouper dans le même chunk.
  *
- * Retente jusqu'à 3 fois en cas d'échec (connexion directe, sans proxy).
+ * Retente jusqu'à 3 fois en cas d'échec réseau.
  */
 async function getFtvNextActionHash() {
   const now = Date.now();
@@ -76,12 +78,12 @@ async function getFtvNextActionHash() {
   }
 
   const MAX_RETRIES = 3;
+  const SEARCH_ACTION_RE = /createServerReference\)?\s*\(\s*"([a-f0-9]{40,})"[^)]*?"searchAction"/;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     console.log(`[FTV] Fetching next-action hash (attempt ${attempt}/${MAX_RETRIES}, direct) ...`);
 
     try {
-      // Étape 1: Charger la page /recherche/
       const pageResponse = await axios.get(`${FTV_BASE}/recherche/`, {
         headers: { ...FTV_BROWSER_HEADERS },
         proxy: false,
@@ -92,17 +94,23 @@ async function getFtvNextActionHash() {
       const html = pageResponse.data;
       let hash = null;
 
-      // Étape 2: Trouver le script chunk de la page recherche
-      // Pattern: <script src="/_next/static/chunks/app/recherche/page-XXXX.js" async="">
-      const scriptMatch = html.match(/<script[^>]+src="(\/_next\/static\/chunks\/app\/recherche\/page-[^"]+\.js)"/);
+      // Fast path: hash inliné dans le HTML (certains layouts Next.js le font)
+      const inlineMatch = html.match(/\$ACTION_ID_([a-f0-9]{40,})/);
+      if (inlineMatch) {
+        hash = inlineMatch[1];
+        console.log(`[FTV] Found next-action hash inline in HTML: ${hash}`);
+      }
 
-      if (scriptMatch) {
-        const scriptUrl = `${FTV_BASE}${scriptMatch[1]}`;
-        console.log(`[FTV] Found recherche chunk: ${scriptUrl}`);
+      if (!hash) {
+        // Lister TOUS les chunks JS — Turbopack ne respecte plus la structure /app/PAGE/page-HASH.js
+        const chunkUrls = [...new Set(
+          [...html.matchAll(/<script[^>]+src="(\/_next\/static\/chunks\/[^"]+\.js)"/g)]
+            .map((m) => m[1])
+        )];
+        console.log(`[FTV] Scanning ${chunkUrls.length} chunks for searchAction reference...`);
 
-        // Étape 3: Télécharger le fichier JS
-        try {
-          const jsResponse = await axios.get(scriptUrl, {
+        const results = await Promise.allSettled(chunkUrls.map(async (url) => {
+          const res = await axios.get(`${FTV_BASE}${url}`, {
             headers: {
               'User-Agent': FTV_BROWSER_HEADERS['User-Agent'],
               'Accept': '*/*',
@@ -117,39 +125,18 @@ async function getFtvNextActionHash() {
               'Sec-Fetch-Site': 'same-origin',
             },
             proxy: false,
-            timeout: 15000,
+            timeout: 10000,
           });
+          const m = (typeof res.data === 'string' ? res.data : '').match(SEARCH_ACTION_RE);
+          return m ? m[1] : null;
+        }));
 
-          const jsCode = jsResponse.data;
-
-          // Étape 4: Extraire le hash de createServerReference("HASH", ...)
-          const serverRefMatch = jsCode.match(/createServerReference\)\s*\(\s*"([a-f0-9]{40,})"/);
-          if (serverRefMatch) {
-            hash = serverRefMatch[1];
-            console.log(`[FTV] Found next-action hash via createServerReference: ${hash}`);
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value) {
+            hash = r.value;
+            console.log(`[FTV] Found next-action hash in chunk: ${hash}`);
+            break;
           }
-
-          // Fallback: chercher aussi le pattern searchAction
-          if (!hash) {
-            const searchActionMatch = jsCode.match(/"([a-f0-9]{40,})"[^]*?"searchAction"/);
-            if (searchActionMatch) {
-              hash = searchActionMatch[1];
-              console.log(`[FTV] Found next-action hash via searchAction: ${hash}`);
-            }
-          }
-        } catch (jsErr) {
-          console.error(`[FTV] Error fetching JS chunk: ${jsErr.message}`);
-        }
-      } else {
-        console.warn('[FTV] Could not find recherche page chunk script tag');
-      }
-
-      // Fallback: chercher directement dans le HTML
-      if (!hash) {
-        const actionIdMatch = html.match(/\$ACTION_ID_([a-f0-9]{40,})/);
-        if (actionIdMatch) {
-          hash = actionIdMatch[1];
-          console.log(`[FTV] Found next-action hash via $ACTION_ID_ fallback: ${hash}`);
         }
       }
 
@@ -159,12 +146,11 @@ async function getFtvNextActionHash() {
         return hash;
       }
 
-      console.warn(`[FTV] Attempt ${attempt}: could not extract hash from page content`);
+      console.warn(`[FTV] Attempt ${attempt}: could not extract hash from page or chunks`);
     } catch (err) {
       console.error(`[FTV] Attempt ${attempt} failed (direct): ${err.response?.status || err.message}`);
       if (attempt < MAX_RETRIES) {
-        // Petit délai avant de retry avec un autre proxy
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
   }

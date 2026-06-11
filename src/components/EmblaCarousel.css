@@ -1,0 +1,114 @@
+/* Styles partagés des EmblaCarousel — extraits du <style> inline pour éviter
+   la ré-évaluation du template literal à chaque render du composant. */
+
+.embla-slide {
+  position: relative;
+  flex-shrink: 0;
+  contain: layout;
+}
+
+/* Skip layout/paint des slides hors viewport (CSS-native virtualization).
+   Embla calcule ses snaps sur le DOM logique (taille réservée), pas sur le
+   contenu peint. La taille intrinsèque 192×320 ≈ aspect-[2/3] de w-[192px]
+   + badges/marges. Browser support : Chrome/Edge 85+, Safari 18+, Firefox 125+.
+   Fallback gracieux (= comportement par défaut, pas de régression).
+
+   IMPORTANT — `:not(:has(.ranking-number))` : `content-visibility: auto` implique
+   `contain: paint`, qui clippe les descendants débordant la box. Le numéro
+   Top 10 est positionné en `left: -1.5rem; bottom: -0.75rem` avec font-size
+   9rem → il déborde sous/à gauche de la card et serait coupé. On exclut donc
+   les slides qui contiennent un ranking. `:has()` : Chrome 105+, Safari 15.4+,
+   Firefox 121+ (déjà aligné sur le reste du codebase). */
+.embla-slide:not(:has(.ranking-number)) {
+  content-visibility: auto;
+  contain-intrinsic-size: 192px 320px;
+}
+
+/* P5 — will-change: transform pré-promotion compositing layer (PC only).
+   Le container parent d'Embla est translaté pendant le scroll horizontal ;
+   avec chaque slide pré-promu en layer indépendant, la compose phase est
+   cheaper (translate de layers existants vs re-raster du parent qui
+   contiendrait tout dans un seul gros layer). Coût mémoire GPU : 5 carousels
+   × ~6 cards visibles × ~120 KB layer ≈ 4 MB sur Home, soutenable.
+
+   Scope PC via `(hover: hover)` : mobile = pas de lag observé + GPU plus
+   limité. `:not(:has(.ranking-number))` : même raison qu'au-dessus, l'override
+   `will-change` crée un stacking context qui pourrait clipper le digit
+   débordant du Top 10. */
+@media (hover: hover) {
+  .embla-slide:not(:has(.ranking-number)) {
+    will-change: transform;
+  }
+}
+
+/* Pendant le scroll (cf. useEmblaScrollSuppress + SmoothScroll), on coupe les
+   pointer events sur les slides : ça empêche le :hover de flipper en
+   permanence quand les cards défilent sous le curseur (chaque flip
+   déclenchait un cycle Layerize+Paint au compositor). */
+body.is-scrolling .embla-slide,
+body.embla-scrolling .embla-slide {
+  pointer-events: none;
+}
+
+/* Top 10 ranking number — Peephole : digit filled with poster, slow zoom.
+   L'animation `peephole-zoom` fait varier `background-size` 180% → 240% sur 8s
+   en alternance, donnant un effet de zoom-in/out subtil sur le mask. Le coût
+   est minime (1 carousel Top 10 × 30 cards) et la frame rate reste stable
+   parce que background-size ne déclenche que du paint (pas du layout) sur le
+   .ranking-number lui-même, pas sur ses ancêtres.
+
+   `text-shadow` au lieu de `filter: drop-shadow()` : ~10× moins coûteux côté
+   GPU, visuel quasi identique à cette taille. */
+.ranking-number {
+  position: absolute;
+  left: -1rem;
+  bottom: -0.5rem;
+  z-index: 5;
+  font-size: 6rem;
+  font-weight: 900;
+  line-height: 0.85;
+  user-select: none;
+  pointer-events: none;
+  font-family: 'Arial Black', 'Helvetica Neue', Impact, Arial, sans-serif;
+  letter-spacing: -0.08em;
+  color: transparent;
+  /* `auto 200%` = height 200% de la box, width auto (proportionnel). Le poster
+     TMDB est en 2:3 → width = 200% × (2/3) = 133% de la height. Pour les
+     digits étroits (ex. "1", "10", "11") le ratio bbox-text est très vertical,
+     et `180% auto` (ancien) calculait width=180% mais height auto pouvait
+     tomber SOUS 100% de la height de la box → bandes vides en haut/bas du
+     digit. `auto 200%` garantit que la height est toujours ≥ 200% donc le
+     digit est toujours rempli, peu importe sa largeur. */
+  background-size: auto 200%;
+  background-position: center;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-stroke: 1.5px rgba(239, 68, 68, 0.6);
+  text-stroke: 1.5px rgba(239, 68, 68, 0.6);
+  text-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
+  animation: peephole-zoom 8s ease-in-out infinite alternate;
+}
+
+@keyframes peephole-zoom {
+  from { background-size: auto 200%; }
+  to   { background-size: auto 240%; }
+}
+
+@media (min-width: 768px) {
+  .ranking-number {
+    left: -1.5rem;
+    bottom: -0.75rem;
+    font-size: 9rem;
+    -webkit-text-stroke: 2px rgba(239, 68, 68, 0.6);
+    text-stroke: 2px rgba(239, 68, 68, 0.6);
+  }
+}
+
+/* Reduced-motion — coupe l'animation peephole pour les utilisateurs qui
+   préfèrent moins de mouvement. */
+@media (prefers-reduced-motion: reduce) {
+  .ranking-number {
+    animation: none;
+  }
+}

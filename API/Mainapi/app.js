@@ -31,6 +31,8 @@ const {
   shouldUpdateCacheFrenchStream,
   shouldUpdateCacheLecteurVideo,
   shouldUpdateCache24h,
+  shouldUpdateCache48h,
+  generateCacheKey,
   CACHE_DIR,
 } = require("./utils/cacheManager");
 
@@ -64,6 +66,17 @@ const DARKIWORLD_BASE_URL = normalizeBaseUrl(
 const cookieJar = new tough.CookieJar();
 
 // === Darkino session & headers setup ===
+// UA + client hints stables (Chrome/Brave 148 Windows). darkiworld a une
+// limite de session par client, donc TOUTES les requêtes (refresh `/`,
+// /api/v1/titles/.../content/liens, /api/v1/download-premium/...,
+// seasons/episodes) doivent partager exactement ce fingerprint pour rester
+// sur une seule session côté upstream.
+//
+// Cookies + x-xsrf-token : viennent de l'env (DARKIWORLD_COOKIES /
+// DARKIWORLD_XSRF_TOKEN). cf_clearance volontairement absent de l'env :
+// Cloudflare le renouvelle régulièrement, le set-cookie de réponse arrive
+// dans le tough-cookie jar et `mergeCookieHeaders(jarState, configured)`
+// ajoute les cookies du jar absents de la string env sans écraser ceux fixés.
 const darkiHeaders = {
   accept: "application/json",
   "accept-encoding": "gzip, deflate, br",
@@ -72,18 +85,31 @@ const darkiHeaders = {
   cookie: process.env.DARKIWORLD_COOKIES || "",
   pragma: "no-cache",
   priority: "u=1, i",
+  "sec-ch-ua":
+    '"Chromium";v="148", "Brave";v="148", "Not/A)Brand";v="99"',
+  "sec-ch-ua-arch": '"x86"',
+  "sec-ch-ua-bitness": '"64"',
+  "sec-ch-ua-full-version-list":
+    '"Chromium";v="148.0.0.0", "Brave";v="148.0.0.0", "Not/A)Brand";v="99.0.0.0"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-model": '""',
+  "sec-ch-ua-platform": '"Windows"',
+  "sec-ch-ua-platform-version": '"19.0.0"',
   "sec-fetch-dest": "empty",
   "sec-fetch-mode": "cors",
   "sec-fetch-site": "same-origin",
+  "sec-gpc": "1",
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
   "x-xsrf-token": process.env.DARKIWORLD_XSRF_TOKEN || "",
 };
 
 // Coflix config
-const COFLIX_BASE_URL = "https://coflix.click";
+const COFLIX_BASE_URL = "https://coflix.date";
 const coflixHeaders = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-  Referer: "https://coflix.click",
+  Referer: "https://coflix.date",
 };
 
 // === Axios instances for each source ===
@@ -132,16 +158,32 @@ const axiosFStream = axios.create({
   decompress: true,
 });
 
-// Darkino session refresh
-let lastDarkinoHomeRequest = 0;
-const DARKINO_SESSION_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+// Darkino session refresh — coordonné via Redis pour qu'un SEUL worker du
+// cluster pinge l'upstream toutes les 10 minutes (et pas N workers en parallèle,
+// ce qui ferait exploser la limite de session côté darkiworld).
+const DARKINO_SESSION_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const DARKINO_REFRESH_LAST_KEY = "darkino:lastRefreshAt";
+const DARKINO_REFRESH_LOCK_KEY = "darkino:refreshLock";
+const DARKINO_REFRESH_LOCK_TTL_MS = 30 * 1000; // filet si le worker crash pendant le GET (axios timeout = 5s)
 
 const refreshDarkinoSessionIfNeeded = async () => {
-  const now = Date.now();
-  if (now - lastDarkinoHomeRequest > DARKINO_SESSION_REFRESH_INTERVAL) {
+  try {
+    const last = Number(await redis.get(DARKINO_REFRESH_LAST_KEY)) || 0;
+    if (Date.now() - last <= DARKINO_SESSION_REFRESH_INTERVAL) return;
+
+    // SET NX PX : seul le worker qui acquiert exécute le refresh, les autres no-op.
+    const acquired = await redis.set(
+      DARKINO_REFRESH_LOCK_KEY,
+      String(process.pid),
+      "PX",
+      DARKINO_REFRESH_LOCK_TTL_MS,
+      "NX",
+    );
+    if (!acquired) return;
+
     try {
       await axiosHelpers.axiosDarkinoRequest({ method: "get", url: "/" });
-      lastDarkinoHomeRequest = now;
+      await redis.set(DARKINO_REFRESH_LAST_KEY, String(Date.now()));
       console.log("[DARKINO] Session refreshed");
     } catch (error) {
       if (
@@ -150,7 +192,12 @@ const refreshDarkinoSessionIfNeeded = async () => {
       ) {
         console.error("[DARKINO] Failed to refresh session:", error.message);
       }
+    } finally {
+      await redis.del(DARKINO_REFRESH_LOCK_KEY).catch(() => {});
     }
+  } catch (_) {
+    // Redis down → skip silently. Pas de fallback in-memory : ce serait
+    // réintroduire le bug N-workers-refreshent-en-parallèle.
   }
 };
 
@@ -212,6 +259,20 @@ app.use(express.json({ limit: "30mb" })); // Reduced from 1000mb to prevent abus
 app.use(jsonParseErrorHandler);
 
 app.use(express.urlencoded({ extended: true, limit: "5mb" })); // Reduced from 1000mb to prevent abuse
+
+// 8. Serve uploaded OAuth app icons (`public/oauth-icons/<filename>`).
+//    Le panel admin upload ici, OAuthAuthorizePage lit `/oauth-icons/<filename>`.
+const { ICON_DIR: OAUTH_ICON_DIR } = require('./utils/oauthClientsDb');
+app.use(
+  '/oauth-icons',
+  express.static(OAUTH_ICON_DIR, {
+    fallthrough: false,
+    maxAge: '7d',
+    setHeaders: (res) => {
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    },
+  }),
+);
 
 // ==========================================================================
 // Configure route modules with dependencies from extracted utilities
@@ -359,7 +420,9 @@ darkiworldRouter.configure({
   saveToCache,
   shouldUpdateCache,
   shouldUpdateCache24h,
+  shouldUpdateCache48h,
   refreshDarkinoSessionIfNeeded,
+  redis,
 });
 
 // --- Configure voirdrama ---
@@ -410,6 +473,7 @@ app.use('/api/profiles', require('./routes/profiles'));
 app.use('/api/help', require('./routes/helpFeedback'));
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/oauth', oauthRouter);
+app.use('/api/admin/oauth-apps', require('./routes/adminOauthApps'));
 app.use('/api/sessions', require('./routes/sessions'));
 app.use('/api', require('./routes/debrid'));
 app.use('/proxy', require('./routes/proxy'));
@@ -483,6 +547,16 @@ const appReady = (async () => {
 
     await ensureOAuthStorage(pool);
     console.log('OAuth tables initialized successfully');
+
+      // OAuth client config (table oauth_clients + stats + grants VIP).
+      // ensureTables et migrateLegacyJsonIfNeeded sont protégés par le lock
+      // mais idempotents — sûr sur restart cluster. reloadCache hydrate
+      // le cache in-process de CE worker (chaque worker a le sien).
+      const oauthClientsDb = require('./utils/oauthClientsDb');
+      await oauthClientsDb.ensureTables();
+      await oauthClientsDb.migrateLegacyJsonIfNeeded();
+      await oauthClientsDb.reloadCache();
+      console.log('OAuth client tables initialized successfully');
 
       // Initialize Wishboard routes
       const { createWishboardRouter } = require("./wishboardRoutes");
@@ -587,6 +661,39 @@ const appReady = (async () => {
 // === Pool getter for other modules ===
 function getAppPool() {
   return getPool();
+}
+
+// === Hydracker queue drain timer ===
+// Every worker fires the tick. drainQueueOnce uses Redis worker_lock so only
+// one worker actually drains; the others get { drained: false, reason: 'lock_taken' }
+// and skip. This means the drain runs in a worker process which has full
+// darkiworld auth context (cookies, XSRF, darkiHeaders, axiosDarkinoRequest
+// configured via axiosHelpers.configure earlier in this file).
+const hydrackerQueue = require('./utils/hydrackerQueue');
+const DRAIN_INTERVAL_MS = 5000;
+if (hydrackerQueue.BATCHING_ENABLED) {
+  setInterval(async () => {
+    try {
+      const result = await hydrackerQueue.drainQueueOnce({
+        redis,
+        cacheDir: DOWNLOAD_CACHE_DIR,
+        generateCacheKey,
+        getFromCacheNoExpiration,
+        saveToCache,
+        axiosDarkinoRequest: axiosHelpers.axiosDarkinoRequest,
+        refreshDarkinoSessionIfNeeded
+      });
+      if (result.drained) {
+        console.log(`[hydracker] drained batch of ${result.batchSize}`);
+      } else if (result.error) {
+        console.warn(`[hydracker] drain error: ${result.error} (requeued ${result.requeued || 0})`);
+      }
+    } catch (e) {
+      console.warn(`[hydracker] drain tick threw:`, e?.message || e);
+    }
+  }, DRAIN_INTERVAL_MS);
+} else {
+  console.log('[hydracker] HYDRACKER_BATCHING_ENABLED=false → drain timer skipped, decode runs synchronously');
 }
 
 // === Unified error handler ===

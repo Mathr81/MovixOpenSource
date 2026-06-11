@@ -1,7 +1,33 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import Hls from 'hls.js';
-import { MediaPlayer } from 'dashjs';
-import mpegts from 'mpegts.js';
+import type HlsType from 'hls.js';
+import type * as DashjsType from 'dashjs';
+import type MpegtsType from 'mpegts.js';
+
+let HlsLib: typeof HlsType | null = null;
+let DashjsLib: typeof DashjsType | null = null;
+let MpegtsLib: typeof MpegtsType | null = null;
+
+const loadHls = async (): Promise<typeof HlsType> => {
+  if (HlsLib) return HlsLib;
+  const mod = await import('hls.js');
+  HlsLib = mod.default;
+  return HlsLib;
+};
+
+const loadDashjs = async (): Promise<typeof DashjsType> => {
+  if (DashjsLib) return DashjsLib;
+  // dashjs is ESM — `import('dashjs')` resolves to the namespace which already
+  // exposes `MediaPlayer` as a named export. No `.default` indirection needed.
+  DashjsLib = await import('dashjs');
+  return DashjsLib;
+};
+
+const loadMpegts = async (): Promise<typeof MpegtsType> => {
+  if (MpegtsLib) return MpegtsLib;
+  const mod = await import('mpegts.js');
+  MpegtsLib = mod.default;
+  return MpegtsLib;
+};
 import { motion, AnimatePresence } from 'framer-motion';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, X, Loader2, Volume1, Cast, Airplay, Settings, ArrowLeft, ExternalLink } from 'lucide-react';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
@@ -34,7 +60,9 @@ class ProxyLoader {
     private delegate: any;
 
     constructor(config: any) {
-        const DefaultLoader = (Hls.DefaultConfig as any).loader;
+        // ProxyLoader is only instantiated by HLS.js after `new Hls(...)` has run,
+        // which only happens after `loadHls()` has resolved. So HlsLib is set here.
+        const DefaultLoader = (HlsLib!.DefaultConfig as any).loader;
         this.delegate = new DefaultLoader(config);
     }
 
@@ -319,7 +347,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     // ... (refs and state)
     const videoRef = useRef<HTMLVideoElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
-    const hlsRef = useRef<Hls | null>(null);
+    const hlsRef = useRef<HlsType | null>(null);
     const dashRef = useRef<any>(null);
     const mpegtsRef = useRef<any>(null); // Ref for mpegts player
     const controlsTimeoutRef = useRef<NodeJS.Timeout>();
@@ -411,7 +439,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         }
     }, []);
 
-    const getLiveResyncPosition = useCallback((instance: Hls | null, video?: HTMLVideoElement | null) => {
+    const getLiveResyncPosition = useCallback((instance: HlsType | null, video?: HTMLVideoElement | null) => {
         if (!instance) return null;
 
         const liveSyncPosition = instance.liveSyncPosition;
@@ -448,7 +476,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         return null;
     }, []);
 
-    const seekToLiveEdge = useCallback((instance: Hls | null, video: HTMLVideoElement | null) => {
+    const seekToLiveEdge = useCallback((instance: HlsType | null, video: HTMLVideoElement | null) => {
         if (!instance || !video) return false;
 
         const targetPosition = getLiveResyncPosition(instance, video);
@@ -460,7 +488,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         return true;
     }, [getLiveResyncPosition]);
 
-    const scheduleHlsReinit = useCallback((instance: Hls | null, reason: string) => {
+    const scheduleHlsReinit = useCallback((instance: HlsType | null, reason: string) => {
         if (!instance || hlsRef.current !== instance) return;
         if (hlsRecoveryInFlightRef.current) {
             console.log(`[HLS] ${reason}: recovery already in flight`);
@@ -502,7 +530,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         }, 120);
     }, [clearHlsRecoveryTimeout, resetPauseState, resetVideoElement]);
 
-    const scheduleHlsLiveResync = useCallback((instance: Hls | null, reason: string) => {
+    const scheduleHlsLiveResync = useCallback((instance: HlsType | null, reason: string) => {
         if (!instance || hlsRef.current !== instance) return;
         if (hlsRecoveryInFlightRef.current) {
             console.log(`[HLS] ${reason}: recovery already in flight`);
@@ -833,6 +861,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         setIsLoading(true);
         setShowControls(true);
 
+        let cancelled = false;
         const isDash = streamUrl.endsWith('.mpd');
 
         // Check if we should force proxy (e.g. for HTTP streams or specific providers)
@@ -944,7 +973,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
         console.log('Player selection:', { isMpegTs, isDash, finalUrl });
 
-        if (isMpegTs && mpegts.isSupported()) {
+        // Lazy-load only the player lib actually needed for this stream type.
+        (async () => {
+        if (isMpegTs) {
+            const mpegts = await loadMpegts();
+            if (cancelled) return;
+            if (mpegts.isSupported()) {
             console.log('Initializing MPEG-TS player for:', finalUrl);
             const player = mpegts.createPlayer({
                 type: 'mpegts',  // could also be 'mse' type if content type is correct, but 'mpegts' is specific
@@ -985,8 +1019,12 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             // Loading handling
             video.addEventListener('playing', () => setIsLoading(false), { once: true });
+            }
 
         } else if (isDash) {
+            const dashjs = await loadDashjs();
+            if (cancelled) return;
+            const { MediaPlayer } = dashjs;
             // Initialize Dash Player
             const player = MediaPlayer().create();
             dashRef.current = player;
@@ -1020,7 +1058,10 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 }
             });
 
-        } else if (Hls.isSupported()) {
+        } else {
+            const Hls = await loadHls();
+            if (cancelled) return;
+            if (Hls.isSupported()) {
             // Initialize HLS Player
             const hlsConfig: any = {
                 enableWorker: true,
@@ -1324,16 +1365,19 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                     }
                 }
             });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Safari native HLS
-            video.src = finalUrl;
-            video.addEventListener('loadedmetadata', () => {
-                setIsLoading(false);
-                video.play().catch(console.error);
-            });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Safari native HLS
+                video.src = finalUrl;
+                video.addEventListener('loadedmetadata', () => {
+                    setIsLoading(false);
+                    video.play().catch(console.error);
+                });
+            }
         }
+        })();
 
         return () => {
+            cancelled = true;
             // Reset watchdog state on stream change
             stallCountRef.current = 0;
             lastTimeRef.current = 0;

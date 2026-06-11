@@ -1,13 +1,13 @@
 {
-  "version": "2.5.1",
-  "buildNumber": 10,
-  "apkUrl": "https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/app/movix-android.apk",
-  "apkSizeBytes": 72040798,
-  "apkSha256": "715544f47ad1aa7525081e07e7dfc892e58ba57b8419e5ec9d00c524527004c4",
+  "version": "2.5.3",
+  "buildNumber": 12,
+  "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
+  "apkSizeBytes": 72023883,
+  "apkSha256": "6e63593a1c47cee9cf60414219e4e05ef11c7a72e77256ebaffb65af1cc8e977",
   "mandatory": false,
-  "releasedAt": "2026-04-25T16:26:33.137Z",
+  "releasedAt": "2026-05-10T09:47:30.589Z",
   "releaseNotes": {
-    "fr": "",
+    "fr": "Correction extraction du lecteur Uqload\nL'écran se s'etteint plus lors de l'utilisation de l'app",
     "en": ""
   }
 }

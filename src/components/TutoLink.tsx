@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 
 interface TutoLinkProps {
   /** React Router route path (e.g. '/extension', '/app'). */

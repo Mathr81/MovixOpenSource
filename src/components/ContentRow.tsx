@@ -1,5 +1,5 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion } from 'framer-motion';
 import { ChevronLeft, ChevronRight, ImageOff } from 'lucide-react';
 import ContentRowSkeleton from './skeletons/ContentRowSkeleton';

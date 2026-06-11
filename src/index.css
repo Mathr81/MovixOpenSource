@@ -108,6 +108,33 @@ body.embla-scrolling .embla-slide {
   }
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   Reduced-motion global — kill switch a11y
+   ──────────────────────────────────────────────────────────────────────────
+   Pattern recommandé W3C/MDN : on ne supprime pas les transitions/animations
+   (qui cassent souvent l'UI — un menu qui s'ouvre attend la fin de la
+   transition), on les ramène à ~instantané (0.01ms). Itération à 1 pour les
+   keyframes infinies (pulse, spin, particles).
+
+   Lenis et HeroSlider lisent déjà `prefers-reduced-motion` côté JS pour se
+   couper proprement ; cette règle CSS attrape tout le reste (Tailwind animate-*,
+   framer-motion sans `useReducedMotion`, transitions ad-hoc) en une passe.
+
+   Sources :
+   - https://www.w3.org/WAI/WCAG22/Understanding/animation-from-interactions
+   - https://developer.mozilla.org/en-US/docs/Web/CSS/@media/prefers-reduced-motion
+   ────────────────────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @keyframes background-pan {
   0% {
     background-position: 0% center;

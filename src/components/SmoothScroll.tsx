@@ -236,6 +236,10 @@ const SmoothScroll = () => {
         wheelMultiplier: preset.wheelMultiplier,
         touchMultiplier: 2,
         prevent: shouldPreventLenis,
+        // Lenis 1.3 : stoppe l'inertie en cours quand l'utilisateur navigue
+        // vers une nouvelle route. Évite qu'un scroll en cours sur Home
+        // continue à défiler la nouvelle page après le pushState.
+        stopInertiaOnNavigate: true,
       });
 
       // Wrap scrollTo pour relancer le RAF sur scroll programmatique.

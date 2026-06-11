@@ -5,7 +5,73 @@ const DEFAULT_MIRRORS = __MOVIX_DEFAULT_MIRRORS__;
 const CONFIG_URL = __MOVIX_CONFIG_URL__;
 const NAV_TIMEOUT_MS = 3000;
 const CONFIG_TIMEOUT_MS = 3000;
+// Ping de confirmation sur un asset statique de l'origine. Volontairement
+// généreux : sur mobile, sortir de veille peut prendre 3-5s (DNS + TLS +
+// radio cellulaire qui se réveille). Si même ce ping fail, l'origine est
+// vraiment injoignable.
+const REACHABILITY_TIMEOUT_MS = 4000;
+const REACHABILITY_PROBE_PATH = '/movix.png';
 const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+
+// ============================================================================
+// Image cache — TMDB images (posters, backdrops, logos)
+// ============================================================================
+//
+// Stratégie : cache-first sur image.tmdb.org. Premier hit = network + cache,
+// hits suivants = direct depuis CacheStorage (instantané, no network).
+//
+// Bonus : queue de concurrence côté SW, cap à 6 simultanés. Sans throttle,
+// le navigateur peut déclencher 30+ fetchs parallèles au mount du home.
+//
+// Bump IMAGE_CACHE_NAME pour invalider toutes les images cachées d'un coup
+// (ex. quand on change la taille standard w500→w342 — sinon on continue à
+// servir les vieilles URLs pendant des semaines). v2 = passage à w342 posters
+// + w300 logos.
+const IMAGE_CACHE_NAME = 'movix-tmdb-images-v2';
+const TMDB_IMAGE_HOST = 'image.tmdb.org';
+const MAX_CONCURRENT_IMAGE_FETCHES = 6;
+let activeImageFetches = 0;
+const imageFetchQueue = [];
+
+function acquireImageFetchSlot() {
+  return new Promise((resolve) => {
+    if (activeImageFetches < MAX_CONCURRENT_IMAGE_FETCHES) {
+      activeImageFetches++;
+      resolve();
+    } else {
+      imageFetchQueue.push(resolve);
+    }
+  });
+}
+
+function releaseImageFetchSlot() {
+  const next = imageFetchQueue.shift();
+  if (next) {
+    next();
+  } else {
+    activeImageFetches = Math.max(0, activeImageFetches - 1);
+  }
+}
+
+async function handleTmdbImage(req) {
+  const cache = await caches.open(IMAGE_CACHE_NAME);
+  const cached = await cache.match(req);
+  if (cached) return cached;
+
+  await acquireImageFetchSlot();
+  try {
+    const res = await fetch(req);
+    if (res && (res.ok || res.type === 'opaque')) {
+      // .clone() avant .put() : la response ne peut être consommée qu'une fois.
+      // .catch silently : QuotaExceededError quand storage full → on sert la
+      // réponse non-cachée à l'utilisateur, qui marche quand même.
+      cache.put(req, res.clone()).catch(() => {});
+    }
+    return res;
+  } finally {
+    releaseImageFetchSlot();
+  }
+}
 
 // ============================================================================
 // Helpers fallback domain
@@ -89,6 +155,15 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function buildMirrorUrl(targetHost, { from, reason, error, via } = {}) {
+  const url = new URL(`https://${targetHost}/`);
+  if (from)   url.searchParams.set('from', from);
+  if (reason) url.searchParams.set('reason', reason);
+  if (error)  url.searchParams.set('error', String(error).slice(0, 100));
+  if (via)    url.searchParams.set('via', via);
+  return url.href;
 }
 
 function renderRedirectPage(url) {
@@ -186,7 +261,15 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
+      // Préserve le cache d'images courant ; supprime tout le reste (anciennes
+      // versions de cache, caches légacy d'avant cette logique). Quand on bumpe
+      // IMAGE_CACHE_NAME (ex. v1 → v2), l'ancienne version sera supprimée ici
+      // automatiquement.
+      await Promise.all(
+        keys
+          .filter((k) => k !== IMAGE_CACHE_NAME)
+          .map((k) => caches.delete(k))
+      );
       await self.clients.claim();
     })()
   );
@@ -236,6 +319,48 @@ self.addEventListener('notificationclick', (event) => {
 // Fetch — intercepte les navigations top-level pour fallback domain
 // ============================================================================
 
+// Ping de confirmation : l'origine répond-elle réellement ? Utilisé pour
+// distinguer un VRAI blocage FAI (toute l'origine bloquée) d'un échec
+// transient (mobile qui sort de veille, throttling de tab background, blip
+// réseau). On vise un asset statique stable, cache: 'no-store' pour forcer
+// un round-trip frais.
+async function probeOriginOnce() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REACHABILITY_TIMEOUT_MS);
+  try {
+    const url = new URL(REACHABILITY_PROBE_PATH, self.location.origin).href;
+    const res = await fetch(`${url}?_swprobe=${Date.now()}`, {
+      method: 'HEAD',
+      cache: 'no-store',
+      signal: controller.signal,
+      credentials: 'omit',
+      redirect: 'manual',
+    });
+    clearTimeout(timer);
+    // 2xx, 3xx, 4xx = origine répond (même un 404 confirme que le serveur
+    // est joignable). Seul un échec réseau ou un 5xx massif = injoignable.
+    return res.status < 500;
+  } catch {
+    clearTimeout(timer);
+    return false;
+  }
+}
+
+// Deux tentatives avant de conclure à un blocage. Un seul HEAD raté n'est
+// pas un signal suffisant : un blip réseau ponctuel (perte de paquet, switch
+// de cell tower, throttling court) peut le faire échouer. Si la 1ère échoue
+// on attend 500ms et on retente — un VRAI blocage FAI est persistant et
+// échouera les deux fois ; un blip transient laissera passer la 2ème.
+async function isOriginReachable() {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  const first = await probeOriginOnce();
+  if (first) return true;
+  await new Promise((r) => setTimeout(r, 500));
+  return await probeOriginOnce();
+}
+
 async function handleNavigation(req) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NAV_TIMEOUT_MS);
@@ -249,21 +374,51 @@ async function handleNavigation(req) {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       throw err;
     }
-    return await redirectToMirror();
+    // Confirmation : l'origine est-elle vraiment injoignable ? Sinon (mobile
+    // qui se réveille, network blip, tab throttlé), on relaie l'erreur
+    // d'origine et on laisse le browser gérer (retry naturel, page d'erreur).
+    // On ne bascule au miroir QUE si même un HEAD simple échoue.
+    const reachable = await isOriginReachable();
+    if (reachable) {
+      throw err;
+    }
+    return await redirectToMirror({
+      from: self.location.hostname,
+      reason: 'unreachable',
+      error: `${err.name}: ${err.message}`,
+      via: 'sw-fetch',
+    });
   }
 }
 
-async function redirectToMirror() {
+async function redirectToMirror({ from, reason, error, via } = {}) {
   const mirrors = await loadMirrors();
   const target = pickNextMirror(mirrors, self.location.hostname);
   if (!target) return render503Page();
-  const redirectUrl = `https://${target}/`;
+  const redirectUrl = buildMirrorUrl(target, { from, reason, error, via });
   return renderRedirectPage(redirectUrl);
 }
 
 self.addEventListener('fetch', (event) => {
   const req = event.request;
-  if (req.mode !== 'navigate' || req.method !== 'GET') return;
+  if (req.method !== 'GET') return;
+
+  // 1. TMDB image cache — intercepte tous les GET sur image.tmdb.org peu
+  // importe l'origine du SW. Pas de garde localhost ici : le cache est utile
+  // aussi en dev pour éviter de re-fetcher les mêmes posters à chaque reload.
+  let url;
+  try {
+    url = new URL(req.url);
+  } catch {
+    return;
+  }
+  if (url.hostname === TMDB_IMAGE_HOST) {
+    event.respondWith(handleTmdbImage(req));
+    return;
+  }
+
+  // 2. Navigation fallback (logique existante — préservée)
+  if (req.mode !== 'navigate') return;
   if (isLocalHost(self.location.hostname)) return;
   event.respondWith(handleNavigation(req));
 });
@@ -277,10 +432,21 @@ self.addEventListener('message', async (event) => {
   if (!data || data.type !== 'MOVIX_FORCE_REDIRECT') return;
   if (isLocalHost(self.location.hostname)) return;
   try {
+    // Garde-fou : la page peut compter ses erreurs de manière trop
+    // optimiste (burst d'API calls qui fail au réveil mobile). On confirme
+    // avant de rediriger — sinon on enverrait l'utilisateur sur un miroir
+    // alors que l'origine répond très bien.
+    const reachable = await isOriginReachable();
+    if (reachable) return;
     const mirrors = await loadMirrors();
     const target = pickNextMirror(mirrors, self.location.hostname);
     if (!target) return;
-    const url = `https://${target}/`;
+    const url = buildMirrorUrl(target, {
+      from: self.location.hostname,
+      reason: 'api-errors',
+      error: data.error || 'API error threshold reached',
+      via: 'sw-message',
+    });
     event.source?.postMessage({ type: 'MOVIX_REDIRECT_TO', url });
   } catch {}
 });

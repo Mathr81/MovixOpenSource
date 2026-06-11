@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { Link } from "react-router-dom";
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Play, ShieldAlert, Settings, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAdFreePopup } from "../context/AdFreePopupContext";

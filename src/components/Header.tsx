@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Snowfall from 'react-snowfall';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Film, Search, Menu, X, Star, Tv2, Users, Clapperboard, Bell, Tv, Lightbulb, Network, List, Radio, Unlock, ChevronDown, ExternalLink, LayoutGrid, Settings, Dices, Sparkles, HelpCircle, Github } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ProfileMenu from './ProfileMenu';
@@ -284,7 +285,9 @@ const Header: React.FC = () => {
         dropdownRafIdRef.current = null;
       }
     };
-  }, [showAutocomplete, autocompleteSuggestions, isMobileSearchOpen]);
+  // autocompleteSuggestions intentionally excluded — body doesn't reference it;
+  // including it churns listener registration on every keystroke
+  }, [showAutocomplete, isMobileSearchOpen]);
 
   // Focus mobile search input when opened
   useEffect(() => {
@@ -599,8 +602,18 @@ const Header: React.FC = () => {
               borderColor="rgba(239, 68, 68, 0.2)"
               className="h-full bg-black"
             >
-              {/* Glow effects */}
-              <div className="absolute top-20 left-1/2 -translate-x-1/2 w-[400px] h-[400px] bg-red-600/8 rounded-full blur-[100px] pointer-events-none" />
+              {/* Glow effects — radial-gradient au lieu de blur-[100px].
+                  Le blur 100px sur un 400×400 coûte ~3-5ms/frame en composit GPU
+                  tant que le menu est ouvert (coût ∝ rayon²). Le radial-gradient
+                  donne visuellement le même halo doux sans toucher au filter
+                  pipeline → ~0ms. */}
+              <div
+                className="absolute top-0 left-1/2 -translate-x-1/2 w-[600px] h-[600px] pointer-events-none"
+                style={{
+                  background:
+                    'radial-gradient(circle, rgba(220, 38, 38, 0.18) 0%, rgba(220, 38, 38, 0.08) 35%, transparent 70%)',
+                }}
+              />
               <div className="absolute bottom-0 left-0 right-0 h-[200px] bg-gradient-to-t from-red-950/15 to-transparent pointer-events-none" />
 
               {/* Contenu scrollable */}
@@ -646,7 +659,7 @@ const Header: React.FC = () => {
       <AnimatePresence>
         {isMobileSearchOpen && (
           <motion.div
-            className="md:hidden fixed inset-x-0 top-0 z-[11002] bg-black/95 backdrop-blur-md p-4"
+            className="md:hidden fixed inset-x-0 top-0 z-[11002] bg-black/95 p-4"
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
@@ -681,7 +694,7 @@ const Header: React.FC = () => {
         {showAutocomplete && autocompleteSuggestions.length > 0 && (
           <motion.div
             ref={autocompleteRef}
-            className="bg-black/95 backdrop-blur-md border border-white/15 rounded-xl shadow-2xl z-[12000] overflow-hidden"
+            className="bg-black/95 border border-white/15 rounded-xl shadow-2xl z-[12000] overflow-hidden"
             style={dropdownStyle}
             initial={{ opacity: 0, y: -4 }}
             animate={{ opacity: 1, y: 0 }}

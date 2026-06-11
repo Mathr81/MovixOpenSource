@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
 import {
   Clapperboard,
@@ -46,7 +46,7 @@ const AprilFoolsAdminPage: React.FC = () => {
     tmdbId: '872585',
     season: '1',
     episode: '1',
-    iframeUrl: 'https://uqload.to/embed-xxxxx.html',
+    iframeUrl: 'https://uqload.is/embed-xxxxx.html',
   });
   const [vipForm, setVipForm] = useState(() => ({
     code: t('aprilAdmin.vipKeys.defaultLabel'),

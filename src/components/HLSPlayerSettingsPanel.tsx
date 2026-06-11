@@ -987,24 +987,27 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {[
-                                        { id: 'vostfr', label: t('watch.voVostfrPlayer', { n: 1 }) },
-                                        { id: 'vidlink', label: t('watch.voVostfrPlayer', { n: 2 }) },
-                                        { id: 'vidsrccc', label: t('watch.voVostfrPlayer', { n: 3 }) },
-                                        { id: 'vidsrcwtf1', label: t('watch.voVostfrPlayer', { n: 4 }) }
+                                        { id: 'peachify', label: 'Peachify' },
+                                        { id: 'vostfr', label: 'Videasy' },
+                                        { id: 'vidlink', label: 'Vidlink' },
+                                        { id: 'vidsrccc', label: 'Vidsrc.io' },
+                                        { id: 'vidsrcwtf1', label: 'Vidsrc.wtf 1' }
                                       ].map((vostfrSource, index) => {
                                         // IMPORTANT: `!= null` au lieu de truthy check — sinon seasonNumber=0
                                         // (épisode spécial / Spéciaux TMDB) tombe dans le fallback '#' qui fait
                                         // charger la page courante en boucle dans l'iframe.
                                         const sourceUrl = movieId ?
-                                          vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
-                                            vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
-                                              vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
-                                                `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
+                                          vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
+                                            vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
+                                              vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
+                                                vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
+                                                  `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
                                           (tvShowId != null && seasonNumber != null && episodeNumber != null) ?
-                                            vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
-                                              vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
-                                                vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
-                                                  `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}` :
+                                            vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
+                                              vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                                vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
+                                                  vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                                    `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}` :
                                             '#'; // Fallback if neither movie nor TV info is present
 
                                         // Active state check for VOSTFR sources in main menu

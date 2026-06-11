@@ -28,7 +28,7 @@ const { PROXIES, DARKINO_PROXIES, getProxyAgent, getDarkinoHttpProxyAgent } = re
 // === FStream Configuration ===
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 const TMDB_API_URL = 'https://api.themoviedb.org/3';
-const FSTREAM_BASE_URL = 'https://french-stream.one/';
+const FSTREAM_BASE_URL = 'https://french-stream.one';
 const FSTREAM_SEARCH_URL = `${FSTREAM_BASE_URL}/engine/ajax/search.php`;
 
 // === FStream Authentication (disabled) ===
@@ -281,14 +281,18 @@ async function searchFStreamDirect(query, page = 1) {
   }
 }
 
+// Fallback "fuzzy" : search.php avec titre nu + filtre permissif (pas de filtre annee).
+// Remplace l'ancien get_seasons.php (mort cote upstream depuis ~2026-05) qui prenait
+// un TMDB id ; on simule le meme role en listant toutes les saisons matchant le titre.
 async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
+  if (!serieTitle) return [];
   try {
     const formData = new URLSearchParams();
-    formData.append('serie_tag', `s-${tmdbId}`);
+    formData.append('query', serieTitle);
 
     const response = await axiosFStreamRequest({
       method: 'post',
-      url: `${FSTREAM_BASE_URL}/engine/ajax/get_seasons.php`,
+      url: FSTREAM_SEARCH_URL,
       data: formData,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -297,53 +301,55 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
       timeout: 6000
     });
 
-    let seasonsData = response.data;
-    if (typeof seasonsData === 'string') {
-      const trimmed = seasonsData.trim();
-      if (!trimmed) return [];
-      try { seasonsData = JSON.parse(trimmed); }
-      catch (parseError) {
-        console.error(`[FSTREAM TV] Impossible de parser les saisons pour ${tmdbId}: ${parseError.message}`);
-        return [];
-      }
-    }
+    const html = typeof response.data === 'string' ? response.data : '';
+    if (!html.trim()) return [];
 
-    if (!Array.isArray(seasonsData)) return [];
+    const $ = cheerio.load(html);
+    const normalize = (s) => (s || '').toLowerCase().normalize('NFD')
+      .replace(/[̀-ͯ]/g, '').replace(/[''`´]/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    const normalizedSerie = normalize(serieTitle);
+    if (!normalizedSerie) return [];
 
-    const normalizedSerieTitle = serieTitle || '';
+    const results = [];
+    $('div.search-item').each((_, element) => {
+      const $el = $(element);
+      const rawTitle = $el.find('.search-title').text().trim();
+      const onclickAttr = $el.attr('onclick') || '';
+      const linkMatch = onclickAttr.match(/location\.href=['"]([^'"]+)['"]/);
+      const link = linkMatch ? linkMatch[1] : null;
+      if (!rawTitle || !link) return;
 
-    return seasonsData
-      .map((season) => {
-        if (!season) return null;
-        const rawTitle = season.title || '';
-        const altName = season.alt_name || '';
-        const seasonMatch = rawTitle.match(/Saison\s+(\d+)/i) || altName.match(/saison-(\d+)/i);
-        if (!seasonMatch) return null;
+      const seasonMatch = rawTitle.match(/Saison\s+(\d+)/i);
+      if (!seasonMatch) return;
+      const seasonNumber = parseInt(seasonMatch[1], 10);
+      if (Number.isNaN(seasonNumber)) return;
 
-        const seasonNumber = parseInt(seasonMatch[1], 10);
-        if (Number.isNaN(seasonNumber)) return null;
+      const baseTitle = rawTitle.replace(/\s*-\s*Saison\s+\d+.*$/i, '').replace(/\s*\(\d{4}\)\s*$/, '').trim();
+      const normalizedBase = normalize(baseTitle);
+      if (!normalizedBase) return;
+      if (!normalizedBase.includes(normalizedSerie) && !normalizedSerie.includes(normalizedBase)) return;
 
-        const rawYear = season.serie_anne;
-        const year = rawYear && /^\d{4}$/.test(String(rawYear)) ? parseInt(rawYear, 10) : null;
+      const titleYearMatch = rawTitle.match(/\((\d{4})\)/);
+      const urlYearMatch = link.match(/-(\d{4})\.html/);
+      const year = titleYearMatch ? parseInt(titleYearMatch[1], 10)
+        : urlYearMatch ? parseInt(urlYearMatch[1], 10) : null;
 
-        const fullUrl = (season.full_url || '').replace(/\\/g, '/');
-        if (!fullUrl) return null;
-        const normalizedLink = fullUrl.startsWith('http')
-          ? fullUrl
-          : `${FSTREAM_BASE_URL}${fullUrl.startsWith('/') ? '' : '/'}${fullUrl}`;
+      const cleanTitle = baseTitle ? `${baseTitle} - Saison ${seasonNumber}` : rawTitle;
+      const normalizedLink = link.startsWith('http')
+        ? link
+        : `${FSTREAM_BASE_URL}${link.startsWith('/') ? '' : '/'}${link}`;
 
-        const baseTitle = rawTitle || `Saison ${seasonNumber}`;
-        const combinedTitle = normalizedSerieTitle ? `${normalizedSerieTitle} - ${baseTitle}` : baseTitle;
+      results.push({
+        title: cleanTitle,
+        originalTitle: rawTitle,
+        link: normalizedLink,
+        seasonNumber,
+        year
+      });
+    });
 
-        return {
-          title: combinedTitle,
-          originalTitle: rawTitle || combinedTitle,
-          link: normalizedLink,
-          seasonNumber,
-          year
-        };
-      })
-      .filter(Boolean);
+    return results;
   } catch (error) {
     console.error(`[FSTREAM TV] Erreur lors de la recuperation des saisons pour ${tmdbId}: ${error.message}`);
     return [];

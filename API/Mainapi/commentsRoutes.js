@@ -299,6 +299,77 @@ const requireAuth = async (req, res, next) => {
   }
 };
 
+// Rate limit pour les actions d'écriture (commentaires/réponses/réactions/notifications)
+// - Clef = userId post-auth (fallback IP CF/X-Forwarded-For derrière Cloudflare)
+// - Store Redis partagé entre workers du cluster (sinon chaque worker compte indépendamment)
+// - passOnStoreError: si Redis tombe, fail-open au lieu de bloquer toutes les requêtes
+const rateLimit = require("express-rate-limit");
+const { ipKeyGenerator } = require("express-rate-limit");
+const { createRedisRateLimitStore } = require("./utils/redisRateLimitStore");
+const writeRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  store: createRedisRateLimitStore({
+    prefix: "rate-limit:comments:write:",
+    windowMs: 60 * 1000,
+  }),
+  passOnStoreError: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Trop de requêtes. Réessayez dans une minute." },
+  keyGenerator: (req) => {
+    if (req.user) return `u:${req.user.userType}:${req.user.userId}`;
+    return (
+      req.headers["cf-connecting-ip"] ||
+      req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
+      ipKeyGenerator(req.ip)
+    );
+  },
+  validate: {
+    xForwardedForHeader: false,
+    ip: false,
+    keyGeneratorIpFallback: false,
+  },
+});
+
+// Init paresseux des tables notifs/push (évite un DDL par requête, idempotent en cas de redémarrage)
+let _notificationTablesInitialized = false;
+let _notificationTablesInitPromise = null;
+async function ensureNotificationTables() {
+  if (_notificationTablesInitialized) return;
+  if (_notificationTablesInitPromise) return _notificationTablesInitPromise;
+  _notificationTablesInitPromise = (async () => {
+    const pool = getCachedPool();
+    await pool.execute(
+      `CREATE TABLE IF NOT EXISTS user_notification_preferences (
+        user_id VARCHAR(255) NOT NULL,
+        user_type VARCHAR(50) NOT NULL,
+        notifications_disabled TINYINT(1) DEFAULT 0,
+        updated_at BIGINT,
+        PRIMARY KEY (user_id, user_type)
+      )`
+    );
+    await pool.execute(
+      `CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL,
+        user_type VARCHAR(50) NOT NULL,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at BIGINT,
+        INDEX idx_user_push (user_id, user_type)
+      )`
+    );
+    _notificationTablesInitialized = true;
+  })();
+  try {
+    await _notificationTablesInitPromise;
+  } finally {
+    _notificationTablesInitPromise = null;
+  }
+}
+
 // Helper to get allowed profile IDs (security check)
 async function getProfileIds(userId, userType) {
   try {
@@ -1086,6 +1157,15 @@ router.get("/notifications", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "profileId requis" });
     }
 
+    // Vérifier que le profileId appartient bien à l'utilisateur authentifié
+    const userProfileIds = await getProfileIds(
+      req.user.userId,
+      req.user.userType,
+    );
+    if (!userProfileIds.includes(profileId)) {
+      return res.status(403).json({ error: "Profil non autorisé" });
+    }
+
     let query =
       "SELECT * FROM notifications WHERE user_id = ? AND user_type = ? AND profile_id = ?";
     const params = [req.user.userId, req.user.userType, profileId];
@@ -1107,7 +1187,7 @@ router.get("/notifications", requireAuth, async (req, res) => {
 });
 
 // PUT /api/comments/notifications/:id/read - Marquer une notification comme lue
-router.put("/notifications/:id/read", requireAuth, async (req, res) => {
+router.put("/notifications/:id/read", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
     const { profileId } = req.body;
@@ -1115,6 +1195,15 @@ router.put("/notifications/:id/read", requireAuth, async (req, res) => {
     // Validation du profileId
     if (!profileId) {
       return res.status(400).json({ error: "profileId requis" });
+    }
+
+    // Vérifier que le profileId appartient bien à l'utilisateur authentifié
+    const userProfileIds = await getProfileIds(
+      req.user.userId,
+      req.user.userType,
+    );
+    if (!userProfileIds.includes(profileId)) {
+      return res.status(403).json({ error: "Profil non autorisé" });
     }
 
     await dbRun(
@@ -1130,13 +1219,22 @@ router.put("/notifications/:id/read", requireAuth, async (req, res) => {
 });
 
 // PUT /api/comments/notifications/read-all - Marquer toutes les notifications comme lues
-router.put("/notifications/read-all", requireAuth, async (req, res) => {
+router.put("/notifications/read-all", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { profileId } = req.body;
 
     // Validation du profileId
     if (!profileId) {
       return res.status(400).json({ error: "profileId requis" });
+    }
+
+    // Vérifier que le profileId appartient bien à l'utilisateur authentifié
+    const userProfileIds = await getProfileIds(
+      req.user.userId,
+      req.user.userType,
+    );
+    if (!userProfileIds.includes(profileId)) {
+      return res.status(403).json({ error: "Profil non autorisé" });
     }
 
     await dbRun(
@@ -1154,7 +1252,7 @@ router.put("/notifications/read-all", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/comments/notifications/:id - Supprimer une notification
-router.delete("/notifications/:id", requireAuth, async (req, res) => {
+router.delete("/notifications/:id", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
     const { profileId } = req.query;
@@ -1162,6 +1260,15 @@ router.delete("/notifications/:id", requireAuth, async (req, res) => {
     // Validation du profileId
     if (!profileId) {
       return res.status(400).json({ error: "profileId requis" });
+    }
+
+    // Vérifier que le profileId appartient bien à l'utilisateur authentifié
+    const userProfileIds = await getProfileIds(
+      req.user.userId,
+      req.user.userType,
+    );
+    if (!userProfileIds.includes(profileId)) {
+      return res.status(403).json({ error: "Profil non autorisé" });
     }
 
     // Vérifier que la notification appartient à l'utilisateur et au profil
@@ -1190,17 +1297,8 @@ router.delete("/notifications/:id", requireAuth, async (req, res) => {
 // GET /api/comments/notifications/preferences - Récupérer les préférences de notifications
 router.get("/notifications/preferences", requireAuth, async (req, res) => {
   try {
-    const pool = getPool();
-    await pool.execute(
-      `CREATE TABLE IF NOT EXISTS user_notification_preferences (
-        user_id VARCHAR(255) NOT NULL,
-        user_type VARCHAR(50) NOT NULL,
-        notifications_disabled TINYINT(1) DEFAULT 0,
-        updated_at BIGINT,
-        PRIMARY KEY (user_id, user_type)
-      )`
-    );
-
+    await ensureNotificationTables();
+    const pool = getCachedPool();
     const [rows] = await pool.execute(
       'SELECT notifications_disabled FROM user_notification_preferences WHERE user_id = ? AND user_type = ? LIMIT 1',
       [req.user.userId, req.user.userType]
@@ -1217,21 +1315,11 @@ router.get("/notifications/preferences", requireAuth, async (req, res) => {
 });
 
 // PUT /api/comments/notifications/preferences - Mettre à jour les préférences de notifications
-router.put("/notifications/preferences", requireAuth, async (req, res) => {
+router.put("/notifications/preferences", requireAuth, writeRateLimit, async (req, res) => {
   try {
+    await ensureNotificationTables();
     const disabled = req.body?.notificationsDisabled === true;
-    const pool = getPool();
-
-    await pool.execute(
-      `CREATE TABLE IF NOT EXISTS user_notification_preferences (
-        user_id VARCHAR(255) NOT NULL,
-        user_type VARCHAR(50) NOT NULL,
-        notifications_disabled TINYINT(1) DEFAULT 0,
-        updated_at BIGINT,
-        PRIMARY KEY (user_id, user_type)
-      )`
-    );
-
+    const pool = getCachedPool();
     await pool.execute(
       `INSERT INTO user_notification_preferences (user_id, user_type, notifications_disabled, updated_at)
        VALUES (?, ?, ?, ?)
@@ -1247,31 +1335,68 @@ router.put("/notifications/preferences", requireAuth, async (req, res) => {
 });
 
 // POST /api/comments/notifications/push/subscribe - Enregistrer une subscription push
-router.post("/notifications/push/subscribe", requireAuth, async (req, res) => {
+router.post("/notifications/push/subscribe", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { subscription } = req.body;
-    if (!subscription || !subscription.endpoint) {
+    // Validation stricte: endpoint + keys.p256dh + keys.auth requis
+    if (
+      !subscription ||
+      typeof subscription.endpoint !== "string" ||
+      !subscription.endpoint ||
+      !subscription.keys ||
+      typeof subscription.keys.p256dh !== "string" ||
+      !subscription.keys.p256dh ||
+      typeof subscription.keys.auth !== "string" ||
+      !subscription.keys.auth
+    ) {
       return res.status(400).json({ error: "Subscription invalide" });
     }
-    const pool = getPool();
-    await pool.execute(
-      `CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
-        user_type VARCHAR(50) NOT NULL,
-        endpoint TEXT NOT NULL,
-        p256dh TEXT NOT NULL,
-        auth TEXT NOT NULL,
-        created_at BIGINT,
-        INDEX idx_user_push (user_id, user_type)
-      )`
+
+    await ensureNotificationTables();
+    const pool = getCachedPool();
+
+    // Vérifier si l'endpoint existe déjà — refuser le hijack cross-user
+    const [existing] = await pool.execute(
+      'SELECT user_id, user_type FROM push_subscriptions WHERE endpoint = ? LIMIT 1',
+      [subscription.endpoint]
     );
-    // Supprimer les anciennes subscriptions du même endpoint
-    await pool.execute('DELETE FROM push_subscriptions WHERE endpoint = ?', [subscription.endpoint]);
-    await pool.execute(
-      'INSERT INTO push_subscriptions (user_id, user_type, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [req.user.userId, req.user.userType, subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth, Date.now()]
-    );
+
+    if (existing.length > 0) {
+      const owner = existing[0];
+      if (
+        String(owner.user_id) !== String(req.user.userId) ||
+        String(owner.user_type) !== String(req.user.userType)
+      ) {
+        // Endpoint appartient à un autre compte — refuser (anti-hijack push)
+        return res
+          .status(409)
+          .json({ error: "Endpoint déjà associé à un autre compte" });
+      }
+      // Même owner: rotate les clés (cas normal, le browser peut renouveler les clés)
+      await pool.execute(
+        'UPDATE push_subscriptions SET p256dh = ?, auth = ?, created_at = ? WHERE endpoint = ? AND user_id = ? AND user_type = ?',
+        [
+          subscription.keys.p256dh,
+          subscription.keys.auth,
+          Date.now(),
+          subscription.endpoint,
+          req.user.userId,
+          req.user.userType,
+        ]
+      );
+    } else {
+      await pool.execute(
+        'INSERT INTO push_subscriptions (user_id, user_type, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          req.user.userId,
+          req.user.userType,
+          subscription.endpoint,
+          subscription.keys.p256dh,
+          subscription.keys.auth,
+          Date.now(),
+        ]
+      );
+    }
     res.json({ success: true });
   } catch (error) {
     console.error("Erreur lors de l'enregistrement push:", error);
@@ -1280,11 +1405,12 @@ router.post("/notifications/push/subscribe", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/comments/notifications/push/unsubscribe - Supprimer une subscription push
-router.delete("/notifications/push/unsubscribe", requireAuth, async (req, res) => {
+router.delete("/notifications/push/unsubscribe", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { endpoint } = req.body;
     if (!endpoint) return res.status(400).json({ error: "Endpoint manquant" });
-    const pool = getPool();
+    await ensureNotificationTables();
+    const pool = getCachedPool();
     await pool.execute('DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ? AND user_type = ?', [endpoint, req.user.userId, req.user.userType]);
     res.json({ success: true });
   } catch (error) {
@@ -1301,9 +1427,14 @@ router.get("/notifications/push/vapid-key", (req, res) => {
 // ==================== ROUTES RÉACTIONS ====================
 
 // POST /api/comments/react - Ajouter/retirer une réaction
-router.post("/react", requireAuth, async (req, res) => {
+router.post("/react", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { targetType, targetId, profileId } = req.body; // targetType: 'comment' ou 'reply'
+
+    // Whitelist targetType pour éviter pollution de la table comment_reactions
+    if (!["comment", "reply"].includes(targetType)) {
+      return res.status(400).json({ error: "targetType invalide" });
+    }
 
     // Verify profile ownership
     const userProfileIds = await getProfileIds(
@@ -1448,6 +1579,11 @@ router.get(
       const { targetType, targetId } = req.params;
       const { profileId } = req.query;
 
+      // Whitelist targetType
+      if (!["comment", "reply"].includes(targetType)) {
+        return res.status(400).json({ error: "targetType invalide" });
+      }
+
       const reaction = await dbGet(
         "SELECT * FROM comment_reactions WHERE target_type = ? AND target_id = ? AND user_id = ? AND user_type = ? AND profile_id = ?",
         [targetType, targetId, req.user.userId, req.user.userType, profileId],
@@ -1468,8 +1604,9 @@ router.get(
 router.get("/:commentId/replies", async (req, res) => {
   try {
     const { commentId } = req.params;
-    const { page = 1, limit = 3 } = req.query;
-    const offset = (page - 1) * limit;
+    const safePage = Math.max(1, Math.min(parseInt(req.query.page) || 1, 1000));
+    const safeLimit = Math.max(1, Math.min(parseInt(req.query.limit) || 3, 50));
+    const offset = (safePage - 1) * safeLimit;
 
     // Tenter de récupérer l'utilisateur connecté (optionnel)
     let currentUser = null;
@@ -1516,8 +1653,8 @@ router.get("/:commentId/replies", async (req, res) => {
         currentUser.userType,
         profileId,
         commentId,
-        parseInt(limit),
-        parseInt(offset),
+        safeLimit,
+        offset,
       ];
     } else {
       repliesQuery = `
@@ -1527,7 +1664,7 @@ router.get("/:commentId/replies", async (req, res) => {
         WHERE cr.comment_id = ? AND cr.deleted = 0
         ORDER BY cr.hierarchical_path ASC
         LIMIT ? OFFSET ?`;
-      repliesParams = [commentId, parseInt(limit), parseInt(offset)];
+      repliesParams = [commentId, safeLimit, offset];
     }
 
     const replies = await dbAll(repliesQuery, repliesParams);
@@ -1565,8 +1702,8 @@ router.get("/:commentId/replies", async (req, res) => {
     res.json({
       replies: repliesWithDetails,
       total: totalResult.total,
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: safePage,
+      limit: safeLimit,
       hasMore: offset + repliesWithDetails.length < totalResult.total,
     });
   } catch (error) {
@@ -1576,7 +1713,7 @@ router.get("/:commentId/replies", async (req, res) => {
 });
 
 // POST /api/comments/:commentId/replies - Créer une réponse
-router.post("/:commentId/replies", requireAuth, async (req, res) => {
+router.post("/:commentId/replies", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { commentId } = req.params;
     let {
@@ -1827,10 +1964,10 @@ router.post("/:commentId/replies", requireAuth, async (req, res) => {
 });
 
 // PUT /api/comments/replies/:id - Éditer une réponse
-router.put("/replies/:id", requireAuth, async (req, res) => {
+router.put("/replies/:id", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
-    let { content, isSpoiler } = req.body;
+    let { content, isSpoiler, profileId } = req.body;
 
     // Normalize content while preserving the original characters
     content = normalizeCommentContent(content);
@@ -1857,6 +1994,16 @@ router.put("/replies/:id", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "Non autorisé" });
     }
 
+    // Si la réponse a un profile_id, exiger que l'éditeur passe le même profileId
+    // (empêche un autre profil du même compte d'éditer)
+    if (reply.profile_id) {
+      if (!profileId || String(reply.profile_id) !== String(profileId)) {
+        return res
+          .status(403)
+          .json({ error: "Seul le profil auteur peut éditer cette réponse" });
+      }
+    }
+
     // Mettre à jour la réponse
     await dbRun(
       "UPDATE comment_replies SET content = ?, is_spoiler = ?, is_edited = 1, updated_at = ? WHERE id = ?",
@@ -1880,7 +2027,7 @@ router.put("/replies/:id", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/comments/replies/:id - Supprimer une réponse (admin ou auteur)
-router.delete("/replies/:id", requireAuth, async (req, res) => {
+router.delete("/replies/:id", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
     const { profileId } = req.query;
@@ -1899,10 +2046,13 @@ router.delete("/replies/:id", requireAuth, async (req, res) => {
     const userMatch =
       String(reply.user_id) === String(req.user.userId) &&
       String(reply.user_type) === String(req.user.userType);
-    const profileMatch =
-      !reply.profile_id ||
-      !profileId ||
-      String(reply.profile_id) === String(profileId);
+    // Si la réponse a un profile_id, le profileId fourni doit matcher exactement
+    // (empêche un kid profile de supprimer la réponse d'un adult profile du même compte)
+    let profileMatch = true;
+    if (reply.profile_id) {
+      profileMatch =
+        !!profileId && String(reply.profile_id) === String(profileId);
+    }
     const isOwner = userMatch && profileMatch;
 
     if (!userData.isAdmin && !isOwner) {
@@ -2927,18 +3077,21 @@ router.get("/limits", requireAuth, async (req, res) => {
 
 // ==================== ROUTES REPORTS (avant les routes dynamiques) ====================
 
-const rateLimit = require("express-rate-limit");
-
 const reportRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  store: createRedisRateLimitStore({
+    prefix: "rate-limit:comments:report:",
+    windowMs: 15 * 60 * 1000,
+  }),
+  passOnStoreError: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Trop de signalements. Réessayez dans 15 minutes." },
   keyGenerator: (req) =>
     req.headers["cf-connecting-ip"] ||
     req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
-    req.ip,
+    ipKeyGenerator(req.ip),
   validate: {
     xForwardedForHeader: false,
     ip: false,
@@ -3364,8 +3517,9 @@ router.put("/admin/reports/:id/dismiss", requireAuth, async (req, res) => {
 router.get("/:contentType/:contentId", async (req, res) => {
   try {
     const { contentType, contentId } = req.params;
-    const { page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+    const safePage = Math.max(1, Math.min(parseInt(req.query.page) || 1, 1000));
+    const safeLimit = Math.max(1, Math.min(parseInt(req.query.limit) || 20, 50));
+    const offset = (safePage - 1) * safeLimit;
 
     // Tenter de récupérer l'utilisateur connecté (optionnel)
     let currentUser = null;
@@ -3414,8 +3568,8 @@ router.get("/:contentType/:contentId", async (req, res) => {
         profileId,
         contentType,
         contentId,
-        parseInt(limit),
-        parseInt(offset),
+        safeLimit,
+        offset,
       ];
     } else {
       commentsQuery = `
@@ -3429,8 +3583,8 @@ router.get("/:contentType/:contentId", async (req, res) => {
       commentsParams = [
         contentType,
         contentId,
-        parseInt(limit),
-        parseInt(offset),
+        safeLimit,
+        offset,
       ];
     }
 
@@ -3470,8 +3624,8 @@ router.get("/:contentType/:contentId", async (req, res) => {
     res.json({
       comments: commentsWithDetails,
       total: totalResult.total,
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: safePage,
+      limit: safeLimit,
       hasMore: offset + commentsWithDetails.length < totalResult.total,
     });
   } catch (error) {
@@ -3481,8 +3635,26 @@ router.get("/:contentType/:contentId", async (req, res) => {
 });
 
 // POST /api/comments - Créer un commentaire
-router.post("/", requireAuth, async (req, res) => {
+router.post("/", requireAuth, writeRateLimit, async (req, res) => {
+  // Lock Redis par user pour sérialiser les créations concurrentes
+  // (évite la race count >=3 / count >=10 entre SELECT et INSERT)
+  const userLockKey = `comments:create:lock:${req.user.userType}:${req.user.userId}`;
+  let lockAcquired = null;
+  let lockHeld = false;
   try {
+    try {
+      lockAcquired = await redis.set(userLockKey, "1", "EX", 10, "NX");
+    } catch {
+      // Redis indisponible — on accepte le risque de race (best effort)
+      lockAcquired = "OK";
+    }
+    if (!lockAcquired) {
+      return res
+        .status(429)
+        .json({ error: "Une création est déjà en cours, réessayez." });
+    }
+    lockHeld = true;
+
     let {
       contentType,
       contentId,
@@ -3640,14 +3812,22 @@ router.post("/", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Erreur lors de la création du commentaire:", error);
     res.status(500).json({ error: "Erreur serveur" });
+  } finally {
+    if (lockHeld) {
+      try {
+        await redis.del(userLockKey);
+      } catch {
+        /* Redis indisponible — le lock expirera via TTL */
+      }
+    }
   }
 });
 
 // PUT /api/comments/:id - Éditer un commentaire
-router.put("/:id", requireAuth, async (req, res) => {
+router.put("/:id", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
-    let { content, isSpoiler } = req.body;
+    let { content, isSpoiler, profileId } = req.body;
 
     // Normalize content while preserving the original characters
     content = normalizeCommentContent(content);
@@ -3674,6 +3854,16 @@ router.put("/:id", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "Non autorisé" });
     }
 
+    // Si le commentaire a un profile_id, exiger que l'éditeur passe le même profileId
+    // (empêche un autre profil du même compte d'éditer)
+    if (comment.profile_id) {
+      if (!profileId || String(comment.profile_id) !== String(profileId)) {
+        return res
+          .status(403)
+          .json({ error: "Seul le profil auteur peut éditer ce commentaire" });
+      }
+    }
+
     // Mettre à jour le commentaire
     await dbRun(
       "UPDATE comments SET content = ?, is_spoiler = ?, is_edited = 1, updated_at = ? WHERE id = ?",
@@ -3696,7 +3886,7 @@ router.put("/:id", requireAuth, async (req, res) => {
 });
 
 // DELETE /api/comments/:id - Supprimer un commentaire (admin ou auteur)
-router.delete("/:id", requireAuth, async (req, res) => {
+router.delete("/:id", requireAuth, writeRateLimit, async (req, res) => {
   try {
     const { id } = req.params;
     const { profileId } = req.query;
@@ -3715,11 +3905,13 @@ router.delete("/:id", requireAuth, async (req, res) => {
     const userMatch =
       String(comment.user_id) === String(req.user.userId) &&
       String(comment.user_type) === String(req.user.userType);
-    // Vérifier le profile_id si le commentaire en a un
-    const profileMatch =
-      !comment.profile_id ||
-      !profileId ||
-      String(comment.profile_id) === String(profileId);
+    // Si le commentaire a un profile_id, le profileId fourni doit matcher exactement
+    // (empêche un kid profile de supprimer le commentaire d'un adult profile du même compte)
+    let profileMatch = true;
+    if (comment.profile_id) {
+      profileMatch =
+        !!profileId && String(comment.profile_id) === String(profileId);
+    }
     const isOwner = userMatch && profileMatch;
 
     if (!userData.isAdmin && !isOwner) {

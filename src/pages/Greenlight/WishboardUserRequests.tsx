@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
 import {
     ArrowLeft, Popcorn, Film, Tv, Calendar, Check, X, Clock,
@@ -273,7 +273,11 @@ const WishboardUserRequests: React.FC = () => {
             >
                 <div className="container px-6 pb-8 md:px-10">
                     <div className="relative inline-block">
-                        <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[140%] h-[140%] blur-[60px] bg-green-500/20 rounded-full -z-10" />
+                        {/* radial-gradient au lieu de blur-[60px] */}
+                        <div
+                            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[180%] h-[180%] rounded-full -z-10 pointer-events-none"
+                            style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.30) 0%, transparent 65%)' }}
+                        />
                         <div className="relative flex items-center gap-3">
                             <Popcorn className="h-8 w-8 text-green-500" />
                             <h1 className="text-3xl md:text-4xl font-black tracking-tight">

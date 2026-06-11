@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Bell, BellRing, Calendar, Clock, Trash2, Edit3, ExternalLink, ArrowLeft } from 'lucide-react';
 import { AlertService } from '../services/alertService';
 import { EpisodeAlert, NotifyBeforeDays } from '../types/alerts';

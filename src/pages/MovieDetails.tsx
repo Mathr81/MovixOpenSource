@@ -1,11 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
 import { Loader, Video, Star, Calendar, List, Check, ChevronRight, Play, Film, X, Building, MapPin, Languages, Library, Info, ArrowLeft, Image, Download, MessageSquare, AlertTriangle, Archive, CheckCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import AddToListButton from '../components/AddToListButton';
 import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
@@ -344,6 +343,13 @@ const ImagesSection = ({ movieId, images, loading }: { movieId: string; images: 
     setDownloadedCount(0);
 
     try {
+      // Lazy-load jszip + file-saver only when the user triggers the bulk download.
+      const [jszipMod, fileSaverMod] = await Promise.all([
+        import('jszip'),
+        import('file-saver'),
+      ]);
+      const JSZip = jszipMod.default;
+      const { saveAs } = fileSaverMod;
       const zip = new JSZip();
       const folder = zip.folder(`movie-${movieId}-${selectedCategory}`);
 
@@ -996,7 +1002,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
   const [videoSource, setVideoSource] = useState<string | null>(null);
   const [customSources, setCustomSources] = useState<string[]>([]);
   // Change l'état initial pour ne pas sélectionner de lecteur par défaut et corrige le type
-  type PlayerSourceType = 'primary' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'adfree' | 'multi' | 'omega' | 'darkino' | 'mp4' | number;
+  type PlayerSourceType = 'primary' | 'peachify' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'adfree' | 'multi' | 'omega' | 'darkino' | 'mp4' | number;
   const [selectedSource, setSelectedSource] = useState<PlayerSourceType | null>(null);
   const [frembedAvailable, setFrembedAvailable] = useState(true);
   const [adFreeSource, setAdFreeSource] = useState<string | null>(null);
@@ -1548,7 +1554,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
         <div className="relative">
           <button
             onClick={() => setShowVostfrOptions(!showVostfrOptions)}
-            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
+            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'peachify' || selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
               ? 'bg-red-600 text-white'
               : 'bg-gray-700 hover:bg-gray-600'
               }`}
@@ -1567,12 +1573,13 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
 
           {showVostfrOptions && (
             <div className="absolute z-50 top-full left-0 mt-1 bg-gray-800 rounded-lg shadow-lg overflow-hidden min-w-[200px]">
-              <button onClick={() => handleSelectSource('vostfr')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vostfr' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 1 })}</button>
-              <button onClick={() => handleSelectSource('videasy')} className={`w-full px-4 py-2 text-left ${selectedSource === 'videasy' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 2 })}</button>
-              <button onClick={() => handleSelectSource('vidsrccc')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrccc' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 3 })}</button>
-              <button onClick={() => handleSelectSource('vidsrcsu')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcsu' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 4 })}</button>
-              <button onClick={() => handleSelectSource('vidsrcwtf1')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf1' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 5 })}</button>
-              <button onClick={() => handleSelectSource('vidsrcwtf5')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf5' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>{t('details.playerVOSTFR', { number: 6 })}</button>
+              <button onClick={() => handleSelectSource('peachify')} className={`w-full px-4 py-2 text-left ${selectedSource === 'peachify' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Peachify</button>
+              <button onClick={() => handleSelectSource('vostfr')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vostfr' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 3</button>
+              <button onClick={() => handleSelectSource('videasy')} className={`w-full px-4 py-2 text-left ${selectedSource === 'videasy' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidlink</button>
+              <button onClick={() => handleSelectSource('vidsrccc')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrccc' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.io</button>
+              <button onClick={() => handleSelectSource('vidsrcsu')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcsu' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.su</button>
+              <button onClick={() => handleSelectSource('vidsrcwtf1')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf1' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 1</button>
+              <button onClick={() => handleSelectSource('vidsrcwtf5')} className={`w-full px-4 py-2 text-left ${selectedSource === 'vidsrcwtf5' ? 'bg-red-600/70 text-white' : 'hover:bg-gray-700'}`}>Vidsrc.wtf 5</button>
             </div>
           )}
         </div>
@@ -1907,6 +1914,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
             }
             src={
               selectedSource === 'primary' ? `https://frembed.click/api/film.php?id=${movieId}` :
+                selectedSource === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
                 selectedSource === 'vostfr' ? `https://vidsrc.wtf/api/3/movie/?id=${movieId}` :
                   selectedSource === 'videasy' ? `https://vidlink.pro/movie/${movieId}?primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=default&title=true&poster=true&autoplay=true&nextbutton=false` :
                     selectedSource === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
@@ -2588,7 +2596,7 @@ const MovieDetails = (): JSX.Element => {
       if (backdrops && backdrops.length > 0) {
         // Trier par résolution et choisir la meilleure
         const bestBackdrop = backdrops.sort((a: any, b: any) => b.width - a.width)[0];
-        setBackdropImage(`https://image.tmdb.org/t/p/original${bestBackdrop.file_path}`);
+        setBackdropImage(`https://image.tmdb.org/t/p/w1280${bestBackdrop.file_path}`);
       }
     } catch (error) {
       console.error('Error fetching movie images:', error);
@@ -2749,7 +2757,7 @@ const MovieDetails = (): JSX.Element => {
   const movieDescription = movie.overview?.trim() || `Découvrez ${movie.title} sur Movix.`;
 
   return (
-    <>
+    <MotionConfig reducedMotion="user">
       <SEO
         title={movieTitle}
         description={movieDescription}
@@ -2917,17 +2925,23 @@ const MovieDetails = (): JSX.Element => {
       </style>
 
 
+      {/* Page backdrop — own compositing layer (position:fixed) instead of
+          backgroundAttachment:fixed, which forces full-page re-rasterization
+          on every scroll frame and tanks FPS on heavy details pages. */}
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 z-0 pointer-events-none bg-black"
+        style={backdropImage ? {
+          backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})`,
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+        } : undefined}
+      />
       <motion.div
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.5 }}
-        className="min-h-screen bg-black text-white px-4 md:px-8 lg:px-16 py-6"
-        style={{
-          backgroundImage: backdropImage ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})` : undefined,
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
-          backgroundAttachment: 'fixed'
-        }}
+        className="relative z-10 min-h-screen text-white px-4 md:px-8 lg:px-16 py-6"
       >
         {/* Header avec titre et année */}
         <motion.div
@@ -4527,7 +4541,7 @@ const MovieDetails = (): JSX.Element => {
 
 
       </motion.div>
-    </>
+    </MotionConfig>
   );
 };
 

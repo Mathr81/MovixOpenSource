@@ -1,23 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const path = require('path');
-const fsp = require('fs').promises;
 const { getPool } = require('../mysqlPool');
 const { isUploaderOrAdmin } = require('../middleware/auth');
-
-async function getUserData(userId, userType) {
-  try {
-    const safeUserId = String(userId).replace(/[^a-zA-Z0-9_\-]/g, '');
-    const safeUserType = userType === 'bip39' ? 'bip39' : 'oauth';
-    const userPath = path.join(__dirname, '..', 'data', 'users', safeUserType, `${safeUserId}.json`);
-    const data = JSON.parse(await fsp.readFile(userPath, 'utf8'));
-    if (data.profiles && data.profiles.length > 0) {
-      const p = data.profiles[0];
-      return { username: p.name || 'Admin', avatar: p.avatar || null };
-    }
-  } catch { /* fall through */ }
-  return { username: 'Admin', avatar: null };
-}
+const { resolveAdminIdentity } = require('../utils/adminIdentity');
 
 router.get('/admin/leaderboard', isUploaderOrAdmin, async (req, res) => {
   try {
@@ -75,14 +60,13 @@ router.get('/admin/leaderboard', isUploaderOrAdmin, async (req, res) => {
     }
 
     const leaderboard = await Promise.all(rows.map(async (row) => {
-      const userType = row.admin_auth_type === 'bip-39' ? 'bip39' : 'oauth';
-      const u = await getUserData(row.admin_id, userType);
+      const identity = await resolveAdminIdentity(row.admin_id, row.admin_auth_type);
       return {
         admin_id: row.admin_id,
         admin_auth_type: row.admin_auth_type,
         role: adminRoles[row.admin_id] || 'admin',
-        username: u.username,
-        avatar: u.avatar,
+        username: identity.username,
+        avatar: identity.avatar,
         score: Number(row.score),
         last_action_at: row.last_action_at,
       };

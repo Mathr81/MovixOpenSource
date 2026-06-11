@@ -1,46 +1,99 @@
-/* ─── Mode Léger : désactive TOUS les effets GPU lourds ─────────────────── */
+/* ─── Mode Léger + préférences granulaires d'animations ─────────────────────
+   Chaque catégorie est pilotée par un attribut `data-*` posé sur <html> par
+   LightModeContext. `data-light-mode="true"` reste un raccourci qui ajoute
+   AUSSI tous les attributs `data-no-*` (calcul fait dans le provider), donc
+   les sélecteurs `[data-light-mode="true"]` ci-dessous sont conservés pour
+   les règles trop spécifiques pour rentrer dans une catégorie. */
 
-/* Backdrop-blur — attrape toutes les variantes Tailwind (xl, lg, md, sm, arbitraires) */
-[data-light-mode="true"] [class*="backdrop-blur"] {
+/* ════════════════════════════════════════════════════════════════════════════
+   ANIMATIONS DE FOND (data-no-bg-anim)
+   - canvas (DynamicBackground, particules)
+   - flocons de neige
+   - screensaver kenburns
+   - animations décoratives "rainbow"
+   ══════════════════════════════════════════════════════════════════════════ */
+html[data-no-bg-anim] canvas {
+  display: none !important;
+}
+html[data-no-bg-anim] .snow-particle {
+  display: none !important;
+  animation: none !important;
+}
+html[data-no-bg-anim] .screensaver-kenburns {
+  animation: none !important;
+}
+html[data-no-bg-anim] [class*="rainbow"] {
+  animation: none !important;
+}
+/* Halo lumineux radial du SquareBackground — coûteux (RAF sur pointermove
+   + radial-gradient). Inclus dans la catégorie "animations de fond". */
+html[data-no-bg-anim] .square-bg-halo {
+  display: none !important;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   ANIMATIONS DE CHARGEMENT (data-no-loading-anim)
+   - skeletons pulsants (animate-pulse)
+   - spinners (animate-spin)
+   - rebonds (animate-bounce, animate-ping)
+   On vise les classes Tailwind utilitaires, qui sont employées partout pour
+   l'état "loading".
+   ══════════════════════════════════════════════════════════════════════════ */
+html[data-no-loading-anim] .animate-pulse,
+html[data-no-loading-anim] .animate-spin,
+html[data-no-loading-anim] .animate-bounce,
+html[data-no-loading-anim] .animate-ping,
+html[data-no-loading-anim] [class*="animate-pulse"],
+html[data-no-loading-anim] [class*="animate-spin"] {
+  animation: none !important;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   EFFETS DE FLOU (data-no-blur)
+   - backdrop-blur (très coûteux GPU, plante les Smart TV)
+   - filter:blur via classes Tailwind ou inline
+   ══════════════════════════════════════════════════════════════════════════ */
+html[data-no-blur] [class*="backdrop-blur"] {
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;
   background-color: rgba(10, 10, 15, 0.95) !important;
 }
-
-/* Filter blur — attrape blur-sm, blur-xl, blur-2xl, blur-3xl, blur-[60px], etc. */
-[data-light-mode="true"] [class*="blur-"] {
+html[data-no-blur] [class*="blur-"] {
   filter: none !important;
 }
-
-/* Inline styles — framer-motion et styles JSX qui posent filter/backdrop-filter */
-[data-light-mode="true"] [style*="filter"] {
+html[data-no-blur] [style*="filter"] {
   filter: none !important;
   -webkit-filter: none !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
 
-/* Stoppe TOUTES les animations CSS */
-[data-light-mode="true"] [class*="animate-"],
-[data-light-mode="true"] [class*="rainbow"],
-[data-light-mode="true"] .screensaver-kenburns,
-[data-light-mode="true"] .snow-particle {
+/* ════════════════════════════════════════════════════════════════════════════
+   TRANSITIONS (data-no-transitions)
+   - Coupe transitions CSS sur tout l'arbre
+   - framer-motion est géré séparément via <MotionConfig reducedMotion>
+   ══════════════════════════════════════════════════════════════════════════ */
+html[data-no-transitions] *,
+html[data-no-transitions] *::before,
+html[data-no-transitions] *::after {
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   LEGACY : raccourci Mode Léger
+   Garde-fou : si `data-light-mode="true"` est présent SANS les autres attrs
+   (ex: provider non monté), on coupe quand même tout l'essentiel. En usage
+   normal, LightModeContext ajoute les attrs granulaires en plus, donc ces
+   règles sont redondantes mais inoffensives.
+   ══════════════════════════════════════════════════════════════════════════ */
+html[data-light-mode="true"] [class*="animate-"] {
   animation: none !important;
   transition: none !important;
 }
 
-/* Canvas — masque les canvas d'animation (particules, grilles) */
-[data-light-mode="true"] canvas {
-  display: none !important;
-}
-
-/* will-change — supprime la promotion de couches GPU */
-[data-light-mode="true"] [style*="will-change"],
-[data-light-mode="true"] [class*="will-change"] {
+/* will-change : supprime la promotion de couches GPU partout en Mode Léger. */
+html[data-light-mode="true"] [style*="will-change"],
+html[data-light-mode="true"] [class*="will-change"] {
   will-change: auto !important;
-}
-
-/* Snow particles */
-[data-light-mode="true"] .snow-particle {
-  display: none !important;
 }

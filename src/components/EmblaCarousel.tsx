@@ -1,16 +1,20 @@
 import React, { useCallback, useEffect, useState, useMemo } from 'react';
 import useEmblaCarousel from 'embla-carousel-react';
 import { Star, Calendar, Trash, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
-import { Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip';
 import { encodeId } from '../utils/idEncoder';
-import { useTmdbLogo } from '../hooks/useTmdbLogo';
+import { useTmdbImages, prefetchTmdbImages } from '../hooks/useTmdbImages';
 import { useEmblaScrollSuppress } from '../hooks/useEmblaScrollSuppress';
+import './EmblaCarousel.css';
 
 const POSTER_FALLBACK = `data:image/svg+xml,${encodeURIComponent('<svg width="500" height="750" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#111"/><text x="50%" y="50%" fill="#444" font-size="36" font-family="sans-serif" text-anchor="middle" dy=".3em">MOVIX</text></svg>')}`;
+
+// Stable frozen constant for non-history carousel items — prevents fresh object
+// identity inside limitedItems.map() from defeating CarouselCard memo. — perf
+const EMPTY_PROGRESS = Object.freeze({ percentage: 0, position: 0, duration: 0 });
 
 interface Media {
   id: number;
@@ -69,14 +73,16 @@ interface LazyImageProps {
 }
 
 // Native lazy loading + async decode — décharge le decode du main thread
-// pour éviter le jank pendant le scroll horizontal du carousel.
+// pour éviter le jank pendant le scroll horizontal du carousel. width/height
+// HTML attrs = hint au décodeur pour allouer un buffer correctement
+// dimensionné + évite les CLS au mount.
 const LazyImage: React.FC<LazyImageProps> = ({
   src,
   alt,
   className = '',
   style,
   onError,
-  placeholder = 'data:image/svg+xml;utf8,<svg width="500" height="750" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 750" preserveAspectRatio="xMidYMid meet"><rect width="100%" height="100%" fill="%23333"/><text x="50%" y="50%" fill="%23ccc" font-size="50" font-family="Arial, sans-serif" text-anchor="middle" dy=".3em">MOVIX</text></svg>',
+  placeholder = 'data:image/svg+xml;utf8,<svg width="342" height="513" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 342 513" preserveAspectRatio="xMidYMid meet"><rect width="100%" height="100%" fill="%23333"/><text x="50%" y="50%" fill="%23ccc" font-size="38" font-family="Arial, sans-serif" text-anchor="middle" dy=".3em">MOVIX</text></svg>',
   draggable = false,
   priority = false
 }) => {
@@ -108,6 +114,8 @@ const LazyImage: React.FC<LazyImageProps> = ({
       <img
         src={errored ? placeholder : src}
         alt={alt}
+        width={342}
+        height={513}
         loading={priority ? 'eager' : 'lazy'}
         decoding="async"
         fetchPriority={priority ? 'high' : 'auto'}
@@ -123,9 +131,7 @@ const LazyImage: React.FC<LazyImageProps> = ({
         }}
       />
       {!loaded && (
-        <div className="absolute inset-0 bg-gray-800 animate-pulse flex items-center justify-center">
-          <div className="w-8 h-8 border-2 border-gray-600 border-t-white rounded-full animate-spin"></div>
-        </div>
+        <div className="absolute inset-0 bg-gray-900" aria-hidden="true" />
       )}
     </div>
   );
@@ -137,7 +143,7 @@ const CarouselCard = React.memo<{
   index: number;
   itemId: string;
   detailPath: string;
-  isVisible: boolean;
+  priority: boolean;
   initialStarred: boolean;
   progressData: { percentage: number; position: number; duration: number };
   isHistory: boolean;
@@ -148,7 +154,7 @@ const CarouselCard = React.memo<{
   item,
   index,
   detailPath,
-  isVisible,
+  priority,
   initialStarred,
   progressData,
   isHistory,
@@ -161,21 +167,23 @@ const CarouselCard = React.memo<{
   const title = item.title || item.name || '';
   const isCollection = (item as any).media_type === 'collection';
 
-  // Logo loading : déclenché dès que le slide entre dans la vue (via embla
-  // `slidesInView`). Même comportement desktop / mobile. Les requêtes sont
-  // mises en cache par useTmdbLogo (sessionStorage), donc les visites
-  // suivantes du même item sont gratuites.
-  const [shouldLoadLogo, setShouldLoadLogo] = useState(false);
-  const triggerLogoLoad = useCallback(() => {
-    setShouldLoadLogo(true);
-  }, []);
-  useEffect(() => {
-    if (isVisible) setShouldLoadLogo(true);
-  }, [isVisible]);
-  const logoMediaType = shouldLoadLogo && !isCollection && (item.media_type === 'movie' || item.media_type === 'tv')
+  // Plus de gate `shouldLoadImages` ni de `setState` per-card : le parent
+  // EmblaCarousel pré-warme TOUS les /images JSON (+ pré-décode les posters)
+  // à l'idle dès le mount du carousel. fetchAndCache + inflight map dans
+  // useTmdbImages dédupent les éventuels conflits prefetch ↔ hook subscribe.
+  // Résultat : 0 setState pendant scroll + cache hit synchrone au 1er render
+  // pour les sessions suivantes.
+  const imagesMediaType = !isCollection && (item.media_type === 'movie' || item.media_type === 'tv')
     ? item.media_type
     : undefined;
-  const logoUrl = useTmdbLogo(logoMediaType, shouldLoadLogo ? item.id : undefined);
+  const { logoUrl, posterUrl } = useTmdbImages(imagesMediaType, item.id);
+
+  // Poster localisé si dispo (TMDB renvoie souvent une affiche FR différente
+  // pour les sorties FR), sinon le poster_path par défaut du payload de liste.
+  // Le swap natif <img src> arrive sans flash si l'URL ne change pas
+  // (cas fréquent : la liste retourne déjà le poster FR si la requête liste
+  // était en `language=fr-FR`).
+  const posterSrc = posterUrl ?? `https://image.tmdb.org/t/p/w342${item.poster_path}`;
 
   const toggleWatchlist = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -224,12 +232,9 @@ const CarouselCard = React.memo<{
 
   return (
     <div className="embla-slide flex-none relative w-[144px] md:w-[192px]">
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.3, delay: Math.min(index * 0.03, 0.5) }}
-        onPointerEnter={triggerLogoLoad}
-        className="relative group rounded-xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/20 hover:scale-105 transition-[transform,border-color,background-color] duration-200 ease-out"
+      <div
+        style={{ animationDelay: `${Math.min(index * 0.03, 0.5)}s` }}
+        className="relative group rounded-xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/20 hover:scale-105 transition-transform duration-200 ease-out animate-card-enter"
       >
         {/* Type badge */}
         <span className="absolute top-2 left-2 z-10 px-2 py-1 rounded-lg bg-black/75 text-[10px] font-semibold uppercase tracking-wider text-white/80">
@@ -243,60 +248,56 @@ const CarouselCard = React.memo<{
           </span>
         )}
 
-        {/* Top-right action: remove (history) or watchlist (normal) */}
+        {/* Top-right action: remove (history) or watchlist (normal) — natif <button>
+            avec title= pour le tooltip (zéro overhead vs Radix Tooltip qui mountait
+            un portal par card sur hover). active:scale-* remplace whileTap. */}
         {isHistory && onRemoveItem ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <motion.button
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onRemoveItem(item.id, item.media_type);
-                }}
-                whileTap={{ scale: 0.85 }}
-                className="absolute top-2 right-2 z-20 p-2 rounded-full bg-red-600/95 hover:bg-red-600 text-white transition-colors"
-                aria-label={t('common.deleteAll')}
-              >
-                <Trash className="w-3.5 h-3.5" />
-              </motion.button>
-            </TooltipTrigger>
-            <TooltipContent>{t('common.deleteAll')}</TooltipContent>
-          </Tooltip>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onRemoveItem(item.id, item.media_type);
+            }}
+            title={t('common.deleteAll')}
+            aria-label={t('common.deleteAll')}
+            className="absolute top-2 right-2 z-20 p-2 rounded-full bg-red-600/95 hover:bg-red-600 active:scale-[0.85] text-white transition-[colors,transform] duration-150"
+          >
+            <Trash className="w-3.5 h-3.5" />
+          </button>
         ) : (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <motion.button
-                onClick={toggleWatchlist}
-                whileTap={{ scale: 0.7 }}
-                className={`absolute top-2 right-2 z-20 p-2 rounded-full transition-[opacity,background-color] duration-200 md:opacity-0 md:group-hover:opacity-100 ${starred ? 'bg-yellow-500/40 border border-yellow-400/50' : 'bg-black/65 hover:bg-black/80'}`}
-              >
-                <motion.div
-                  key={starred ? 'on' : 'off'}
-                  initial={{ scale: 0.3, rotate: -45 }}
-                  animate={{ scale: 1, rotate: 0 }}
-                  transition={{ type: 'spring', stiffness: 500, damping: 15 }}
-                >
-                  <Star
-                    className={`w-4 h-4 transition-colors duration-150 ${starred ? 'text-yellow-400' : 'text-white'}`}
-                    fill={starred ? 'currentColor' : 'none'}
-                  />
-                </motion.div>
-              </motion.button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {starred ? t('profile.removeFromWatchlist') : t('profile.addToWatchlist')}
-            </TooltipContent>
-          </Tooltip>
+          <button
+            type="button"
+            onClick={toggleWatchlist}
+            title={starred ? t('profile.removeFromWatchlist') : t('profile.addToWatchlist')}
+            aria-label={starred ? t('profile.removeFromWatchlist') : t('profile.addToWatchlist')}
+            className={`absolute top-2 right-2 z-20 p-2 rounded-full active:scale-[0.7] transition-[opacity,background-color,transform] duration-200 md:opacity-0 md:group-hover:opacity-100 ${starred ? 'bg-yellow-500/40 border border-yellow-400/50' : 'bg-black/65 hover:bg-black/80'}`}
+          >
+            <motion.div
+              key={starred ? 'on' : 'off'}
+              initial={{ scale: 0.3, rotate: -45 }}
+              animate={{ scale: 1, rotate: 0 }}
+              transition={{ type: 'spring', stiffness: 500, damping: 15 }}
+            >
+              <Star
+                className={`w-4 h-4 transition-colors duration-150 ${starred ? 'text-yellow-400' : 'text-white'}`}
+                fill={starred ? 'currentColor' : 'none'}
+              />
+            </motion.div>
+          </button>
         )}
 
-        {/* Poster */}
+        {/* Poster — w342 = 342×513 = 1.78× le display 192px CSS sur écran @1×.
+            Suffisant pour la qualité visible sur écran @2× sans surdécoder.
+            posterSrc = poster localisé FR>EN>any si useTmdbImages a résolu,
+            sinon default poster_path du payload. */}
         <div className="w-full aspect-[2/3] relative">
           <LazyImage
-            src={`https://image.tmdb.org/t/p/w500${item.poster_path}`}
+            src={posterSrc}
             alt={title || t('common.poster')}
             className="rounded-xl w-full h-full"
             placeholder={POSTER_FALLBACK}
-            priority={isVisible}
+            priority={priority}
           />
         </div>
 
@@ -361,13 +362,16 @@ const CarouselCard = React.memo<{
         >
           <span className="sr-only">{title}</span>
         </Link>
-      </motion.div>
+      </div>
 
-      {/* Top 10 ranking number — outside motion.div to escape its overflow-hidden */}
+      {/* Top 10 ranking number — outside the card wrapper to escape overflow-hidden.
+          Réutilise posterSrc → même image que la card (SW cache chaud, 0 fetch
+          supplémentaire) ET cohérence visuelle quand le poster localisé FR
+          arrive. */}
       {showRanking && (
         <div
           className="ranking-number"
-          style={{ backgroundImage: `url(https://image.tmdb.org/t/p/w500${item.poster_path})` }}
+          style={{ backgroundImage: `url(${posterSrc})` }}
         >
           {index + 1}
         </div>
@@ -377,15 +381,6 @@ const CarouselCard = React.memo<{
 });
 
 CarouselCard.displayName = 'CarouselCard';
-
-const arraysEqual = (a: number[], b: number[]) => {
-  if (a === b) return true;
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-};
 
 const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
   title,
@@ -405,11 +400,13 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     containScroll: 'keepSnaps',
     slidesToScroll: 1,
     skipSnaps: false,
-    duration: 25,
+    // P7 — 25 → 15 : snap plus rapide = moins de frames pendant lesquelles
+    // le browser doit composer + react au scroll. Si le visuel devient trop
+    // saccadé sur trackpad/molette, remonter à 20.
+    duration: 15,
     startIndex: 0,
     loop: false
   });
-  const [visibleSlides, setVisibleSlides] = useState<number[]>([]);
   const [canScrollPrev, setCanScrollPrev] = useState(false);
   const [canScrollNext, setCanScrollNext] = useState(false);
 
@@ -429,29 +426,84 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
   // Limite le nombre d'items pour éviter de surcharger le DOM (max 30 items par carousel)
   const limitedItems = useMemo(() => items.slice(0, 30), [items]);
 
-  // Effect 1: track visible slides for image priority via 'slidesInView' event.
-  // Embla fires this only when slides actually enter/leave the viewport — not
-  // every scroll frame. We extend ±1 for preloading.
+  // Pré-warmer idle (P1 + P3) : dès le mount du carousel, on pré-décode toutes
+  // les bitmaps poster (élimine le coût de décode synchrone pendant le scroll
+  // horizontal — le 1er passage causait des frames perdues sur PC où 5-6 cards
+  // entraient par frame) ET on pré-fetche tous les /images JSON de TMDB
+  // (élimine le storm de fetches au moment où la card devient visible).
+  //
+  // requestIdleCallback : le browser yield si CPU busy, on n'interfère pas
+  // avec le critical path. Concurrency=2 par carousel × 5 carousels Home = max
+  // 10 décodes parallèles, bien sous la limite browser/réseau. Les fetches
+  // sont protégés par le SW qui cap à 6 concurrent (cf. sw.js).
+  //
+  // Cleanup : `cancelled` flag stoppe la worker loop à la prochaine itération
+  // (le décode/fetch en vol finit normalement, on ignore juste le résultat).
   useEffect(() => {
-    if (!emblaApi) return;
-    const updateVisible = () => {
-      const inView = emblaApi.slidesInView();
-      const extendedSet = new Set<number>(inView);
-      inView.forEach((i) => {
-        if (i > 0) extendedSet.add(i - 1);
-        if (i < limitedItems.length - 1) extendedSet.add(i + 1);
-      });
-      const next = Array.from(extendedSet).sort((a, b) => a - b);
-      setVisibleSlides((prev) => (arraysEqual(prev, next) ? prev : next));
+    if (typeof window === 'undefined') return;
+    const w = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
     };
-    updateVisible();
-    emblaApi.on('slidesInView', updateVisible);
-    emblaApi.on('reInit', updateVisible);
+    const ric = w.requestIdleCallback ?? ((cb: () => void) => window.setTimeout(cb, 1));
+    const cic = w.cancelIdleCallback ?? window.clearTimeout;
+
+    let cancelled = false;
+    const concurrency = 2;
+
+    const worker = async (cursor: { i: number }) => {
+      while (!cancelled) {
+        const idx = cursor.i++;
+        if (idx >= limitedItems.length) return;
+        const item = limitedItems[idx];
+        const tasks: Promise<unknown>[] = [];
+
+        // P1 : pré-décode poster off-DOM. Le browser garde la bitmap en cache
+        // image → quand le <img> mount dans la card, il pioche directement la
+        // bitmap décodée, 0 décode pendant scroll.
+        if (item.poster_path) {
+          const url = `https://image.tmdb.org/t/p/w342${item.poster_path}`;
+          const img = new Image();
+          img.src = url;
+          tasks.push(img.decode().catch(() => undefined));
+        }
+
+        // P3 : pré-fetch /images JSON via fetchAndCache (dédupé par inflight
+        // map → 0 doublon avec les hooks `useTmdbImages` qui mounteraient en
+        // même temps).
+        if (item.media_type === 'movie' || item.media_type === 'tv') {
+          tasks.push(prefetchTmdbImages(item.media_type, item.id).catch(() => undefined));
+        }
+
+        if (tasks.length > 0) await Promise.all(tasks);
+      }
+    };
+
+    const handle = ric(() => {
+      const cursor = { i: 0 };
+      void Promise.all(Array.from({ length: concurrency }, () => worker(cursor)));
+    }, { timeout: 2000 });
+
     return () => {
-      emblaApi.off('slidesInView', updateVisible);
-      emblaApi.off('reInit', updateVisible);
+      cancelled = true;
+      cic(handle);
     };
-  }, [emblaApi, limitedItems.length]);
+  }, [limitedItems]);
+
+  // `priority` cap statique : les N premières cards reçoivent
+  // `loading="eager"` + `fetchpriority="high"` pour aider le LCP. Calculé une
+  // fois au mount selon le viewport (= getStep + 2 buffer pour couvrir les
+  // cards initiales partiellement visibles). Pas de mise à jour pendant scroll
+  // → 0 re-render storm sur les 30 cards quand de nouveaux items entrent en
+  // vue (le pre-decode P1 a déjà payé le coût décode hors critical path).
+  const priorityCount = useMemo(() => {
+    const w = typeof window !== 'undefined' ? window.innerWidth : 1024;
+    if (w >= 1536) return 10; // 2K+
+    if (w >= 1280) return 8;  // xl
+    if (w >= 1024) return 7;  // lg
+    if (w >= 768) return 6;   // md
+    return 4;                 // sm/xs
+  }, []);
 
   // Effect 2: track arrow-button state via 'select' + 'reInit' only.
   useEffect(() => {
@@ -599,62 +651,38 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     }
   }, []);
 
+  // Pre-compute a map de progression : 1 lecture localStorage par item au lieu
+  // de 1× par item × par render. Recomputed seulement quand limitedItems change.
+  // Garde une identité stable pour progressData → CarouselCard memo respecté.
+  // Pour les items non-history, on retombe sur EMPTY_PROGRESS.
+  const progressMap = useMemo(() => {
+    const map = new Map<string, { percentage: number; position: number; duration: number }>();
+    if (!isHistory) return map;
+    for (const item of limitedItems) {
+      if (!('currentEpisode' in item)) continue;
+      const h = item as ContinueWatching;
+      const itemKey = `${h.id}-${h.media_type}`;
+      if (h.media_type === 'tv' && h.currentEpisode) {
+        const ep = getEpisodeProgress(h.id, h.currentEpisode.season, h.currentEpisode.episode);
+        map.set(itemKey, {
+          percentage: ep.percentage,
+          position: ep.position || 0,
+          duration: ep.duration || 0,
+        });
+      } else if (h.media_type === 'movie') {
+        const mv = getMovieProgress(h.id);
+        map.set(itemKey, {
+          percentage: mv.percentage,
+          position: mv.position || 0,
+          duration: mv.duration || 0,
+        });
+      }
+    }
+    return map;
+  }, [limitedItems, isHistory, getEpisodeProgress, getMovieProgress]);
+
   return (
-    <>
-      <style>
-        {`
-          .embla-slide {
-            position: relative;
-            flex-shrink: 0;
-            contain: layout;
-          }
-
-          /* Pendant le scroll (150ms idle après le dernier input), on coupe les
-             pointer events sur les slides : ça empêche le :hover de flipper en
-             permanence quand les cards défilent sous le curseur (chaque flip
-             déclenchait un cycle Layerize+Paint au compositor). Le body.is-scrolling
-             est posé par SmoothScroll.tsx. */
-          body.is-scrolling .embla-slide {
-            pointer-events: none;
-          }
-
-          /* Top 10 ranking number — digit filled with poster (static, no animation
-             to avoid continuous repaint of the background-clip: text mask) */
-          .ranking-number {
-            position: absolute;
-            left: -1rem;
-            bottom: -0.5rem;
-            z-index: 5;
-            font-size: 6rem;
-            font-weight: 900;
-            line-height: 0.85;
-            user-select: none;
-            pointer-events: none;
-            font-family: 'Arial Black', 'Helvetica Neue', Impact, Arial, sans-serif;
-            letter-spacing: -0.08em;
-            color: transparent;
-            background-size: 200% auto;
-            background-position: center;
-            background-repeat: no-repeat;
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-stroke: 1.5px rgba(239, 68, 68, 0.6);
-            text-stroke: 1.5px rgba(239, 68, 68, 0.6);
-            filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.6));
-          }
-
-          @media (min-width: 768px) {
-            .ranking-number {
-              left: -1.5rem;
-              bottom: -0.75rem;
-              font-size: 9rem;
-              -webkit-text-stroke: 2px rgba(239, 68, 68, 0.6);
-              text-stroke: 2px rgba(239, 68, 68, 0.6);
-            }
-          }
-        `}
-      </style>
-      <div className="mb-4 content-row-container select-none -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
+    <div className="mb-4 content-row-container select-none -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
         <div className="flex justify-between items-center mb-2 px-4 md:px-6 relative">
           <div className="flex items-center gap-3">
             <h2 className="section-title">{title}</h2>
@@ -689,7 +717,6 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
               {limitedItems.map((item, index) => {
                 const itemId = `carousel-${item.id}-${item.media_type}-${index}`;
                 const detailPath = item.media_type === 'collection' ? `/collection/${item.id}` : `/${item.media_type}/${encodeId(item.id)}`;
-                const isVisible = visibleSlides.includes(index);
                 const initialStarred = (() => {
                   const list = (item as any).media_type === 'collection'
                     ? watchlistCollections
@@ -699,23 +726,11 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
                   return Array.isArray(list) && list.some((media: any) => media.id === item.id);
                 })();
 
-                // Calculate progress for history items
-                const progressData = { percentage: 0, position: 0, duration: 0 };
-
-                if (isHistory && 'currentEpisode' in item) {
-                  const historyItem = item as ContinueWatching;
-                  if (historyItem.media_type === 'tv' && historyItem.currentEpisode) {
-                    const epProgress = getEpisodeProgress(historyItem.id, historyItem.currentEpisode.season, historyItem.currentEpisode.episode);
-                    progressData.percentage = epProgress.percentage;
-                    progressData.position = epProgress.position || 0;
-                    progressData.duration = epProgress.duration || 0;
-                  } else if (historyItem.media_type === 'movie') {
-                    const movieProgress = getMovieProgress(historyItem.id);
-                    progressData.percentage = movieProgress.percentage;
-                    progressData.position = movieProgress.position || 0;
-                    progressData.duration = movieProgress.duration || 0;
-                  }
-                }
+                // Lookup mémoïsé : progressMap pré-calculée 1× par changement
+                // d'items. Sur un re-render non lié (canScrollNext flip, hover),
+                // on récupère ici la même référence d'objet → CarouselCard memo
+                // respecté.
+                const progressData = progressMap.get(`${item.id}-${item.media_type}`) ?? EMPTY_PROGRESS;
 
                 return (
                   <CarouselCard
@@ -724,7 +739,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
                     index={index}
                     itemId={itemId}
                     detailPath={detailPath}
-                    isVisible={isVisible}
+                    priority={index < priorityCount}
                     initialStarred={initialStarred}
                     progressData={progressData}
                     isHistory={isHistory}
@@ -746,7 +761,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
             onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
             className={`hidden md:flex absolute left-6 md:left-8 top-1/2 z-[950]
                      w-12 h-32 rounded-2xl items-center justify-center text-white/90 hover:text-white
-                     bg-gradient-to-b from-neutral-900/70 via-black/80 to-neutral-900/70 backdrop-blur-md
+                     bg-gradient-to-b from-neutral-900/95 via-black/95 to-neutral-900/95
                      ring-1 ring-white/10 hover:ring-red-500/40
                      shadow-2xl shadow-black/70
                      transition-all duration-300 ease-out
@@ -764,7 +779,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
             onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
             className={`hidden md:flex absolute right-6 md:right-8 top-1/2 z-[950]
                      w-12 h-32 rounded-2xl items-center justify-center text-white/90 hover:text-white
-                     bg-gradient-to-b from-neutral-900/70 via-black/80 to-neutral-900/70 backdrop-blur-md
+                     bg-gradient-to-b from-neutral-900/95 via-black/95 to-neutral-900/95
                      ring-1 ring-white/10 hover:ring-red-500/40
                      shadow-2xl shadow-black/70
                      transition-all duration-300 ease-out
@@ -777,7 +792,6 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
           </button>
         </div>
       </div>
-    </>
   );
 };
 

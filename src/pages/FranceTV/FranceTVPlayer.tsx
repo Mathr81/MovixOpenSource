@@ -6,8 +6,29 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { isUserVip } from '../../utils/authUtils';
 import { getVipHeaders } from '../../utils/vipUtils';
 import { PROXIES_EMBED_API } from '../../config/runtime';
-import Hls from 'hls.js';
-import shaka from 'shaka-player';
+import type HlsType from 'hls.js';
+import type * as ShakaType from 'shaka-player';
+
+let HlsLib: typeof HlsType | null = null;
+let ShakaLib: typeof ShakaType | null = null;
+
+const loadHls = async (): Promise<typeof HlsType> => {
+  if (HlsLib) return HlsLib;
+  const mod = await import('hls.js');
+  HlsLib = mod.default;
+  return HlsLib;
+};
+
+const loadShaka = async (): Promise<typeof ShakaType> => {
+  if (ShakaLib) return ShakaLib;
+  const mod = await import('shaka-player');
+  // shaka-player is a CJS module; Vite/Rollup synthesizes a `default` namespace
+  // for it. The previous code used `import shaka from 'shaka-player'` (default),
+  // which is what mod.default returns here.
+  const dflt = (mod as { default?: typeof ShakaType }).default;
+  ShakaLib = dflt ?? (mod as unknown as typeof ShakaType);
+  return ShakaLib;
+};
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
@@ -63,8 +84,8 @@ const FranceTVPlayer: React.FC = () => {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const shakaRef = useRef<shaka.Player | null>(null);
+  const hlsRef = useRef<HlsType | null>(null);
+  const shakaRef = useRef<ShakaType.Player | null>(null);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [loading, setLoading] = useState(true);
@@ -151,7 +172,10 @@ const FranceTVPlayer: React.FC = () => {
 
   // ─── Player Initialization ─────────────────────────────────────────────
 
-  const initHlsPlayer = useCallback((manifestUrl: string) => {
+  const initHlsPlayer = useCallback(async (manifestUrl: string) => {
+    if (!videoRef.current) return;
+
+    const Hls = await loadHls();
     if (!videoRef.current) return;
 
     if (Hls.isSupported()) {
@@ -221,6 +245,9 @@ const FranceTVPlayer: React.FC = () => {
   const initShakaPlayer = useCallback(async (manifestUrl: string, keys: string[]) => {
     if (!videoRef.current) return;
 
+    const shaka = await loadShaka();
+    if (!videoRef.current) return;
+
     shaka.polyfill.installAll();
     if (!shaka.Player.isBrowserSupported()) {
       setError(t('francetv.dashNotSupported'));
@@ -276,7 +303,7 @@ const FranceTVPlayer: React.FC = () => {
     }
   }, [safeAutoplay]);
 
-  const populateShakaControls = useCallback((player: shaka.Player) => {
+  const populateShakaControls = useCallback((player: ShakaType.Player) => {
     const variants = player.getVariantTracks();
     const textTracks = player.getTextTracks();
 

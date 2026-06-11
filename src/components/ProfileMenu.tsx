@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { LogOut, User, List, Star, Check, ChevronDown, Crown, Settings, Shield } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { googleAuth } from '../services/googleAuth';
 import { discordAuth } from '../services/discordAuth';
 import { useVipModal } from '../context/VipModalContext';

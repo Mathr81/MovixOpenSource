@@ -12,6 +12,7 @@ const path = require('path');
 const { verifyAccessKey } = require('./checkVip');
 const { searchTmdb } = require('./utils/tmdbCache');
 const { verifyTurnstileFromRequest } = require('./utils/turnstile');
+const { resolveAdminIdentity } = require('./utils/adminIdentity');
 
 const TURNSTILE_INVISIBLE_SECRETKEY = process.env.TURNSTILE_INVISIBLE_SECRETKEY;
 const TMDB_API_URL = 'https://api.themoviedb.org/3';
@@ -945,24 +946,18 @@ function createWishboardRouter(mysqlPool, redis) {
                 }
             }
 
-            // Resolve user data (username, avatar) for each admin
+            // Resolve user data (username, avatar) for each admin via the
+            // shared helper — prefers OAuth provider identity over the
+            // generic Movix profile, so we display "Maxou DM" instead of
+            // "Admin" / "Profil".
             const leaderboard = await Promise.all(rows.map(async (row) => {
-                let userData = { username: 'Admin', avatar: null };
-                try {
-                    const userType = row.admin_auth_type === 'bip-39' ? 'bip39' : 'oauth';
-                    const basicData = await getUserData(row.admin_id, userType);
-                    if (basicData.username) userData.username = basicData.username;
-                    if (basicData.avatar) userData.avatar = basicData.avatar;
-                } catch (err) {
-                    // Keep defaults
-                }
-
+                const identity = await resolveAdminIdentity(row.admin_id, row.admin_auth_type);
                 return {
                     admin_id: row.admin_id,
                     admin_auth_type: row.admin_auth_type,
                     role: adminRoles[row.admin_id] || 'admin',
-                    username: userData.username,
-                    avatar: userData.avatar,
+                    username: identity.username,
+                    avatar: identity.avatar,
                     greenlight_count: row.greenlight_count,
                     last_greenlight_at: row.last_greenlight_at
                 };

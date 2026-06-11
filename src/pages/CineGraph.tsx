@@ -1,11 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
+import { lazyWithRetry } from '@/routing/lazyWithRetry';
 import { createPortal } from 'react-dom';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Star, Film, Tv2, User, GitBranch, ZoomIn, ZoomOut, Maximize2, ArrowLeft, Network, Sparkles, Eye, Loader, HelpCircle, Settings2 } from 'lucide-react';
-import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
+import type { ForceGraphMethods } from 'react-force-graph-2d';
 import { forceCollide } from 'd3-force-3d';
+
+// Heavy graph renderer (~140 KB minified) — code-split into its own chunk so
+// the page shell loads before the graph engine is fetched.
+const ForceGraph2D = lazy(() => lazyWithRetry(() => import('react-force-graph-2d')));
 import {
   fetchContentGraph,
   fetchPersonGraph,
@@ -930,52 +935,63 @@ const CineGraphPage: React.FC = () => {
 
           {/* Force Graph */}
           <div className="cinegraph-graph-container" ref={containerRef}>
-            <ForceGraph2D
-              ref={graphRef as any}
-              graphData={filteredData}
-              width={dimensions.width}
-              height={dimensions.height}
-              backgroundColor="rgba(0,0,0,0)"
-              nodeCanvasObject={paintNode}
-              nodePointerAreaPaint={(node: any, color, ctx) => {
-                const gNode = node as GraphNode;
-                const size = gNode.val || 12;
-                let r: number;
-                if (gNode.img && (gNode.type === 'movie' || gNode.type === 'tv' || gNode.type === 'person')) {
-                  r = size / 2 + 2;
-                } else {
-                  r = size / 2 + 1;
-                }
-                r = Math.max(r, 12);
-                ctx.beginPath();
-                ctx.arc(node.x!, node.y!, r, 0, 2 * Math.PI);
-                ctx.fillStyle = color;
-                ctx.fill();
-              }}
-              linkCanvasObject={paintLink}
-              onNodeHover={handleNodeHover}
-              onNodeClick={handleNodeClick}
-              onNodeRightClick={handleNodeDblClick}
-              onNodeDragEnd={(node: any, translate: any) => {
-                const dx = translate?.x ?? 0;
-                const dy = translate?.y ?? 0;
-                if (Math.hypot(dx, dy) < 4) {
-                  handleNodeClick(node);
-                  return;
-                }
-                node.fx = node.x;
-                node.fy = node.y;
-              }}
-              d3AlphaDecay={0.05}
-              d3VelocityDecay={0.4}
-              cooldownTicks={80}
-              warmupTicks={50}
-              enableNodeDrag={true}
-              enableZoomInteraction={true}
-              enablePanInteraction={true}
-              minZoom={0.2}
-              maxZoom={8}
-            />
+            <Suspense
+              fallback={
+                <div
+                  className="flex items-center justify-center"
+                  style={{ width: dimensions.width, height: dimensions.height }}
+                >
+                  <Loader className="animate-spin text-gray-400" size={32} />
+                </div>
+              }
+            >
+              <ForceGraph2D
+                ref={graphRef as any}
+                graphData={filteredData}
+                width={dimensions.width}
+                height={dimensions.height}
+                backgroundColor="rgba(0,0,0,0)"
+                nodeCanvasObject={paintNode}
+                nodePointerAreaPaint={(node: any, color, ctx) => {
+                  const gNode = node as GraphNode;
+                  const size = gNode.val || 12;
+                  let r: number;
+                  if (gNode.img && (gNode.type === 'movie' || gNode.type === 'tv' || gNode.type === 'person')) {
+                    r = size / 2 + 2;
+                  } else {
+                    r = size / 2 + 1;
+                  }
+                  r = Math.max(r, 12);
+                  ctx.beginPath();
+                  ctx.arc(node.x!, node.y!, r, 0, 2 * Math.PI);
+                  ctx.fillStyle = color;
+                  ctx.fill();
+                }}
+                linkCanvasObject={paintLink}
+                onNodeHover={handleNodeHover}
+                onNodeClick={handleNodeClick}
+                onNodeRightClick={handleNodeDblClick}
+                onNodeDragEnd={(node: any, translate: any) => {
+                  const dx = translate?.x ?? 0;
+                  const dy = translate?.y ?? 0;
+                  if (Math.hypot(dx, dy) < 4) {
+                    handleNodeClick(node);
+                    return;
+                  }
+                  node.fx = node.x;
+                  node.fy = node.y;
+                }}
+                d3AlphaDecay={0.05}
+                d3VelocityDecay={0.4}
+                cooldownTicks={80}
+                warmupTicks={50}
+                enableNodeDrag={true}
+                enableZoomInteraction={true}
+                enablePanInteraction={true}
+                minZoom={0.2}
+                maxZoom={8}
+              />
+            </Suspense>
 
             {/* Controls */}
             <div className="cinegraph-controls">

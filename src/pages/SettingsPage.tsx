@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useLocation, useNavigate, Link } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import {
   ArrowLeft, Settings, Shield, Monitor, Smartphone, Tablet,
   Copy, X, Snowflake, Activity, Trash2, Crown, Volume2,
   Database, Key, Lock, Palette, Eye, Download, Upload, Globe, AlertTriangle, History, CalendarClock, FlaskConical, Link2, MessageCircle, BellOff, Sparkles,
-  Zap, RefreshCw, ChevronDown, ListOrdered
+  Zap, RefreshCw, ChevronDown, ListOrdered, Gauge
 } from 'lucide-react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
@@ -55,6 +56,7 @@ import {
   subscribeToLastPlayerChanges,
 } from '../utils/lastPlayerPref';
 import { BgColorPickerPanel } from '../components/Settings/BgColorPickerPanel';
+import { useLightMode } from '../context/LightModeContext';
 import {
   BG_ACCENT_PRESETS,
   BG_STORAGE_KEYS,
@@ -146,6 +148,7 @@ function getNonSyncReasonTranslationKey(reason: NonSyncableStorageReason) {
 
 const SECTIONS = [
   { id: 'appearance', labelKey: 'settings.sections.appearance', icon: Palette },
+  { id: 'performance', labelKey: 'settings.sections.performance', icon: Gauge },
   { id: 'language', labelKey: 'settings.sections.language', icon: Globe },
   { id: 'vip', labelKey: 'settings.sections.vip', icon: Crown },
   { id: 'sessions', labelKey: 'settings.sections.sessions', icon: Monitor },
@@ -354,6 +357,7 @@ const SettingsPage: React.FC = () => {
   const navigate = useNavigate();
   const contentRef = useRef<HTMLDivElement>(null);
   const { t, i18n } = useTranslation();
+  const { lightModeSetting, setLightModeSetting, isLightMode, prefs: animPrefs, effectivePrefs: animEffectivePrefs, setPref: setAnimPref } = useLightMode();
   // Active section tracking
   const [activeSection, setActiveSection] = useState<string>(() => {
     const hash = location.hash.replace('#', '');
@@ -423,6 +427,9 @@ const SettingsPage: React.FC = () => {
   const [bgForceSquareSize, setBgForceSquareSize] = useState<boolean>(() => {
     return localStorage.getItem(BG_STORAGE_KEYS.forceSquareSize) === '1';
   });
+  const [bgHaloEnabled, setBgHaloEnabled] = useState<boolean>(() => {
+    return localStorage.getItem(BG_STORAGE_KEYS.haloEnabled) !== '0';
+  });
 
   const bgAccentRgb = bgAccent === 'custom'
     ? hexToRgbString(bgAccentCustomHex)
@@ -461,6 +468,13 @@ const SettingsPage: React.FC = () => {
     const next = !bgForceColor;
     setBgForceColor(next);
     localStorage.setItem(BG_STORAGE_KEYS.forceColor, next ? '1' : '0');
+    notifyBgPrefsChanged();
+  };
+
+  const handleBgHaloToggle = () => {
+    const next = !bgHaloEnabled;
+    setBgHaloEnabled(next);
+    localStorage.setItem(BG_STORAGE_KEYS.haloEnabled, next ? '1' : '0');
     notifyBgPrefsChanged();
   };
 
@@ -1755,30 +1769,16 @@ const SettingsPage: React.FC = () => {
                   {renderToggle(disableAutoScroll, handleAutoScrollToggle)}
                 </motion.div>
 
-                {/* Smooth scroll */}
+                {/* Smooth scroll — sélecteur unifié 4 options
+                    (Désactivé / Standard / Fluide / Ultra fluide). Le toggle
+                    ON/OFF séparé d'avant a été fusionné dans ce sélecteur :
+                    cliquer "Désactivé" coupe Lenis (scroll natif), les 3 autres
+                    activent + choisissent l'intensité. */}
                 <motion.div
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ delay: 0.1 }}
-                  className="flex items-center justify-between p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors group"
-                >
-                  <div className="flex-1 mr-4">
-                    <h4 className="font-medium text-white mb-0.5 text-sm">{t('settings.smoothScroll')}</h4>
-                    <p className="text-xs text-gray-500 leading-relaxed">
-                      {t('settings.smoothScrollDesc')}
-                    </p>
-                  </div>
-                  {renderToggle(smoothScrollEnabled, handleSmoothScrollToggle)}
-                </motion.div>
-
-                {/* Intensité du scroll fluide — désactivé (opaque) quand smoothScroll off */}
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: smoothScrollEnabled ? 1 : 0.5, y: 0 }}
-                  transition={{ delay: 0.115 }}
-                  className={`p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 transition-colors ${
-                    smoothScrollEnabled ? 'hover:border-gray-600/50' : 'pointer-events-none'
-                  }`}
+                  className="p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors"
                 >
                   <div className="flex flex-col gap-3">
                     <div>
@@ -1786,29 +1786,42 @@ const SettingsPage: React.FC = () => {
                         {t('settings.smoothScrollIntensity', 'Intensité du scroll fluide')}
                       </h4>
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        {t('settings.smoothScrollIntensityDesc', 'Contrôle l\'inertie du défilement. Plus fluide = plus de glisse mais réponse moins immédiate.')}
+                        {t('settings.smoothScrollIntensityDesc', 'Contrôle l\'inertie du défilement. Plus fluide = plus de glisse mais réponse moins immédiate. Choisis « Désactivé » pour repasser au scroll natif (recommandé sur configs lentes).')}
                       </p>
                     </div>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="flex gap-2 flex-wrap">
                       {([
-                        { id: 'standard', labelKey: 'settings.smoothScrollIntensity.standard', fallback: 'Standard' },
-                        { id: 'fluid',    labelKey: 'settings.smoothScrollIntensity.fluid',    fallback: 'Fluide' },
-                        { id: 'ultra',    labelKey: 'settings.smoothScrollIntensity.ultra',    fallback: 'Ultra fluide' },
+                        { id: 'off',      labelKey: 'settings.smoothScrollIntensity.off',      descKey: 'settings.smoothScrollIntensity.offDesc',      fallbackLabel: 'Désactivé',   fallbackDesc: 'Scroll natif du navigateur' },
+                        { id: 'standard', labelKey: 'settings.smoothScrollIntensity.standard', descKey: 'settings.smoothScrollIntensity.standardDesc', fallbackLabel: 'Standard',    fallbackDesc: 'Inertie modérée, équilibrée' },
+                        { id: 'fluid',    labelKey: 'settings.smoothScrollIntensity.fluid',    descKey: 'settings.smoothScrollIntensity.fluidDesc',    fallbackLabel: 'Fluide',      fallbackDesc: 'Glisse longue, défilement souple' },
+                        { id: 'ultra',    labelKey: 'settings.smoothScrollIntensity.ultra',    descKey: 'settings.smoothScrollIntensity.ultraDesc',    fallbackLabel: 'Ultra fluide', fallbackDesc: 'Inertie maximale, effet premium' },
                       ] as const).map((opt) => {
-                        const active = smoothScrollIntensity === opt.id;
+                        const isOff = opt.id === 'off';
+                        const active = isOff
+                          ? !smoothScrollEnabled
+                          : (smoothScrollEnabled && smoothScrollIntensity === opt.id);
                         return (
                           <button
                             key={opt.id}
                             type="button"
-                            onClick={() => handleSmoothScrollIntensityChange(opt.id)}
-                            disabled={!smoothScrollEnabled}
-                            className={`text-xs font-medium rounded-lg px-3 py-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 ${
+                            onClick={() => {
+                              if (isOff) {
+                                if (smoothScrollEnabled) handleSmoothScrollToggle();
+                              } else {
+                                if (!smoothScrollEnabled) handleSmoothScrollToggle();
+                                handleSmoothScrollIntensityChange(opt.id);
+                              }
+                            }}
+                            className={`flex-1 min-w-[100px] p-3 rounded-xl text-left transition-colors border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 ${
                               active
-                                ? 'bg-indigo-500 text-white shadow-inner'
-                                : 'bg-gray-700/40 text-gray-300 hover:bg-gray-700/70'
+                                ? (isOff
+                                    ? 'bg-gray-600/15 border-gray-500/40 text-white'
+                                    : 'bg-indigo-600/10 border-indigo-500/30 text-white')
+                                : 'bg-gray-700/20 border-gray-700/40 text-gray-400 hover:bg-gray-700/40 hover:text-white'
                             }`}
                           >
-                            {t(opt.labelKey, opt.fallback)}
+                            <div className="text-xs font-semibold">{t(opt.labelKey, opt.fallbackLabel)}</div>
+                            <div className="text-[10px] text-gray-500 mt-0.5">{t(opt.descKey, opt.fallbackDesc)}</div>
                           </button>
                         );
                       })}
@@ -1852,25 +1865,6 @@ const SettingsPage: React.FC = () => {
                     </p>
                   </div>
                   {renderToggle(commentsSectionHidden, handleCommentsSectionToggle, 'blue')}
-                </motion.div>
-
-                {/* Bandeau hero accueil */}
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.1438 }}
-                  className="flex items-center justify-between p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors group"
-                >
-                  <div className="flex-1 mr-4">
-                    <div className="flex items-center gap-2 mb-0.5">
-                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                      <h4 className="font-medium text-white text-sm">{t('settings.hideHero')}</h4>
-                    </div>
-                    <p className="text-xs text-gray-500 leading-relaxed">
-                      {t('settings.hideHeroDesc')}
-                    </p>
-                  </div>
-                  {renderToggle(heroHidden, handleHeroToggle)}
                 </motion.div>
 
                 {/* Effet neige */}
@@ -1926,6 +1920,22 @@ const SettingsPage: React.FC = () => {
                         <div className="text-[10px] text-gray-500 mt-0.5">{opt.desc}</div>
                       </button>
                     ))}
+                  </div>
+
+                  {/* ─── Toggle Halo lumineux ─────────────────────────────
+                      Désactive le dégradé radial qui suit le curseur. Visible
+                      uniquement dans les modes "combiné" et "classique"
+                      (le mode "interactif" n'a pas de halo). */}
+                  <div className="mt-4 pt-4 border-t border-gray-700/40 flex items-center justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <h5 className="font-medium text-white text-sm mb-0.5">
+                        {t('settings.bgHalo')}
+                      </h5>
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        {t('settings.bgHaloDesc')}
+                      </p>
+                    </div>
+                    {renderToggle(bgHaloEnabled, handleBgHaloToggle, 'indigo')}
                   </div>
 
                   {/* ─── Couleur accent du fond ─────────────────────────── */}
@@ -2021,25 +2031,26 @@ const SettingsPage: React.FC = () => {
                     <p className="text-xs text-gray-500 leading-relaxed mb-3">
                       {t('settings.bgSquareSizeDesc', 'Densité de la grille : plus petit = plus de carrés.')}
                     </p>
-                    <div className="grid grid-cols-4 gap-2">
+                    <div className="flex gap-2 flex-wrap">
                       {([
-                        { value: 32, label: t('settings.bgSizeSmall', 'Dense') },
-                        { value: 48, label: t('settings.bgSizeMedium', 'Moyen') },
-                        { value: 64, label: t('settings.bgSizeLarge', 'Aéré') },
-                        { value: 80, label: t('settings.bgSizeXLarge', 'Très aéré') },
+                        { value: 32, labelKey: 'settings.bgSizeSmall',  descKey: 'settings.bgSizeSmallDesc',  fallbackLabel: 'Dense',     fallbackDesc: 'Grille très dense, beaucoup de carrés' },
+                        { value: 48, labelKey: 'settings.bgSizeMedium', descKey: 'settings.bgSizeMediumDesc', fallbackLabel: 'Moyen',     fallbackDesc: 'Densité équilibrée, par défaut' },
+                        { value: 64, labelKey: 'settings.bgSizeLarge',  descKey: 'settings.bgSizeLargeDesc',  fallbackLabel: 'Aéré',      fallbackDesc: 'Carrés plus larges, moins denses' },
+                        { value: 80, labelKey: 'settings.bgSizeXLarge', descKey: 'settings.bgSizeXLargeDesc', fallbackLabel: 'Très aéré', fallbackDesc: 'Carrés très larges, grille minimale' },
                       ] as const).map((opt) => {
                         const active = bgSquareSize === opt.value;
                         return (
                           <button
                             key={opt.value}
                             onClick={() => handleBgSquareSizeChange(opt.value)}
-                            className={`text-xs font-medium rounded-lg px-3 py-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 ${
+                            className={`flex-1 min-w-[100px] p-3 rounded-xl text-left transition-colors border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 ${
                               active
-                                ? 'bg-indigo-500 text-white shadow-inner'
-                                : 'bg-gray-700/40 text-gray-300 hover:bg-gray-700/70'
+                                ? 'bg-indigo-600/10 border-indigo-500/30 text-white'
+                                : 'bg-gray-700/20 border-gray-700/40 text-gray-400 hover:bg-gray-700/40 hover:text-white'
                             }`}
                           >
-                            {opt.label}
+                            <div className="text-xs font-semibold">{t(opt.labelKey, opt.fallbackLabel)}</div>
+                            <div className="text-[10px] text-gray-500 mt-0.5">{t(opt.descKey, opt.fallbackDesc)}</div>
                           </button>
                         );
                       })}
@@ -2165,6 +2176,167 @@ const SettingsPage: React.FC = () => {
                   </div>
                 </motion.div>
               </div>
+            </section>
+
+            {/* ════════════════════════════════════════════════════════ */}
+            {/* SECTION: Performance                                    */}
+            {/* ════════════════════════════════════════════════════════ */}
+            <section id="performance" className="scroll-mt-24">
+              <div className="flex items-center gap-3 mb-6">
+                <div className="p-2 rounded-xl bg-gradient-to-br from-emerald-600/20 to-teal-600/20 border border-emerald-500/20">
+                  <Gauge className="w-5 h-5 text-emerald-400" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-semibold text-white">{t('settings.sections.performance')}</h2>
+                  <p className="text-sm text-gray-500">{t('settings.performanceDesc')}</p>
+                </div>
+              </div>
+
+              {/* Toggle "Masquer le bandeau d'accueil" — déplacé d'Apparence
+                  vers Performance car couper le hero supprime images lourdes,
+                  rotation auto et fetchs TMDB en plus de l'animation. */}
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.05 }}
+                className="flex items-center justify-between p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors group mb-3"
+              >
+                <div className="flex-1 mr-4">
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                    <h4 className="font-medium text-white text-sm">{t('settings.hideHero')}</h4>
+                  </div>
+                  <p className="text-xs text-gray-500 leading-relaxed">
+                    {t('settings.hideHeroDesc')}
+                  </p>
+                </div>
+                {renderToggle(heroHidden, handleHeroToggle)}
+              </motion.div>
+
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.1 }}
+                className="p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors"
+              >
+                <div className="flex flex-col gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <h4 className="font-medium text-white text-sm">{t('settings.lightMode')}</h4>
+                      {lightModeSetting === 'auto' && (
+                        <span className="text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/20">
+                          {isLightMode ? t('settings.lightModeAutoOn') : t('settings.lightModeAutoOff')}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-gray-500 leading-relaxed">
+                      {t('settings.lightModeDesc')}
+                    </p>
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    {([
+                      { id: 'auto', labelKey: 'settings.lightModeAuto', descKey: 'settings.lightModeAutoDesc', fallbackLabel: 'Auto',      fallbackDesc: 'Détecte automatiquement' },
+                      { id: 'on',   labelKey: 'settings.lightModeOn',   descKey: 'settings.lightModeOnDesc',   fallbackLabel: 'Activé',    fallbackDesc: 'Toujours actif' },
+                      { id: 'off',  labelKey: 'settings.lightModeOff',  descKey: 'settings.lightModeOffDesc',  fallbackLabel: 'Désactivé', fallbackDesc: 'Tous les effets' },
+                    ] as const).map((opt) => {
+                      const active = lightModeSetting === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setLightModeSetting(opt.id)}
+                          className={`flex-1 min-w-[100px] p-3 rounded-xl text-left transition-colors border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 ${
+                            active
+                              ? 'bg-emerald-600/10 border-emerald-500/30 text-white'
+                              : 'bg-gray-700/20 border-gray-700/40 text-gray-400 hover:bg-gray-700/40 hover:text-white'
+                          }`}
+                        >
+                          <div className="text-xs font-semibold">{t(opt.labelKey, opt.fallbackLabel)}</div>
+                          <div className="text-[10px] text-gray-500 mt-0.5">{t(opt.descKey, opt.fallbackDesc)}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] text-gray-600 leading-relaxed">
+                    {t('settings.lightModeAutoHint')}
+                  </p>
+                </div>
+              </motion.div>
+
+              {/* Réglages granulaires d'animations.
+                  Chaque toggle pose son propre attribut `data-no-*` sur <html>
+                  via LightModeContext. Quand Mode léger est actif, toutes les
+                  catégories sont forcées "désactivées" (effectivePrefs), mais
+                  l'état persistant `prefs` est conservé → quand l'utilisateur
+                  coupe Mode léger, il retrouve ses choix granulaires. */}
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.15 }}
+                className="mt-3 p-4 bg-gray-800/20 rounded-xl border border-gray-700/30"
+              >
+                <div className="mb-3">
+                  <h4 className="text-sm font-medium text-white mb-0.5">
+                    {t('settings.animPrefsTitle')}
+                  </h4>
+                  <p className="text-[11px] text-gray-500 leading-relaxed">
+                    {isLightMode
+                      ? t('settings.animPrefsHintLightModeOn')
+                      : t('settings.animPrefsHint')}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  {([
+                    { key: 'bgAnimations',      titleKey: 'settings.animBgTitle',       descKey: 'settings.animBgDesc' },
+                    { key: 'loadingAnimations', titleKey: 'settings.animLoadingTitle',  descKey: 'settings.animLoadingDesc' },
+                    { key: 'carouselAutoplay',  titleKey: 'settings.animCarouselTitle', descKey: 'settings.animCarouselDesc' },
+                    { key: 'blurEffects',       titleKey: 'settings.animBlurTitle',     descKey: 'settings.animBlurDesc' },
+                    { key: 'transitions',       titleKey: 'settings.animTransTitle',    descKey: 'settings.animTransDesc' },
+                  ] as const).map((row) => {
+                    const isOn = animEffectivePrefs[row.key];
+                    const userOn = animPrefs[row.key];
+                    const forcedByLightMode = isLightMode && !animEffectivePrefs[row.key];
+                    return (
+                      <div
+                        key={row.key}
+                        className={`flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-700/40 transition-colors ${
+                          forcedByLightMode ? 'opacity-60' : 'hover:border-gray-600/50'
+                        }`}
+                      >
+                        <div className="flex-1 mr-3 min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                            <span className="font-medium text-white text-xs">{t(row.titleKey)}</span>
+                            {forcedByLightMode && (
+                              <span className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300/80 border border-emerald-500/20">
+                                {t('settings.animForcedByLightMode')}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-gray-500 leading-relaxed">{t(row.descKey)}</p>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={isOn}
+                          disabled={forcedByLightMode}
+                          onClick={() => setAnimPref(row.key, !userOn)}
+                          className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 ${
+                            isOn ? 'bg-emerald-500' : 'bg-gray-600'
+                          } ${forcedByLightMode ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+                          aria-label={t(row.titleKey)}
+                        >
+                          <span
+                            className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                              isOn ? 'translate-x-[18px]' : 'translate-x-[3px]'
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </motion.div>
             </section>
 
             {/* ════════════════════════════════════════════════════════ */}

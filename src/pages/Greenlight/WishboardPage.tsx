@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Popcorn, Plus, Settings, Loader2, HelpCircle, Check, Clock, Search, Zap, X, Ghost, LinkIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WishboardCard } from '../../components/Greenlight/WishboardCard';
@@ -280,7 +280,11 @@ const WishboardPage: React.FC = () => {
                             animate={{ opacity: 1, scale: 1 }}
                             className="mb-6 relative"
                         >
-                            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[140%] h-[140%] blur-[80px] bg-green-500/20 rounded-full -z-10" />
+                            {/* radial-gradient au lieu de blur-[80px] (même halo, ~0ms compositor) */}
+                            <div
+                                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] rounded-full -z-10 pointer-events-none"
+                                style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.30) 0%, transparent 65%)' }}
+                            />
                             <h1 className="relative text-5xl md:text-7xl font-black tracking-tight">
                                 <ShinyText text="GREENLIGHT" speed={3} color="#ffffff" shineColor="#4ade80" className="" />
                             </h1>

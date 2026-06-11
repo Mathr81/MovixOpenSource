@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { ArrowLeft, Crown, Sparkles, Heart, Rocket, Globe, Tv, Film, Users, Star } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SquareBackground } from '../components/ui/square-background';

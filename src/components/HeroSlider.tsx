@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import useEmblaCarousel from 'embla-carousel-react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Play, Info, Star, Calendar, Pause } from 'lucide-react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -23,7 +23,14 @@ const detectLowEndDevice = (): boolean => {
   const isLowEnd = (typeof dm === 'number' && dm <= 2) || (typeof hc === 'number' && hc <= 2);
   const isTV = /Tizen|WebOS|SmartTV|GoogleTV|HbbTV|NetCast|VIDAA|AppleTV|AndroidTV|BRAVIA|Hisense|Aquos/i.test(ua);
   const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
-  return isLowEnd || isTV || reducedMotion;
+  // Settings → Performance → "Carrousels automatiques" or master Mode léger.
+  // Either disables auto-rotation; user can still swipe/drag manually.
+  let userDisabled = false;
+  try {
+    userDisabled = localStorage.getItem('settings_anim_carousel') === 'false'
+      || localStorage.getItem('settings_light_mode') === 'on';
+  } catch { /* localStorage unavailable (private mode, etc.) */ }
+  return isLowEnd || isTV || reducedMotion || userDisabled;
 };
 
 interface Media {
@@ -323,19 +330,21 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
                             transition={{ duration: 0.5, delay: 0.1 }}
                             className="space-y-3 sm:space-y-5"
                           >
-                            {/* Badges — backdrop-blur-md instead of -xl: ~2x cheaper on weak GPUs */}
+                            {/* Badges — backdrop-blur removed (was a per-frame
+                                filter pass on each); slightly more opaque
+                                solid bg keeps legibility against any backdrop. */}
                             <div className="flex flex-wrap gap-1.5 sm:gap-2 items-center">
-                              <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-white/10 backdrop-blur-md border border-white/20 text-white/90 text-[10px] sm:text-xs font-medium uppercase tracking-wider">
+                              <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-white/15 border border-white/20 text-white/90 text-[10px] sm:text-xs font-medium uppercase tracking-wider">
                                 {item.media_type === 'movie' ? t('search.movieLabel') : t('search.serieLabel')}
                               </span>
                               {year && (
-                                <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-white/5 backdrop-blur-md border border-white/10 text-white/80 text-[10px] sm:text-xs font-medium">
+                                <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-white/10 border border-white/10 text-white/80 text-[10px] sm:text-xs font-medium">
                                   <Calendar className="w-3 h-3" />
                                   {year}
                                 </span>
                               )}
                               {rating && (
-                                <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-yellow-500/15 backdrop-blur-md border border-yellow-500/30 text-yellow-300 text-[10px] sm:text-xs font-semibold">
+                                <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-yellow-500/25 border border-yellow-500/30 text-yellow-300 text-[10px] sm:text-xs font-semibold">
                                   <Star className="w-3 h-3 fill-current" />
                                   {rating}
                                 </span>
@@ -385,7 +394,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
                               <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                                 <Link
                                   to={`/${item.media_type}/${encodeId(item.id)}`}
-                                  className="inline-flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 sm:px-6 md:px-7 py-2.5 sm:py-3 rounded-xl sm:rounded-2xl text-sm sm:text-base font-medium backdrop-blur-md border border-white/20 transition-colors"
+                                  className="inline-flex items-center gap-2 bg-white/15 hover:bg-white/25 text-white px-4 sm:px-6 md:px-7 py-2.5 sm:py-3 rounded-xl sm:rounded-2xl text-sm sm:text-base font-medium border border-white/20 transition-colors"
                                 >
                                   <Info className="w-4 h-4 sm:w-5 sm:h-5" />
                                   {t('home.hero.moreInfo')}
@@ -405,7 +414,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
 
         {/* Bottom controls: dots + progress bar + pause */}
         <div className="absolute bottom-3 sm:bottom-4 md:bottom-6 left-0 right-0 z-30 flex items-center justify-center gap-4 px-3 sm:px-6 pointer-events-none">
-          <div className="flex items-center gap-2 sm:gap-3 bg-black/40 backdrop-blur-md border border-white/10 rounded-full px-3 sm:px-4 py-1.5 sm:py-2 pointer-events-auto">
+          <div className="flex items-center gap-2 sm:gap-3 bg-black/60 border border-white/10 rounded-full px-3 sm:px-4 py-1.5 sm:py-2 pointer-events-auto">
             {/* Dots */}
             <div className="flex items-center gap-1.5">
               {items.map((_, idx) => (

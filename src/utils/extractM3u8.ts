@@ -407,12 +407,15 @@ export async function extractUqloadFile(
 
   if (!uqloadUrl) return null;
 
+  // Normaliser tous TLDs uqload.* → uqload.is avant transmission (extension/serveur)
+  const normalizedUrl = uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is');
+
   // Try extension first (no VIP needed)
   if (hasNexusExtractors()) {
-    return tryExtensionFirst('uqload', uqloadUrl, () => extractUqloadFileServer(uqloadUrl));
+    return tryExtensionFirst('uqload', normalizedUrl, () => extractUqloadFileServer(normalizedUrl));
   }
 
-  return extractUqloadFileServer(uqloadUrl);
+  return extractUqloadFileServer(normalizedUrl);
 }
 
 async function extractUqloadFileServer(uqloadUrl: string): Promise<M3u8Result | null> {
@@ -436,8 +439,8 @@ async function extractUqloadFileServer(uqloadUrl: string): Promise<M3u8Result | 
   }
 
   try {
-    // Normaliser le domaine UQLOAD vers uqload.bz
-    const normalizedUrl = uqloadUrl.replace(/uqload\.(cx|com|net|co)/gi, 'uqload.bz');
+    // Normaliser le domaine UQLOAD vers uqload.is (tous TLDs)
+    const normalizedUrl = uqloadUrl.replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is');
     console.log(`[UQLOAD] Normalized URL: ${normalizedUrl}`);
 
     // Utiliser le serveur Python pour l'extraction UQLOAD

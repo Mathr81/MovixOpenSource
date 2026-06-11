@@ -35,7 +35,9 @@ const SYNCABLE_EXACT_KEYS = new Set([
   'subtitleStyle',
   'support_popup_seen',
   'user_language',
-  'is_vip',
+  // SECURITY (audit P0) : `is_vip` retiré du sync — c'est juste un cache UI
+  // côté frontend qui doit être recalculé via /api/check-vip à chaque session.
+  // Le laisser syncable permettait à n'importe qui de forger son statut VIP.
   'watched_movie',
   'watched_tv',
   'watchPartyNickname'

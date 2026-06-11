@@ -675,4 +675,5 @@ module.exports.readUserData = readUserData;
 module.exports.writeUserData = writeUserData;
 module.exports.readProfileData = readProfileData;
 module.exports.writeProfileData = writeProfileData;
+module.exports.withProfileSyncLock = withProfileSyncLock;
 module.exports.USERS_DIR = USERS_DIR;

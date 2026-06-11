@@ -65,7 +65,7 @@ Le fichier `API/Mainapi/.env.example` est la référence complète. En pratique,
 - cache et coordination : `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `NUM_WORKERS`
 - scraping / proxy : `PROXY_SERVER_URL`, `CF_PROXY_403_URL`, `BYPASS403_SERVER_URL`, `SOCKS5_PROXIES`, `HTTP_PROXIES`
 - anti-abuse / forms : `TURNSTILE_SECRET_KEY`, `TURNSTILE_INVISIBLE_SECRETKEY`
-- paiement / VIP : variables `VIP_*`, `BTC_EXPLORER_API`, `LTC_EXPLORER_API`
+- paiement / VIP : variables `VIP_*`, `BLOCKCYPHER_TOKEN`
 
 Certaines intégrations sont très spécifiques à des sources données, par exemple les cookies `DARKIWORLD_*`, `FSTREAM_LOGIN_*` ou `XTREAM_*`.
 

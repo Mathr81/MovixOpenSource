@@ -3,8 +3,17 @@ import { X, Maximize2, Play, Pause, Volume2, VolumeX } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useMiniPlayer } from '../context/MiniPlayerContext';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import { safePlay } from '../utils/safePlay';
+
+type HlsCtor = typeof Hls;
+let HlsLib: HlsCtor | null = null;
+const loadHls = async (): Promise<HlsCtor> => {
+  if (HlsLib) return HlsLib;
+  const mod = await import('hls.js');
+  HlsLib = mod.default;
+  return HlsLib;
+};
 
 const FloatingPlayer: React.FC = () => {
   const {
@@ -82,35 +91,34 @@ const FloatingPlayer: React.FC = () => {
     // Check if source is HLS
     const isHLS = videoSrc.includes('.m3u8') || videoSrc.includes('m3u8');
 
+    let cancelled = false;
+
     if (isHLS) {
-      if (Hls.isSupported()) {
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: false,
-          backBufferLength: 90,
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
-        });
+      (async () => {
+        const Hls = await loadHls();
+        if (cancelled) return;
+        if (Hls.isSupported()) {
+          const hls = new Hls({
+            enableWorker: true,
+            lowLatencyMode: false,
+            backBufferLength: 90,
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+          });
 
-        hls.loadSource(videoSrc);
-        hls.attachMedia(video);
-        hlsRef.current = hls;
+          hls.loadSource(videoSrc);
+          hls.attachMedia(video);
+          hlsRef.current = hls;
 
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            safePlay(video).catch(e => console.error('Autoplay failed:', e));
+          });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native HLS support (Safari)
+          video.src = videoSrc;
           safePlay(video).catch(e => console.error('Autoplay failed:', e));
-        });
-
-        return () => {
-          if (hlsRef.current) {
-            hlsRef.current.destroy();
-            hlsRef.current = null;
-          }
-        };
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Native HLS support (Safari)
-        video.src = videoSrc;
-        safePlay(video).catch(e => console.error('Autoplay failed:', e));
-      }
+        }
+      })();
     } else {
       // Direct MP4 or other formats
       video.src = videoSrc;
@@ -118,6 +126,7 @@ const FloatingPlayer: React.FC = () => {
     }
 
     return () => {
+      cancelled = true;
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;

@@ -254,16 +254,12 @@ async function axiosDarkinoRequest(config) {
   const requestUrl = `${DARKIWORLD_BASE_URL}${config.url}`;
   const darkinoRequestHeaders = await buildDarkinoRequestHeaders(config);
 
-  const debugDarkino = process.env.DEBUG_DARKINO !== 'false';
   const darkinoAuthSnapshot = {
     referer: darkinoRequestHeaders.referer,
     xsrfToken: truncateForLog(darkinoRequestHeaders['x-xsrf-token'] || '', 200),
     cookie: truncateForLog(darkinoRequestHeaders.cookie || '', 500),
     cookieLength: (darkinoRequestHeaders.cookie || '').length,
   };
-  if (debugDarkino) {
-    console.log(`[DARKINO REQUEST][DEBUG] ${String(config.method || 'get').toUpperCase()} ${requestUrl}`, darkinoAuthSnapshot);
-  }
 
   if (!ENABLE_DARKINO_PROXY) {
     // Si le proxy est d\u00e9sactiv\u00e9, faire la requ\u00eate directe
@@ -592,7 +588,17 @@ async function axiosFStreamRequest(config) {
     return response;
   } catch (error) {
     const status = error.response?.status;
-    console.error(`[FSTREAM REQUEST] Erreur ${status || error.code || 'unknown'} avec proxy ${proxyLabel}: ${error.message}`);
+    const method = (config.method || 'GET').toUpperCase();
+    const rawUrl = config.url || '';
+    const isAbs = /^https?:\/\//i.test(rawUrl);
+    const fullUrl = isAbs
+      ? rawUrl
+      : (config.baseURL ? `${config.baseURL.replace(/\/$/, '')}/${rawUrl.replace(/^\//, '')}` : rawUrl);
+    let qs = '';
+    if (config.params && typeof config.params === 'object') {
+      try { qs = '?' + new URLSearchParams(config.params).toString(); } catch (_) {}
+    }
+    console.error(`[FSTREAM REQUEST] Erreur ${status || error.code || 'unknown'} avec proxy ${proxyLabel}: ${error.message} | ${method} ${fullUrl}${qs}`);
     throw error;
   }
 }

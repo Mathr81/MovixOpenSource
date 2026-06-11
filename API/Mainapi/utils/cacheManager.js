@@ -407,6 +407,23 @@ const shouldUpdateCache24h = async (cacheDir, cacheKey) => {
   }
 };
 
+const shouldUpdateCache48h = async (cacheDir, cacheKey) => {
+  const cacheFilePath = path.join(cacheDir, `${cacheKey}.json`);
+  try {
+    const stats = await fsp.stat(cacheFilePath);
+    const now = Date.now();
+    const fileAge = now - stats.mtime.getTime();
+    const fortyEightHours = 48 * 60 * 60 * 1000;
+
+    if (fileAge < fortyEightHours) {
+      return false;
+    }
+    return true;
+  } catch (error) {
+    return true;
+  }
+};
+
 module.exports = {
   CACHE_DIR,
   ANIME_SAMA_CACHE_DIR,
@@ -421,6 +438,7 @@ module.exports = {
   shouldUpdateCacheFrenchStream,
   shouldUpdateCacheLecteurVideo,
   shouldUpdateCache24h,
+  shouldUpdateCache48h,
   ongoingFStreamRequests,
   getOrCreateFStreamRequest,
   saveFStreamToCache,

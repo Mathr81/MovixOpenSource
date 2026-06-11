@@ -1,7 +1,11 @@
 import React, { useEffect, useRef } from 'react';
-import videojs from 'video.js';
+import type videojsType from 'video.js';
 import 'video.js/dist/video-js.css';
-import Player from 'video.js/dist/types/player';
+import type Player from 'video.js/dist/types/player';
+
+let videojsLib: typeof videojsType | null = null;
+const loadVideoJS = async (): Promise<typeof videojsType> =>
+  videojsLib ?? (videojsLib = (await import('video.js')).default);
 
 interface VideoJSPlayerProps {
   src: string;
@@ -22,6 +26,8 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
   const playerRef = useRef<Player | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
     // Options setup
     const options = {
       autoplay: true,
@@ -44,31 +50,40 @@ export const VideoJSPlayer: React.FC<VideoJSPlayerProps> = ({
       }
     };
 
-    // Initialize player
-    if (!playerRef.current) {
-      const videoElement = document.createElement("video-js");
-      videoElement.classList.add('vjs-big-play-centered');
+    (async () => {
+      const videojs = await loadVideoJS();
+      if (cancelled) return;
 
-      if (videoRef.current) {
-        videoRef.current.appendChild(videoElement);
+      // Initialize player
+      if (!playerRef.current) {
+        const videoElement = document.createElement("video-js");
+        videoElement.classList.add('vjs-big-play-centered');
+
+        if (videoRef.current) {
+          videoRef.current.appendChild(videoElement);
+        }
+
+        const player = playerRef.current = videojs(videoElement, options, () => {
+          videojs.log('player is ready');
+          onReady && onReady(player);
+        });
+
+        player.on('error', () => {
+          console.error('VideoJS Error:', player.error());
+          onError && onError(player.error());
+        });
+
+      } else {
+        // Update existing player
+        const player = playerRef.current;
+        player.src(options.sources);
+        player.poster(options.poster || '');
       }
+    })();
 
-      const player = playerRef.current = videojs(videoElement, options, () => {
-        videojs.log('player is ready');
-        onReady && onReady(player);
-      });
-
-      player.on('error', () => {
-        console.error('VideoJS Error:', player.error());
-        onError && onError(player.error());
-      });
-
-    } else {
-      // Update existing player
-      const player = playerRef.current;
-      player.src(options.sources);
-      player.poster(options.poster || '');
-    }
+    return () => {
+      cancelled = true;
+    };
   }, [src, type, poster, onReady, onError]);
 
   // Dispose the player on unmount

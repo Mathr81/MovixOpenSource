@@ -8,6 +8,7 @@ import axios from 'axios'
 import { api } from './services/api'
 import { registerBlockDetection } from './services/blockDetection'
 import './index.css'
+import './styles/light-mode.css'
 
 type MovixConsoleWarningWindow = Window & {
   __movixConsoleSafetyWarningStarted?: boolean;

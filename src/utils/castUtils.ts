@@ -91,21 +91,38 @@ export interface CastMediaInfo {
     }>;
   };
   customData?: any;
+  // Populated by loadMediaOnCastWithFallback when external subtitle tracks are
+  // attached. Each entry is a `chrome.cast.media.Track` instance.
+  tracks?: any[];
+  // Default rendering style for the receiver's text track UI.
+  textTrackStyle?: any;
+}
+
+/**
+ * External subtitle track to attach to a cast media load. Shape kept tiny so
+ * callers don't need to import chrome.cast types — we build the SDK Track
+ * objects internally inside loadMediaOnCastWithFallback.
+ */
+export interface CastSubtitleTrack {
+  url: string;       // Direct WebVTT URL accessible from the receiver's network
+  language: string;  // BCP-47 code (e.g. 'fr', 'en', 'es')
+  label: string;     // Human-readable name shown in the receiver's track menu
 }
 
 /**
  * Detect media type from URL
  */
 export const detectMediaType = (url: string): MediaType | 'html' => {
-  // Check for uqload URLs - they serve MP4 streams
-  if (url.includes('uqload.cx') || url.includes('uqload')) {
-    return 'mp4';
-  }
-
   if (url.includes('.m3u8') || url.includes('m3u8')) {
     return 'm3u8';
   }
   if (url.includes('.mp4') || url.includes('mp4')) {
+    return 'mp4';
+  }
+
+  // Uqload sert soit du HLS (master.m3u8) soit du MP4 (v.mp4) — le check
+  // .m3u8/.mp4 ci-dessus suffit. Fallback mp4 pour URLs uqload sans extension claire.
+  if (url.includes('uqload')) {
     return 'mp4';
   }
 
@@ -677,18 +694,22 @@ export const loadMediaOnCast = async (
   session: any,
   mediaInfo: CastMediaInfo,
   currentTime: number = 0,
-  autoplay: boolean = true
+  autoplay: boolean = true,
+  activeTrackIds?: number[],
 ): Promise<void> => {
   return new Promise((resolve, reject) => {
     if (!session || !(window as any).chrome?.cast?.media) {
       reject(new Error('Invalid session or Cast media API not available'));
       return;
     }
-    
+
     const request = new (window as any).chrome.cast.media.LoadRequest(mediaInfo);
     request.currentTime = currentTime;
     request.autoplay = autoplay;
-    
+    if (activeTrackIds && activeTrackIds.length > 0) {
+      request.activeTrackIds = activeTrackIds;
+    }
+
     session.loadMedia(request, () => {
       console.log('Media loaded on cast device');
       resolve();
@@ -697,6 +718,105 @@ export const loadMediaOnCast = async (
       reject(error);
     });
   });
+};
+
+/**
+ * Candidate Content-Type values to try when loading an HLS stream onto a
+ * Chromecast receiver. Different receivers (Default Media Receiver, Built-in
+ * Cast on Android TVs, older 1st-gen Chromecasts, custom CAFv3 receivers) all
+ * normalise the MIME slightly differently and a single hard-coded value can
+ * fail on some hardware. Order: most-spec-compliant first.
+ */
+export const getHLSContentTypes = (_url: string): string[] => [
+  'application/vnd.apple.mpegurl', // RFC 8216, broadest receiver support
+  'application/x-mpegurl',         // older Apple variant, lowercase
+  'application/x-mpegURL',         // mixed-case, what Movix used historically
+];
+
+/**
+ * Get candidate content types for a given media URL — HLS gets multiple,
+ * other formats get exactly one.
+ */
+const getCastContentTypes = (mediaUrl: string): string[] => {
+  const mediaType = detectMediaType(mediaUrl);
+  if (mediaType === 'm3u8') return getHLSContentTypes(mediaUrl);
+  if (mediaType === 'mp4')  return ['video/mp4'];
+  if (mediaType === 'html') return ['text/html'];
+  return ['application/x-mpegURL'];
+};
+
+/**
+ * Load media on a cast session, retrying with alternative content-types if the
+ * first attempt fails. Mirrors what cinepulse.ac's ChromecastService does — a
+ * single hard-coded Content-Type fails on receivers that disagree with our MIME
+ * choice; iterating gives the cast a real chance to succeed.
+ *
+ * Throws the LAST error if every content-type was rejected by the receiver.
+ */
+export const loadMediaOnCastWithFallback = async (
+  session: any,
+  mediaUrl: string,
+  title: string,
+  poster?: string,
+  currentTime: number = 0,
+  autoplay: boolean = true,
+  subtitles: CastSubtitleTrack[] = [],
+  enableSubtitlesInitially: boolean = false,
+): Promise<void> => {
+  const contentTypes = getCastContentTypes(mediaUrl);
+  const baseMediaInfo = prepareCastMediaInfo(mediaUrl, title, poster, currentTime);
+
+  // Attach external subtitle tracks if any. The Default Media Receiver only
+  // handles WebVTT — SRT URLs will land but won't render. We still send them
+  // so the cast itself isn't blocked; user can pick another source.
+  let activeTrackIds: number[] | undefined;
+  const castMediaApi = (window as any).chrome?.cast?.media;
+  if (subtitles.length > 0 && castMediaApi?.Track) {
+    try {
+      const tracks = subtitles.map((sub, idx) => {
+        const track = new castMediaApi.Track(idx + 1, castMediaApi.TrackType?.TEXT ?? 'TEXT');
+        track.trackContentId = sub.url;
+        track.trackContentType = 'text/vtt';
+        track.subtype = castMediaApi.TextTrackType?.SUBTITLES ?? 'SUBTITLES';
+        track.name = sub.label;
+        track.language = sub.language;
+        return track;
+      });
+      baseMediaInfo.tracks = tracks;
+
+      // Default styling — readable on most TV backgrounds.
+      if (typeof castMediaApi.TextTrackStyle === 'function') {
+        const style = new castMediaApi.TextTrackStyle();
+        style.backgroundColor = '#00000080'; // 50% black behind glyphs
+        style.foregroundColor = '#FFFFFFFF';
+        style.fontScale = 1.0;
+        style.edgeColor = '#000000FF';
+        style.edgeType = castMediaApi.TextTrackEdgeType?.OUTLINE ?? 'OUTLINE';
+        baseMediaInfo.textTrackStyle = style;
+      }
+
+      if (enableSubtitlesInitially) {
+        activeTrackIds = [tracks[0].trackId];
+      }
+    } catch (err) {
+      console.warn('[Cast] Could not build subtitle tracks (cast SDK shape mismatch?):', err);
+    }
+  }
+
+  let lastError: any = null;
+  for (const contentType of contentTypes) {
+    const mediaInfo: CastMediaInfo = { ...baseMediaInfo, contentType };
+    try {
+      console.log('[Cast] Trying contentType:', contentType, 'subs:', subtitles.length, 'active:', !!activeTrackIds);
+      await loadMediaOnCast(session, mediaInfo, currentTime, autoplay, activeTrackIds);
+      console.log('[Cast] Loaded successfully with contentType:', contentType);
+      return;
+    } catch (error) {
+      console.warn(`[Cast] contentType ${contentType} rejected:`, error);
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error('All cast content types rejected by receiver');
 };
 
 // ============================================================================
@@ -711,10 +831,32 @@ export const loadMediaOnCast = async (
  */
 export const isAirPlaySupported = (): boolean => {
   if (typeof window === 'undefined') return false;
-  
+
   // Check for WebKit AirPlay API - only available in Safari
   const video = document.createElement('video') as any;
   return typeof video.webkitShowPlaybackTargetPicker === 'function';
+};
+
+/**
+ * Check whether the W3C Remote Playback API is usable as an AirPlay-like
+ * fallback signal. Skipped when WebKit AirPlay is already available (Safari)
+ * or when the Cast SDK is already loaded (Chrome/Edge with cast.framework) —
+ * those paths handle device discovery natively, so doubling up would only
+ * confuse the picker UX.
+ *
+ * Use case: Firefox / Edge with cast extension blocked / Brave with shields
+ * blocking gstatic.com. These browsers lose the cast.framework path but still
+ * expose `HTMLMediaElement.prototype.remote`, which gives us cross-browser
+ * availability detection and a programmatic picker (`remote.prompt()`).
+ */
+export const isRemotePlaybackSupported = (videoElement?: HTMLVideoElement): boolean => {
+  if (typeof window === 'undefined') return false;
+  // Already covered by chrome.cast.framework — don't dispatch a competing picker.
+  if ((window as any).chrome?.cast) return false;
+  // Already covered by WebKit AirPlay APIs — same reason.
+  if (isAirPlaySupported()) return false;
+  const video = (videoElement ?? document.createElement('video')) as any;
+  return !!video.remote && typeof video.remote.watchAvailability === 'function';
 };
 
 /**
@@ -755,8 +897,52 @@ export const initializeAirPlay = (
   
   // Check if AirPlay is supported
   const isSupported = isAirPlaySupported();
-  
+
   if (!isSupported) {
+    // No WebKit AirPlay — try the W3C Remote Playback API as a fallback so
+    // browsers without cast.framework AND without WebKit AirPlay (Firefox,
+    // Edge with cast blocked, Brave with shields) still get device discovery
+    // and a working picker via `video.remote`.
+    if (isRemotePlaybackSupported(video)) {
+      console.log('[RemotePlayback] Initializing as AirPlay-like fallback');
+      const remote = (video as any).remote;
+      if ('disableRemotePlayback' in video) (video as any).disableRemotePlayback = false;
+
+      let availabilityCallbackId: number | null = null;
+      let lastAvailable = false;
+      const dispatch = () => onStateChange?.({
+        isAvailable: lastAvailable,
+        isConnected: remote.state === 'connected',
+        isConnecting: remote.state === 'connecting',
+      });
+      const handleConnecting = () => onStateChange?.({ isAvailable: lastAvailable, isConnected: false, isConnecting: true });
+      const handleConnect    = () => onStateChange?.({ isAvailable: lastAvailable, isConnected: true,  isConnecting: false });
+      const handleDisconnect = () => onStateChange?.({ isAvailable: lastAvailable, isConnected: false, isConnecting: false });
+
+      remote.addEventListener('connecting', handleConnecting);
+      remote.addEventListener('connect',    handleConnect);
+      remote.addEventListener('disconnect', handleDisconnect);
+
+      Promise.resolve(remote.watchAvailability((available: boolean) => {
+        lastAvailable = available;
+        dispatch();
+      }))
+        .then((id: number) => { availabilityCallbackId = id; })
+        .catch((err: unknown) => console.warn('[RemotePlayback] watchAvailability failed:', err));
+
+      // Initial state — availability not known yet, just report current connection state.
+      dispatch();
+
+      return () => {
+        remote.removeEventListener('connecting', handleConnecting);
+        remote.removeEventListener('connect',    handleConnect);
+        remote.removeEventListener('disconnect', handleDisconnect);
+        if (availabilityCallbackId !== null && typeof remote.cancelWatchAvailability === 'function') {
+          try { remote.cancelWatchAvailability(availabilityCallbackId); } catch { /* swallow — page tearing down */ }
+        }
+      };
+    }
+
     console.log('[AirPlay] Not supported on this device/browser');
     onStateChange?.({ isAvailable: false, isConnected: false, isConnecting: false });
     return () => {}; // Return empty cleanup function
@@ -848,34 +1034,43 @@ export const initializeAirPlay = (
  * Note: This must be triggered by a user gesture (e.g., button click)
  */
 export const requestAirPlay = async (videoElement: HTMLVideoElement): Promise<void> => {
-  if (!isAirPlaySupported()) {
-    throw new Error('AirPlay is not supported on this device/browser');
-  }
-
   const video = videoElement as HTMLVideoElementWithAirPlay;
-  
-  if (typeof video.webkitShowPlaybackTargetPicker !== 'function') {
-    throw new Error('AirPlay device picker is not available');
+
+  // Prefer the WebKit-native picker on Safari — full AirPlay UX, returns
+  // synchronously after showing the system sheet.
+  if (typeof video.webkitShowPlaybackTargetPicker === 'function') {
+    try {
+      console.log('[AirPlay] Showing WebKit device picker...');
+      video.setAttribute('x-webkit-airplay', 'allow');
+      if (typeof video.webkitWirelessVideoPlaybackDisabled !== 'undefined') {
+        video.webkitWirelessVideoPlaybackDisabled = false;
+      }
+      video.webkitShowPlaybackTargetPicker();
+      console.log('[AirPlay] WebKit picker shown');
+      return;
+    } catch (error) {
+      console.warn('[AirPlay] WebKit picker failed, will try Remote Playback API:', error);
+      // fall through
+    }
   }
 
-  try {
-    console.log('[AirPlay] Showing device picker...');
-    
-    // Ensure AirPlay is enabled before showing picker
-    video.setAttribute('x-webkit-airplay', 'allow');
-    if (typeof video.webkitWirelessVideoPlaybackDisabled !== 'undefined') {
-      video.webkitWirelessVideoPlaybackDisabled = false;
+  // W3C Remote Playback API fallback — only used when neither WebKit AirPlay
+  // nor cast.framework picker is available (= isRemotePlaybackSupported() path).
+  const remote = (video as any).remote;
+  if (remote && typeof remote.prompt === 'function') {
+    try {
+      console.log('[RemotePlayback] Calling remote.prompt() as AirPlay fallback');
+      if ('disableRemotePlayback' in video) (video as any).disableRemotePlayback = false;
+      await remote.prompt();
+      console.log('[RemotePlayback] Picker shown');
+      return;
+    } catch (error) {
+      console.error('[RemotePlayback] remote.prompt() failed:', error);
+      throw error;
     }
-    
-    // Show the native AirPlay device picker
-    // Note: This method doesn't return a promise, it just shows the UI
-    video.webkitShowPlaybackTargetPicker();
-    
-    console.log('[AirPlay] Device picker shown successfully');
-  } catch (error) {
-    console.error('[AirPlay] Failed to show device picker:', error);
-    throw error;
   }
+
+  throw new Error('AirPlay/Remote Playback is not supported on this device/browser');
 };
 
 /**

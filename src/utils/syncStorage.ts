@@ -45,7 +45,14 @@ const SYNCABLE_PREFIXES = [
   'watched_',
 ];
 
+// Persistent outbox of pending sync ops. Survives refresh so a user write that
+// didn't reach the server before unload (Firefox keepalive flake, network
+// hiccup, browser crash) is replayed on next boot before loadProfileData wipes
+// localStorage. See ProfileContext.replayOutboxIfAny.
+export const SYNC_OUTBOX_STORAGE_KEY = '__movix_sync_outbox';
+
 const BLOCKED_SYNC_KEYS = new Set([
+  SYNC_OUTBOX_STORAGE_KEY,
   'access_token',
   'auth',
   'auth_method',
@@ -81,6 +88,7 @@ const BLOCKED_SYNC_KEYS = new Set([
 ]);
 
 const PROFILE_LOAD_PRESERVED_KEYS = new Set([
+  SYNC_OUTBOX_STORAGE_KEY,
   'access_token',
   'auth',
   'auth_method',

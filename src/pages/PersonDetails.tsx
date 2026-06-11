@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
 import { motion } from 'framer-motion';
 import { ExternalLink, Clock, Star } from 'lucide-react';

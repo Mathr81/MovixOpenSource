@@ -1,12 +1,11 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
-import { useParams, Link, useSearchParams, useNavigate } from 'react-router-dom';
+import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
 import { Loader, Video, Star, Calendar, List, Check, FolderPlus, ChevronRight, AlertTriangle, Play, X, MapPin, Languages, Building, ArrowLeft, Image, Download, Shield, EyeOff, MessageSquare, Archive, CheckCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import AddToListMenu from '../components/AddToListMenu';
 import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
@@ -380,6 +379,13 @@ const TVImagesSection = ({ tvId }: { tvId: string }) => {
     setDownloadedCount(0);
 
     try {
+      // Lazy-load jszip + file-saver only when the user triggers the bulk download.
+      const [jszipMod, fileSaverMod] = await Promise.all([
+        import('jszip'),
+        import('file-saver'),
+      ]);
+      const JSZip = jszipMod.default;
+      const { saveAs } = fileSaverMod;
       const zip = new JSZip();
       const folder = zip.folder(`tv-${tvId}-${selectedCategory}`);
 
@@ -1181,7 +1187,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
   const { t } = useTranslation();
   const [videoSource, setVideoSource] = useState<string | null>(null);
   const [customSources, setCustomSources] = useState<string[]>([]);
-  const [selectedSource, setSelectedSource] = useState<'primary' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number | null>(null); // Ajout de 'mp4'
+  const [selectedSource, setSelectedSource] = useState<'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number | null>(null); // Ajout de 'mp4'
   const [frembedAvailable, setFrembedAvailable] = useState<boolean>(true);
   const [, setIsLoading] = useState(true);
   const [coflixData, setCoflixData] = useState<CoflixResponse | null>(null);
@@ -1502,9 +1508,12 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
       // Handled by HLSPlayer component
       return;
     }
-    switch (selectedSource as 'primary' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number) {
+    switch (selectedSource as 'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number) {
       case 'primary':
         newSrc = `https://frembed.click/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
+        break;
+      case 'peachify':
+        newSrc = `https://peachify.top/embed/tv/${showId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
         break;
       case 'vostfr':
         newSrc = `https://vidsrc.wtf/api/3/tv/?id=${showId}&s=${seasonNumber}&e=${episodeNumber}`;
@@ -1737,7 +1746,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
         <div className="relative">
           <button
             onClick={() => setShowVostfrOptions(!showVostfrOptions)}
-            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
+            className={`px-4 py-2 rounded flex items-center gap-2 ${(selectedSource === 'peachify' || selectedSource === 'vostfr' || selectedSource === 'videasy' || selectedSource === 'vidsrccc' || selectedSource === 'vidsrcsu' || selectedSource === 'vidsrcwtf1' || selectedSource === 'vidsrcwtf5')
               ? 'bg-red-600 text-white'
               : 'bg-gray-700 hover:bg-gray-600'
               }`}
@@ -1757,13 +1766,23 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
           {showVostfrOptions && (
             <div className="absolute z-50 top-full left-0 mt-1 bg-gray-800 rounded-lg shadow-lg overflow-hidden min-w-[200px]">
               <button
+                onClick={() => handleSelectSource('peachify')}
+                className={`w-full px-4 py-2 text-left ${selectedSource === 'peachify'
+                  ? 'bg-red-600/70 text-white'
+                  : 'hover:bg-gray-700'
+                  }`}
+              >
+                Peachify
+              </button>
+
+              <button
                 onClick={() => handleSelectSource('vostfr')}
                 className={`w-full px-4 py-2 text-left ${selectedSource === 'vostfr'
                   ? 'bg-red-600/70 text-white'
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 1 })}
+                Vidsrc.wtf 3
               </button>
 
               <button
@@ -1773,7 +1792,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 2 })}
+                Vidlink
               </button>
 
               <button
@@ -1783,7 +1802,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 3 })}
+                Vidsrc.io
               </button>
 
               <button
@@ -1793,7 +1812,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 4 })}
+                Vidsrc.su
               </button>
 
               <button
@@ -1803,7 +1822,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 5 })}
+                Vidsrc.wtf 1
               </button>
 
               <button
@@ -1813,7 +1832,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
                   : 'hover:bg-gray-700'
                   }`}
               >
-                {t('details.playerVOSTFR', { number: 6 })}
+                Vidsrc.wtf 5
               </button>
             </div>
           )}
@@ -3192,52 +3211,90 @@ const TVDetails: React.FC = () => {
     hasProgress: false
   });
 
+  type ContinueWatchingTvEntry = {
+    id: number;
+    currentEpisode?: {
+      season: number;
+      episode: number;
+    };
+    lastAccessed?: string;
+  };
+
   useEffect(() => {
     // Load any existing watch progress
     if (id) {
       try {
-        // First, check the continueWatching localStorage data
-        const continueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}');
-
-        if (continueWatching.tv && Array.isArray(continueWatching.tv)) {
-          const showIdInt = parseInt(id);
-          const tvShow = continueWatching.tv.find((show: any) => show.id === showIdInt);
-
-          if (tvShow && tvShow.currentEpisode) {
-            // Try to get detailed progress data for this specific episode
-            const progressKey = `progress_tv_${id}_s${tvShow.currentEpisode.season}_e${tvShow.currentEpisode.episode}`;
-            const progressValue = localStorage.getItem(progressKey);
-            let position = 0;
-            let duration = 0;
-
-            if (progressValue) {
-              try {
-                const progressData = JSON.parse(progressValue);
-                position = Number(progressData.position) || 0;
-                duration = Number(progressData.duration) || 0;
-              } catch (error) {
-                console.error('Error parsing progress data:', error);
-              }
-            }
-
-            setContinueWatchingData({
-              seasonNumber: tvShow.currentEpisode.season,
-              episodeNumber: tvShow.currentEpisode.episode,
-              position: position,
-              duration: duration,
-              hasProgress: true
-            });
-            return;
-          }
-        }
-
-        // Fallback: check old progress_tv_* keys for backward compatibility
         let latestTimestamp = -1;
         let latestSeason = 1;
         let latestEpisode = 1;
         let latestPosition = 0;
         let latestDuration = 0;
 
+        const considerCandidate = (
+          seasonNumber: number,
+          episodeNumber: number,
+          timestampMs: number,
+          position = 0,
+          duration = 0
+        ) => {
+          if (!Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) return;
+          if (seasonNumber <= 0 || episodeNumber <= 0) return;
+          if (!Number.isFinite(timestampMs)) return;
+
+          if (timestampMs > latestTimestamp) {
+            latestTimestamp = timestampMs;
+            latestSeason = seasonNumber;
+            latestEpisode = episodeNumber;
+            latestPosition = Number(position) || 0;
+            latestDuration = Number(duration) || 0;
+          }
+        };
+
+        // First, check the continueWatching localStorage data
+        const continueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}') as {
+          tv?: ContinueWatchingTvEntry[];
+        };
+
+        if (continueWatching.tv && Array.isArray(continueWatching.tv)) {
+          const showIdInt = parseInt(id);
+          const tvShow = continueWatching.tv.find((show) => show.id === showIdInt);
+
+          if (tvShow && tvShow.currentEpisode) {
+            const seasonFromContinue = Number(tvShow.currentEpisode.season);
+            const episodeFromContinue = Number(tvShow.currentEpisode.episode);
+            const continueTs = tvShow.lastAccessed ? Date.parse(tvShow.lastAccessed) : NaN;
+
+            // Try to get detailed progress data for this specific episode
+            const progressKey = `progress_tv_${id}_s${seasonFromContinue}_e${episodeFromContinue}`;
+            const progressValue = Number.isFinite(seasonFromContinue) && Number.isFinite(episodeFromContinue)
+              ? localStorage.getItem(progressKey)
+              : null;
+            let position = 0;
+            let duration = 0;
+            let progressTs = NaN;
+
+            if (progressValue) {
+              try {
+                const progressData = JSON.parse(progressValue);
+                position = Number(progressData.position) || 0;
+                duration = Number(progressData.duration) || 0;
+                progressTs = progressData.timestamp ? Date.parse(progressData.timestamp) : NaN;
+              } catch (error) {
+                console.error('Error parsing progress data:', error);
+              }
+            }
+
+            const effectiveTimestamp = Number.isFinite(progressTs)
+              ? progressTs
+              : Number.isFinite(continueTs)
+                ? continueTs
+                : NaN;
+
+            considerCandidate(seasonFromContinue, episodeFromContinue, effectiveTimestamp, position, duration);
+          }
+        }
+
+        // Also check all progress_tv_* keys and keep the most recent by timestamp
         const keyPrefix = `progress_tv_${id}_s`;
         for (let i = 0; i < localStorage.length; i++) {
           const key = localStorage.key(i);
@@ -3253,13 +3310,13 @@ const TVDetails: React.FC = () => {
             const progressData = JSON.parse(value);
             const ts = progressData.timestamp ? Date.parse(progressData.timestamp) : NaN;
             if (!Number.isFinite(ts)) continue;
-            if (ts > latestTimestamp) {
-              latestTimestamp = ts;
-              latestSeason = season;
-              latestEpisode = episode;
-              latestPosition = Number(progressData.position) || 0;
-              latestDuration = Number(progressData.duration) || 0;
-            }
+            considerCandidate(
+              season,
+              episode,
+              ts,
+              Number(progressData.position) || 0,
+              Number(progressData.duration) || 0
+            );
           } catch (_) {
             // ignore malformed entries
           }
@@ -3270,7 +3327,7 @@ const TVDetails: React.FC = () => {
           let effectiveSeason = latestSeason;
           let effectiveEpisode = latestEpisode;
 
-          if (availableSeasons.length > 0 && !availableSeasons.includes(effectiveSeason)) {
+          if (!animeMode && availableSeasons.length > 0 && !availableSeasons.includes(effectiveSeason)) {
             effectiveSeason = defaultStartSeason;
             effectiveEpisode = 1;
           }
@@ -3297,7 +3354,7 @@ const TVDetails: React.FC = () => {
         console.error('Error parsing continue watching data:', error);
       }
     }
-  }, [id, availableSeasons, defaultStartSeason]);
+  }, [id, animeMode, availableSeasons, defaultStartSeason]);
   // Fonction pour continuer le visionnage
   const handleContinueWatching = () => {
     // Use the progress data if available, otherwise start from the first episode
@@ -3836,7 +3893,7 @@ const TVDetails: React.FC = () => {
       const backdrops = imagesResponse.data.backdrops;
       if (backdrops && backdrops.length > 0) {
         const bestBackdrop = backdrops.sort((a: any, b: any) => b.width - a.width)[0];
-        setBackdropImage(`https://image.tmdb.org/t/p/original${bestBackdrop.file_path}`);
+        setBackdropImage(`https://image.tmdb.org/t/p/w1280${bestBackdrop.file_path}`);
       }
 
       // Récupérer la bande-annonce
@@ -4462,7 +4519,7 @@ const TVDetails: React.FC = () => {
   const tvDescription = tvShow.overview?.trim() || `Découvrez ${tvShow.name} sur Movix.`;
 
   return (
-    <>
+    <MotionConfig reducedMotion="user">
       <SEO
         title={tvTitle}
         description={tvDescription}
@@ -4471,15 +4528,19 @@ const TVDetails: React.FC = () => {
         ogImage={tvSocialImage}
         canonical={tvCanonicalUrl}
       />
+      {/* Page backdrop — own compositing layer (position:fixed) instead of
+          backgroundAttachment:fixed, which forces full-page re-rasterization
+          on every scroll frame and tanks FPS on heavy details pages. */}
       <div
-        className="min-h-screen bg-black"
-        style={{
-          backgroundImage: backdropImage ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})` : undefined,
+        aria-hidden="true"
+        className="fixed inset-0 z-0 pointer-events-none bg-black"
+        style={backdropImage ? {
+          backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})`,
           backgroundSize: 'cover',
           backgroundPosition: 'center',
-          backgroundAttachment: 'fixed'
-        }}
-      >
+        } : undefined}
+      />
+      <div className="relative z-10 min-h-screen">
         <style>{`
         /* Netflix-style poster hover effects - COPIED FROM MovieDetails.tsx */
         .content-row-container {
@@ -7086,7 +7147,7 @@ const TVDetails: React.FC = () => {
 
 
       </div>
-    </>
+    </MotionConfig>
   );
 };
 

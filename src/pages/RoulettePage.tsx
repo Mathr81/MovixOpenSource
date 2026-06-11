@@ -1,11 +1,19 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
 import { Dices, Star, Calendar, RotateCcw, Info, ChevronDown, ChevronUp, Sparkles, X } from 'lucide-react';
 import { motion, AnimatePresence, useAnimation } from 'framer-motion';
-import confetti from 'canvas-confetti';
+import type confettiType from 'canvas-confetti';
 import { toast } from 'sonner';
+
+let confettiLib: typeof confettiType | null = null;
+const loadConfetti = async (): Promise<typeof confettiType> => {
+  if (confettiLib) return confettiLib;
+  const mod = await import('canvas-confetti');
+  confettiLib = mod.default;
+  return confettiLib;
+};
 import SEO from '../components/SEO';
 import { SquareBackground } from '../components/ui/square-background';
 import ShinyText from '../components/ui/shiny-text';
@@ -110,7 +118,8 @@ interface RouletteItem {
 }
 
 // ─── Confetti (canvas-confetti) ──────────────────────────────────────────────
-const fireConfetti = () => {
+const fireConfetti = async () => {
+  const confetti = await loadConfetti();
   const end = Date.now() + 2500;
   const colors = ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#ec4899'];
 

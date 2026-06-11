@@ -680,7 +680,7 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
             (ep) => parseInt(ep.number) === parseInt(episodeNumber),
           );
           if (episode && episode.links) {
-            episodeUrl = episode.links.startsWith("https://coflix.click")
+            episodeUrl = episode.links.startsWith("https://coflix.date")
               ? `${episode.links}`
               : episode.links;
           }
@@ -688,7 +688,7 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
       }
 
       if (!episodeUrl) {
-        episodeUrl = `https://coflix.click/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
+        episodeUrl = `https://coflix.date/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
       }
 
       try {

@@ -1,10 +1,26 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import React, { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, memo, useMemo } from 'react';
-import Hls from 'hls.js';
+import type HlsType from 'hls.js';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, Rewind, FastForward, Volume1, ChevronRight, PictureInPicture, Users, Loader2, Repeat, Cast, Airplay, Info, X, Copy, Check, Lock } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import pako from 'pako';
+import type pakoType from 'pako';
+
+let HlsLib: typeof HlsType | null = null;
+const loadHls = async (): Promise<typeof HlsType> => {
+  if (HlsLib) return HlsLib;
+  const mod = await import('hls.js');
+  HlsLib = mod.default;
+  return HlsLib;
+};
+
+let pakoLib: typeof pakoType | null = null;
+const loadPako = async (): Promise<typeof pakoType> => {
+  if (pakoLib) return pakoLib;
+  const mod = await import('pako');
+  pakoLib = mod.default;
+  return pakoLib;
+};
 import HLSPlayerSettingsPanel from './HLSPlayerSettingsPanel';
 import { toast } from 'sonner';
 import { isUserVip } from '../utils/authUtils';
@@ -12,14 +28,14 @@ import { isDnsLikeError, notifyDnsBlocked } from '../utils/dnsErrorDetection';
 import {
   initializeCastApi,
   requestCastSession,
-  loadMediaOnCast,
-  prepareCastMediaInfo,
+  loadMediaOnCastWithFallback,
   parseM3u8Manifest,
   selectBestStream,
   preferFrenchAudioVariant,
   initializeAirPlay,
   requestAirPlay,
-  isAirPlaySupported
+  isAirPlaySupported,
+  isRemotePlaybackSupported,
 } from '../utils/castUtils';
 import { useAntiSpoilerSettings } from '../hooks/useAntiSpoilerSettings';
 import { useTranslation } from 'react-i18next';
@@ -92,8 +108,8 @@ const clampVolume = (v: number) => Math.max(0, Math.min(1, v));
 
 const normalizeUqloadEmbedUrl = (url: string): string => {
   return url
-    .replace(/uqload\.bz/gi, 'uqload.is')
-    .replace(/uqload%2ebz/gi, 'uqload%2eis');
+    .replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is')
+    .replace(/uqload%2e[a-z0-9-]+/gi, 'uqload%2eis');
 };
 
 // On DNS-level ISP blocks, cascading through every remaining HLS source is
@@ -921,7 +937,24 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
+  const hlsRef = useRef<HlsType | null>(null);
+  // Lazy-loaded HLS.js constructor — see loadHls() at top of file. Stored in state
+  // so effects depending on it re-run after the first dynamic import resolves.
+  // Initial value MUST be wrapped in `() => HlsLib`: once the dynamic import has
+  // resolved, HlsLib points to the Hls *class*. Passing it directly makes React's
+  // useState see `typeof === 'function'` and invoke it as a lazy initializer
+  // without `new` — which a class constructor rejects with
+  // "Class constructor e cannot be invoked without 'new'" on every remount
+  // (e.g. when the parent's `key` changes after a source switch).
+  const [Hls, setHls] = useState<typeof HlsType | null>(() => HlsLib);
+  useEffect(() => {
+    if (Hls) return;
+    let cancelled = false;
+    void loadHls().then((lib) => {
+      if (!cancelled) setHls(() => lib);
+    });
+    return () => { cancelled = true; };
+  }, [Hls]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [volume, setVolume] = useState(() => {
@@ -1148,7 +1181,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   });
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
-  const previewHlsRef = useRef<Hls | null>(null);
+  const previewHlsRef = useRef<HlsType | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [previewStyle, setPreviewStyle] = useState({});
 
@@ -1340,7 +1373,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       if (backdrops && backdrops.length > 0) {
         // Trier par résolution et choisir la meilleure
         const bestBackdrop = backdrops.sort((a: any, b: any) => b.width - a.width)[0];
-        setPipBackdropImage(`https://image.tmdb.org/t/p/original${bestBackdrop.file_path}`);
+        setPipBackdropImage(`https://image.tmdb.org/t/p/w1280${bestBackdrop.file_path}`);
       }
     } catch (error) {
       console.error('Error fetching PiP backdrop image:', error);
@@ -1355,6 +1388,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // CAST_STATE_CHANGED listener effect as soon as the framework is ready,
   // without waiting for the user to start playback.
   const [castSdkReady, setCastSdkReady] = useState(false);
+  // True if the Cast SDK didn't load within 5s of mount — strong hint that an
+  // adblocker, ISP or shielded-browser policy is blocking gstatic.com. Lets us
+  // show a specific error instead of the generic "no devices found" message.
+  const [castSdkBlocked, setCastSdkBlocked] = useState(false);
   const [showCastMenu, setShowCastMenu] = useState(false);
   const [castError, setCastError] = useState<string | null>(null);
   const [isCastLoading, setIsCastLoading] = useState(false);
@@ -2129,10 +2166,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Définir les lecteurs VO/VOSTFR à conserver (enlever 6, 4 et 2)
     if (showVostfrMenu) {
       const vostfrSources = [
-        { id: 'vostfr', label: t('watch.voVostfrPlayer', { n: 1 }), url: '' }, // Videasy (priorité)
-        { id: 'vidlink', label: t('watch.voVostfrPlayer', { n: 2 }), url: '' }, // vidlink
-        { id: 'vidsrccc', label: t('watch.voVostfrPlayer', { n: 3 }), url: '' }, // vidsrc.io
-        { id: 'vidsrcwtf1', label: t('watch.voVostfrPlayer', { n: 4 }), url: '' } // vidsrc.wtf (v1)
+        { id: 'peachify', label: 'Peachify', url: '' }, // Peachify (priorité, FR subs + accent Movix)
+        { id: 'vostfr', label: 'Videasy', url: '' }, // Videasy
+        { id: 'vidlink', label: 'Vidlink', url: '' }, // vidlink
+        { id: 'vidsrccc', label: 'Vidsrc.io', url: '' }, // vidsrc.io
+        { id: 'vidsrcwtf1', label: 'Vidsrc.wtf 1', url: '' } // vidsrc.wtf (v1)
       ];
 
       vostfrSources.forEach(source => {
@@ -2144,13 +2182,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         // boutons Sources/Open dupliqués (rendus dans le parent ET dans l'iframe imbriqué).
         if (tvShowId != null && seasonNumber != null && episodeNumber != null) {
           // TV Show URLs
-          if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`; // vidlink.pro
+          if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
+          else if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`; // vidlink.pro
           else if (source.id === 'vidsrccc') finalUrl = `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}`;
           else if (source.id === 'vostfr') finalUrl = `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}`; // Videasy
           else if (source.id === 'vidsrcwtf1') finalUrl = `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}`; // Assumed pattern
         } else if (movieId) {
           // Movie URLs (existing logic)
-          if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/movie/${movieId}`; // vidlink.pro
+          if (source.id === 'peachify') finalUrl = `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626`;
+          else if (source.id === 'vidlink') finalUrl = `https://vidlink.pro/movie/${movieId}`; // vidlink.pro
           else if (source.id === 'vidsrccc') finalUrl = `https://vidsrc.io/embed/movie?tmdb=${movieId}`;
           else if (source.id === 'vostfr') finalUrl = `https://player.videasy.net/movie/${movieId}`;
           else if (source.id === 'vidsrcwtf1') finalUrl = `https://vidsrc.wtf/api/1/movie/?id=${movieId}`;
@@ -2452,6 +2492,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    // Wait until HLS.js has been dynamically imported before we set up the player.
+    // The non-HLS branches (MP4, native canPlayType) only need this guard for the
+    // shared types in the cleanup; the effect re-runs once Hls is available.
+    if (!Hls) return;
 
     // Clear any existing timeouts when src changes or component unmounts
     const clearBufferingTimeout = () => {
@@ -3224,7 +3268,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.src = '';
       };
     }
-  }, [src, autoPlay, onEnded, onError, subtitleUrl]); // REMOVED playbackSpeed
+  }, [src, autoPlay, onEnded, onError, subtitleUrl, Hls]); // REMOVED playbackSpeed
 
   // Auto next episode preference (must be declared before useEffect that references it)
   const [autoNextEpisodeEnabled, setAutoNextEpisodeEnabled] = useState(() => {
@@ -3694,7 +3738,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             return;
           }
 
-          // Extract using PAKO
+          // Extract using PAKO (lazy-loaded)
+          const pako = await loadPako();
           let extractedData: Uint8Array;
           try {
             extractedData = pako.inflate(buffer);
@@ -4775,71 +4820,85 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   /**
    * Start AirPlay session
    * This will switch from HLS.js to native playback and show the device picker
+   * (Safari path), or fall back to the W3C Remote Playback API picker for
+   * browsers without WebKit AirPlay or chrome.cast (Firefox / shielded Brave).
    */
   const startAirPlay = async () => {
     setIsAirPlayLoading(true);
     try {
       const video = videoRef.current;
-      if (!video || !isAirPlaySupported()) {
-        throw new Error('AirPlay not supported on this device/browser');
+      if (!video) throw new Error('No video element');
+
+      const useWebKitPath = isAirPlaySupported();
+      const useRemoteFallback = !useWebKitPath && isRemotePlaybackSupported(video);
+
+      if (!useWebKitPath && !useRemoteFallback) {
+        throw new Error('AirPlay/Remote Playback not supported on this device/browser');
       }
 
-      console.log('[AirPlay] Starting AirPlay session...');
+      console.log('[AirPlay] Starting session via', useWebKitPath ? 'WebKit' : 'Remote Playback API');
 
-      const currentTime = video.currentTime;
-      const wasPlaying = !video.paused;
+      if (useWebKitPath) {
+        const currentTime = video.currentTime;
+        const wasPlaying = !video.paused;
 
-      // Step 1: Destroy HLS.js instance if it exists
-      // AirPlay is incompatible with MSE (Media Source Extensions)
-      if (hlsRef.current) {
-        console.log('[AirPlay] Destroying HLS.js instance for native playback...');
-        hlsRef.current.destroy();
-        hlsRef.current = null;
+        // Step 1: Destroy HLS.js instance if it exists
+        // AirPlay is incompatible with MSE (Media Source Extensions)
+        if (hlsRef.current) {
+          console.log('[AirPlay] Destroying HLS.js instance for native playback...');
+          hlsRef.current.destroy();
+          hlsRef.current = null;
+        }
+
+        // Step 2: Switch to native Safari playback
+        // Safari has built-in HLS support that works with AirPlay
+        let airPlayUrl = src;
+        if (src.includes('darkibox.com')) {
+          airPlayUrl = buildApiProxyUrl(src);
+        }
+
+        console.log('[AirPlay] Switching to native playback with URL:', airPlayUrl);
+
+        // Configure video element for AirPlay
+        video.setAttribute('x-webkit-airplay', 'allow');
+        const videoWithAirPlay = video as HTMLVideoElementWithWebkit;
+        if (typeof videoWithAirPlay.webkitWirelessVideoPlaybackDisabled !== 'undefined') {
+          videoWithAirPlay.webkitWirelessVideoPlaybackDisabled = false;
+        }
+        if ('disableRemotePlayback' in video) {
+          (video as any).disableRemotePlayback = false;
+        }
+
+        // Set the source directly (Safari will handle HLS natively)
+        video.src = airPlayUrl;
+        video.currentTime = currentTime;
+
+        // Wait for video to be ready
+        await new Promise<void>((resolve) => {
+          const onLoadedMetadata = () => {
+            video.removeEventListener('loadedmetadata', onLoadedMetadata);
+            resolve();
+          };
+          video.addEventListener('loadedmetadata', onLoadedMetadata);
+          video.load();
+        });
+
+        // Resume playback if it was playing
+        if (wasPlaying) {
+          await video.play();
+        }
+      } else {
+        // Remote Playback API fallback — DON'T destroy HLS.js. The picker is
+        // shown via `video.remote.prompt()` and the receiver gets whatever
+        // src is currently on the element (works for MP4 / native HLS, fails
+        // gracefully for HLS.js blob URLs — same caveat as Safari without
+        // native HLS).
+        if ('disableRemotePlayback' in video) {
+          (video as any).disableRemotePlayback = false;
+        }
       }
 
-      // Step 2: Switch to native Safari playback
-      // Safari has built-in HLS support that works with AirPlay
-      let airPlayUrl = src;
-
-      // Apply proxy if needed for darkibox URLs
-      if (src.includes('darkibox.com')) {
-        airPlayUrl = buildApiProxyUrl(src);
-      }
-
-      console.log('[AirPlay] Switching to native playback with URL:', airPlayUrl);
-
-      // Configure video element for AirPlay
-      video.setAttribute('x-webkit-airplay', 'allow');
-      const videoWithAirPlay = video as HTMLVideoElementWithWebkit;
-      if (typeof videoWithAirPlay.webkitWirelessVideoPlaybackDisabled !== 'undefined') {
-        videoWithAirPlay.webkitWirelessVideoPlaybackDisabled = false;
-      }
-      if ('disableRemotePlayback' in video) {
-        (video as any).disableRemotePlayback = false;
-      }
-
-      // Set the source directly (Safari will handle HLS natively)
-      video.src = airPlayUrl;
-
-      // Restore playback position
-      video.currentTime = currentTime;
-
-      // Wait for video to be ready
-      await new Promise<void>((resolve) => {
-        const onLoadedMetadata = () => {
-          video.removeEventListener('loadedmetadata', onLoadedMetadata);
-          resolve();
-        };
-        video.addEventListener('loadedmetadata', onLoadedMetadata);
-        video.load();
-      });
-
-      // Resume playback if it was playing
-      if (wasPlaying) {
-        await video.play();
-      }
-
-      // Step 3: Show AirPlay device picker
+      // Step 3: Show AirPlay / Remote Playback device picker
       // This must be called from a user gesture (button click)
       await requestAirPlay(video);
 
@@ -4884,21 +4943,29 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         console.log('Cast chosen stream URL (prefer FR):', { original: streamUrl, preferred: preferredStreamUrl });
       }
 
-      // Prepare media info for casting
-      const mediaInfo = prepareCastMediaInfo(
+      // Build subtitle tracks for the cast — only the externally-supplied
+      // VOSTFR track today. Internal HLS subtitle tracks are already inside
+      // the manifest, the receiver handles those natively. Activate them on
+      // the receiver only if the user had subtitles visible locally.
+      const subtitlesForCast = subtitleUrl
+        ? [{ url: subtitleUrl, language: 'fr', label: 'Français' }]
+        : [];
+      const enableSubsOnCast = subtitlesForCast.length > 0 && currentSubtitle !== 'off';
+
+      // Load media on cast device — try multiple HLS content-types in case
+      // the receiver rejects our first MIME choice (some Chromecasts only
+      // accept lowercase "application/x-mpegurl", others want the RFC 8216
+      // "application/vnd.apple.mpegurl"). Cinepulse does the same.
+      await loadMediaOnCastWithFallback(
+        session,
         preferredStreamUrl,
         title || tvShow?.name || 'Media',
         poster,
-        videoRef.current?.currentTime || 0
+        videoRef.current?.currentTime || 0,
+        isPlaying,
+        subtitlesForCast,
+        enableSubsOnCast,
       );
-
-
-
-      // Log the finalized media info that will be sent to Chromecast
-      console.log('Cast mediaInfo payload:', mediaInfo);
-
-      // Load media on cast device
-      await loadMediaOnCast(session, mediaInfo, videoRef.current?.currentTime || 0, isPlaying);
 
       setIsCasting(true);
       lastLoadedCastSrcRef.current = src;
@@ -4913,7 +4980,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     } finally {
       setIsCastLoading(false);
     }
-  }, [isPlaying, poster, src, t, title, tvShow?.name]);
+  }, [isPlaying, poster, src, t, title, tvShow?.name, subtitleUrl, currentSubtitle]);
 
   const startCasting = async () => {
     // Native Android WebView path — route through the on-device Google Cast SDK.
@@ -5230,6 +5297,24 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [movieId]);
 
+  // Cast SDK load timeout — if `__onGCastApiAvailable` hasn't fired after 5s,
+  // gstatic.com is almost certainly blocked (adblocker, ISP filter, shielded
+  // browser). Surface this as a distinct state so the UI can guide the user
+  // instead of showing a generic "no devices found".
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if ((window as any).chrome?.cast) return; // Already loaded — nothing to wait for.
+
+    const timeoutId = window.setTimeout(() => {
+      if (!(window as any).chrome?.cast) {
+        console.warn('[Cast] SDK did not load within 5s — likely blocked by adblock/ISP');
+        setCastSdkBlocked(true);
+      }
+    }, 5000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
   // Initialize Chromecast
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -5244,6 +5329,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       if (typeof previousCallback === 'function') {
         previousCallback(isAvailable);
       }
+
+      // SDK fired its callback — clear the "blocked" flag if it was set.
+      setCastSdkBlocked(false);
 
       if (isAvailable) {
         void initializeCast();
@@ -5406,7 +5494,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !isAirPlaySupported()) {
+    // Either WebKit AirPlay (Safari) or W3C Remote Playback API (Firefox /
+    // browsers without cast.framework). isRemotePlaybackSupported already
+    // excludes Safari and Chrome-with-cast so the two checks don't overlap.
+    if (!video || (!isAirPlaySupported() && !isRemotePlaybackSupported(video))) {
       setAirPlayAvailable(false);
       return;
     }
@@ -6239,6 +6330,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const loadSource = async () => {
     if (!videoRef.current) return;
 
+    // Lazy-load HLS.js if we haven't yet — needed for non-MP4 sources
+    const Hls = await loadHls();
+    if (!videoRef.current) return;
+
     // Save current position before switching source
     const savedPosition = videoRef.current.currentTime > 0 ? videoRef.current.currentTime : initialTime || 0;
     const wasPlaying = !videoRef.current.paused;
@@ -6688,6 +6783,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   // Setup HLS error handlers
   useEffect(() => {
+    if (!Hls) return;
     const hls = hlsRef.current;
     if (hls) {
       const onHlsError = (_event: any, data: any) => {
@@ -6757,7 +6853,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         hls.off(Hls.Events.ERROR, onHlsError);
       };
     }
-  }, [src]); // Only depend on src, let parent handle source switching
+  }, [src, Hls]); // Only depend on src, let parent handle source switching
 
   // Add event handler to restore position after source change
   useEffect(() => {
@@ -7010,6 +7106,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [isDragging, hoverState.x, hoverState.time]);
 
   useEffect(() => {
+    if (!Hls) return;
     if (hoverState.showPreview && hoverState.previewUrl && previewVideoRef.current) {
       if (previewHlsRef.current) {
         previewHlsRef.current.destroy();
@@ -7041,10 +7138,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       previewHlsRef.current.destroy();
       previewHlsRef.current = null;
     }
-  }, [hoverState.showPreview, hoverState.previewUrl]);
+  }, [hoverState.showPreview, hoverState.previewUrl, Hls]);
 
   // Add this effect to update subtitles when HLS adds tracks
   useEffect(() => {
+    if (!Hls) return;
     const video = videoRef.current;
     if (!video || !hlsRef.current) return;
 
@@ -7075,7 +7173,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         hlsRef.current.off(Hls.Events.SUBTITLE_TRACKS_UPDATED, handleTracksAdded);
       }
     };
-  }, []);
+  }, [Hls]);
 
   // Add this effect to handle external subtitle URL
   useEffect(() => {
@@ -7855,24 +7953,27 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                   className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                 >
                                   {[
-                                    { id: 'vostfr', label: t('watch.voVostfrPlayer', { n: 1 }) },
-                                    { id: 'vidlink', label: t('watch.voVostfrPlayer', { n: 2 }) },
-                                    { id: 'vidsrccc', label: t('watch.voVostfrPlayer', { n: 3 }) },
-                                    { id: 'vidsrcwtf1', label: t('watch.voVostfrPlayer', { n: 4 }) }
+                                    { id: 'peachify', label: 'Peachify' },
+                                    { id: 'vostfr', label: 'Videasy' },
+                                    { id: 'vidlink', label: 'Vidlink' },
+                                    { id: 'vidsrccc', label: 'Vidsrc.io' },
+                                    { id: 'vidsrcwtf1', label: 'Vidsrc.wtf 1' }
                                   ].map((vostfrSource, index) => {
                                     // IMPORTANT: `!= null` au lieu de truthy check — sinon seasonNumber=0
                                     // (épisode spécial / Spéciaux TMDB) tombe dans le fallback '#' qui fait
                                     // charger la page courante en boucle dans l'iframe.
                                     const sourceUrl = movieId ?
-                                      vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
-                                        vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
-                                          vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
-                                            `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
+                                      vostfrSource.id === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
+                                        vostfrSource.id === 'vidlink' ? `https://vidlink.pro/movie/${movieId}` :
+                                          vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/movie?tmdb=${movieId}` :
+                                            vostfrSource.id === 'vostfr' ? `https://player.videasy.net/movie/${movieId}` :
+                                              `https://vidsrc.wtf/api/1/movie/?id=${movieId}` :
                                       (tvShowId != null && seasonNumber != null && episodeNumber != null) ?
-                                        vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
-                                          vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
-                                            vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
-                                              `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}` :
+                                        vostfrSource.id === 'peachify' ? `https://peachify.top/embed/tv/${tvShowId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626` :
+                                          vostfrSource.id === 'vidlink' ? `https://vidlink.pro/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                            vostfrSource.id === 'vidsrccc' ? `https://vidsrc.io/embed/tv?tmdb=${tvShowId}&season=${seasonNumber}&episode=${episodeNumber}` :
+                                              vostfrSource.id === 'vostfr' ? `https://player.videasy.net/tv/${tvShowId}/${seasonNumber}/${episodeNumber}` :
+                                                `https://vidsrc.wtf/api/1/tv/?id=${tvShowId}&s=${seasonNumber}&e=${episodeNumber}` :
                                         '#'; // Fallback if neither movie nor TV info is present
 
                                     // Active state check for VOSTFR sources in main menu
@@ -9112,6 +9213,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               transition: 'filter 0.5s ease'
             }}
             playsInline
+            // Required so MediaElementAudioSourceNode (volume booster + audio enhancer)
+            // doesn't output silence on cross-origin proxied media. All proxies return
+            // Access-Control-Allow-Origin: *, so the request still succeeds.
+            crossOrigin="anonymous"
             {...{ referrerPolicy: "strict-origin-when-cross-origin" } as React.VideoHTMLAttributes<HTMLVideoElement>}
             poster={poster}
             onTimeUpdate={handleTimeUpdate}
@@ -9146,10 +9251,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           className="absolute inset-0 z-[14000] flex flex-col items-center justify-center p-4 sm:p-6 bg-gray-900 overflow-y-auto pb-[max(1rem,env(safe-area-inset-bottom))]"
           data-lenis-prevent
           style={{
-            backgroundImage: pipBackdropImage ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${pipBackdropImage})` : backdrop ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(https://image.tmdb.org/t/p/original${backdrop})` : poster ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(https://image.tmdb.org/t/p/original${poster})` : undefined,
+            backgroundImage: pipBackdropImage ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${pipBackdropImage})` : backdrop ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(https://image.tmdb.org/t/p/w1280${backdrop})` : poster ? `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(https://image.tmdb.org/t/p/w1280${poster})` : undefined,
             backgroundSize: 'cover',
             backgroundPosition: 'center',
-            backgroundAttachment: 'fixed'
           }}
         >
           {/* PiP Banner at the top */}
@@ -10266,12 +10370,38 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                           </button>
                         </div>
                       ) : !airPlayAvailable && !castAvailable ? (
-                        // Neither target detected — explain why
-                        <div className="p-2 bg-yellow-900/30 border border-yellow-700/50 rounded text-xs text-yellow-200 space-y-1">
-                          <div className="font-medium">{t('watch.castUnavailable')}</div>
-                          <div>• {t('watch.castUnavailableHelpChromecast')}</div>
-                          <div>• {t('watch.castUnavailableHelpAirPlay')}</div>
-                        </div>
+                        // Neither target detected — distinguish "browser doesn't support cast at all"
+                        // (Firefox / Edge non-Chromium / Safari without AirPlay element) from
+                        // "browser supports it but nothing on the LAN / SDK blocked by adblock".
+                        (() => {
+                          const browserSupportsCast = typeof (window as any).chrome?.cast !== 'undefined';
+                          const browserSupportsAirPlay = isAirPlaySupported();
+                          const browserSupportsAny = browserSupportsCast || browserSupportsAirPlay;
+                          // Priority: SDK blocked > no devices on Wi-Fi > browser doesn't support
+                          const reasonKey = castSdkBlocked
+                            ? 'watch.castUnavailableSdkBlocked'
+                            : browserSupportsAny
+                              ? 'watch.castUnavailableNoDevices'
+                              : 'watch.castUnavailableUnsupportedBrowser';
+                          return (
+                            <div className="p-2 bg-yellow-900/30 border border-yellow-700/50 rounded text-xs text-yellow-200 space-y-1">
+                              <div className="font-medium">{t('watch.castUnavailable')}</div>
+                              <div className="opacity-90">{t(reasonKey)}</div>
+                              <div>• {t('watch.castUnavailableHelpChromecast')}</div>
+                              <div>• {t('watch.castUnavailableHelpAirPlay')}</div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setShowCastMenu(false);
+                                  navigate('/help/chromecast');
+                                }}
+                                className="mt-2 text-yellow-100 underline hover:text-white text-xs"
+                              >
+                                {t('watch.castUnavailableSeeHelp')} →
+                              </button>
+                            </div>
+                          );
+                        })()
                       ) : (
                         // Both available - show choice
                         <div className="space-y-2">

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useCallback, useContext, useMemo, useState, useEffect } from 'react';
 
 interface SnowContextType {
   isSnowEnabled: boolean;
@@ -17,12 +17,17 @@ export const SnowProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.setItem('snow_enabled', JSON.stringify(isSnowEnabled));
   }, [isSnowEnabled]);
 
-  const toggleSnow = () => {
+  const toggleSnow = useCallback(() => {
     setIsSnowEnabled(prev => !prev);
-  };
+  }, []);
+
+  const value = useMemo(
+    () => ({ isSnowEnabled, toggleSnow }),
+    [isSnowEnabled, toggleSnow]
+  );
 
   return (
-    <SnowContext.Provider value={{ isSnowEnabled, toggleSnow }}>
+    <SnowContext.Provider value={value}>
       {children}
     </SnowContext.Provider>
   );

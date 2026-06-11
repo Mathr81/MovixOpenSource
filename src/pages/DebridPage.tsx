@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { ArrowLeft, Crown, Download, Copy, Check, AlertCircle, Loader, Link as LinkIcon, Info, Clock, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 

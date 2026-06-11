@@ -17,6 +17,7 @@ import { useAntiSpoilerSettings } from '../../hooks/useAntiSpoilerSettings';
 import { generateRivestreamSecretKey } from '../../utils/rivestreamSecretKey';
 import { useWrappedTracker } from '../../hooks/useWrappedTracker';
 import { isUserVip, getVipHeaders } from '../../utils/authUtils';
+import { isExtensionAvailable } from '../../utils/extensionProxy';
 import { RIVESTREAM_PROXIES } from '../../config/rivestreamProxy';
 import { buildProxyUrl } from '../../config/runtime';
 import { getTmdbLanguage } from '../../i18n';
@@ -49,8 +50,8 @@ const getProxyUrl = (url: string): string => {
 
 const normalizeUqloadEmbedUrl = (url: string): string => {
   return url
-    .replace(/uqload\.bz/gi, 'uqload.is')
-    .replace(/uqload%2ebz/gi, 'uqload%2eis');
+    .replace(/uqload\.[a-z0-9-]+/gi, 'uqload.is')
+    .replace(/uqload%2e[a-z0-9-]+/gi, 'uqload%2eis');
 };
 
 // Interfaces
@@ -595,7 +596,7 @@ const WatchTv: React.FC = () => {
 
   // PurStream (Bravo) HLS states
   const [purstreamSources, setPurstreamSources] = useState<{ url: string; label: string }[]>([]);
-  const canUseBravo = isUserVip() || !!window.hasMovixExtension;
+  const canUseBravo = isUserVip() || isExtensionAvailable();
 
   // Rivestream VO/VOSTFR HLS states
   const [rivestreamSources, setRivestreamSources] = useState<{ url: string; label: string; quality: number; service: string; category: string }[]>([]);
@@ -1571,7 +1572,11 @@ const WatchTv: React.FC = () => {
           localBravoSources = allUnknown
             ? rawBravo
             : (sortHostersByPriority(annotatedBravo, { category: 'moviesTv', topLevel: 'bravo' }) as typeof rawBravo);
-          setPurstreamSources(canUseBravo ? localBravoSources : []);
+          // Stocker les sources brutes — la gate canUseBravo est appliquée au
+          // render. Évite une race au mount où isExtensionAvailable() n'a pas
+          // encore vu l'extension/userscript injecter ses flags et bloquerait
+          // définitivement les sources même quand l'injection finit par arriver.
+          setPurstreamSources(localBravoSources);
           console.log(`? PurStream (Bravo) sources set: ${localBravoSources.length}`);
         }
 
@@ -1971,7 +1976,7 @@ const WatchTv: React.FC = () => {
           }
 
           // Extraire M3U8 des sources fsvid (VIP ou extension locale)
-          if ((isVip || !!window.hasMovixExtension) && fsvidSources.length > 0) {
+          if ((isVip || isExtensionAvailable()) && fsvidSources.length > 0) {
             console.log(`?? Found ${fsvidSources.length} fsvid sources, extracting M3U8...`);
             fsvidSources.forEach(fsvidSource => {
               fstreamExtractionPromises.push(

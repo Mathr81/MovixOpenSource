@@ -4,11 +4,12 @@ import React, {
   useImperativeHandle,
   useRef,
 } from 'react';
-import { Platform } from 'react-native';
+import { Linking, Platform } from 'react-native';
 import { WebView, type WebViewNavigation } from 'react-native-webview';
 import type {
   WebViewErrorEvent,
   WebViewMessageEvent,
+  ShouldStartLoadRequest,
 } from 'react-native-webview/lib/WebViewTypes';
 import { handleBridgeMessage } from '../services/bridge';
 import { buildInjectedJavaScript } from '../injection/inject';
@@ -26,12 +27,13 @@ interface WebViewBrowserProps {
   url: string;
   onNavigationStateChange?: (state: WebViewNavigation) => void;
   onError?: (error: string) => void;
+  onLoadEnd?: () => void;
 }
 
 const injectedJS = buildInjectedJavaScript();
 
 const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
-  ({ url, onNavigationStateChange, onError }, ref) => {
+  ({ url, onNavigationStateChange, onError, onLoadEnd }, ref) => {
     const webViewRef = useRef<WebView>(null);
 
     useImperativeHandle(ref, () => ({
@@ -61,6 +63,27 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       [onError],
     );
 
+    const onShouldStartLoadWithRequest = useCallback(
+      (request: ShouldStartLoadRequest) => {
+        const { url, navigationType } = request;
+        if (
+          url.startsWith('https://') ||
+          url.startsWith('http://') ||
+          url.startsWith('about:') ||
+          url.startsWith('blob:')
+        ) {
+          return true;
+        }
+        // Ouvre uniquement les deep links déclenchés par un vrai clic utilisateur.
+        // Les redirections automatiques (pubs, iframes) sont silencieusement bloquées.
+        if (navigationType === 'click') {
+          Linking.openURL(url).catch(() => {});
+        }
+        return false;
+      },
+      [],
+    );
+
     const onWebViewError = useCallback(
       (event: WebViewErrorEvent) => {
         onError?.(event.nativeEvent.description);
@@ -83,10 +106,12 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         // Bridge messages
         onMessage={onMessage}
         // Navigation
+        onShouldStartLoadWithRequest={onShouldStartLoadWithRequest}
         onNavigationStateChange={onNavigationStateChange}
         // Errors
         onError={onWebViewError}
         onHttpError={onHttpError}
+        onLoadEnd={onLoadEnd}
         // Config
         userAgent={userAgent}
         javaScriptEnabled={true}
@@ -96,7 +121,7 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         allowsFullscreenVideo={true}
         allowsBackForwardNavigationGestures={true}
         // Sécurité
-        originWhitelist={['https://*', 'http://*']}
+        originWhitelist={['https://*', 'http://*', 'about:*', 'blob:*']}
         mixedContentMode="compatibility"
         // Cache
         cacheEnabled={true}

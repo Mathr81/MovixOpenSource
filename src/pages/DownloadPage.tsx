@@ -7,6 +7,7 @@ import AdFreePlayerAds from '../components/AdFreePlayerAds';
 import { toast } from 'sonner';
 import { getTmdbLanguage } from '../i18n';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -513,6 +514,39 @@ const EpisodeDropdown: React.FC<{
   );
 };
 
+const RateLimitInfoButton: React.FC<{ error: string | null }> = ({ error }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+
+  const ratelimitedTemplate = t('download.rateLimited', { retryAt: '__X__' });
+  const ratelimitedPrefix = ratelimitedTemplate.split('__X__')[0];
+  const isRateLimited = !!error && error.startsWith(ratelimitedPrefix);
+
+  if (!isRateLimited) return null;
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="self-start text-xs sm:text-sm text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors mt-1"
+      >
+        {t('download.rateLimitedLearnMore')}
+      </button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('download.rateLimitInfoTitle')}</DialogTitle>
+            <DialogDescription className="text-sm sm:text-base text-gray-300 leading-relaxed pt-2">
+              {t('download.rateLimitInfoBody')}
+            </DialogDescription>
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+};
+
 // Popup de sélection de liens (similaire à AvatarSelector)
 const LinkSelector: React.FC<{
   isOpen: boolean;
@@ -522,7 +556,8 @@ const LinkSelector: React.FC<{
   isDecoding: boolean;
   decodedLink: DecodedLink | null;
   error: string | null;
-}> = ({ isOpen, onClose, title, selectedLink, isDecoding, decodedLink, error }) => {
+  queueInfo?: { size: number } | null;
+}> = ({ isOpen, onClose, title, selectedLink, isDecoding, decodedLink, error, queueInfo }) => {
   const { t, i18n } = useTranslation();
   const [isClosing, setIsClosing] = useState(false);
   const isVipUser = localStorage.getItem('is_vip') === 'true';
@@ -638,14 +673,22 @@ const LinkSelector: React.FC<{
                   </h3>
                   
                   {isDecoding ? (
-                    <div className="flex items-center justify-center py-6 sm:py-8">
-                      <Loader className="w-6 h-6 sm:w-8 sm:h-8 animate-spin text-blue-500" />
-                      <span className="ml-2 text-white text-sm sm:text-base">{t('download.decoding')}</span>
+                    <div className="flex flex-col items-center justify-center py-6 sm:py-8 gap-2">
+                      <div className="flex items-center">
+                        <Loader className="w-6 h-6 sm:w-8 sm:h-8 animate-spin text-blue-500" />
+                        <span className="ml-2 text-white text-sm sm:text-base">{t('download.decoding')}</span>
+                      </div>
+                      {queueInfo != null && (
+                        <span className="text-gray-400 text-xs sm:text-sm">{t('download.queueWaiting', { size: queueInfo.size })}</span>
+                      )}
                     </div>
                   ) : error ? (
-                    <div className="flex items-center text-red-400 text-sm sm:text-base">
-                      <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 mr-2 flex-shrink-0" />
-                      <span className="break-words">{error}</span>
+                    <div className="flex flex-col text-red-400 text-sm sm:text-base">
+                      <div className="flex items-center">
+                        <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 mr-2 flex-shrink-0" />
+                        <span className="break-words">{error}</span>
+                      </div>
+                      <RateLimitInfoButton error={error} />
                     </div>
                   ) : decodedLink ? (
                     <div className="space-y-3 sm:space-y-4">
@@ -706,21 +749,19 @@ const LinkSelector: React.FC<{
                             )}
                           </>
                         )}
-                        {decodedLink.metadata && (
-                          <>
-                            {decodedLink.metadata.language && (
-                              <div>
-                                <span className="text-gray-400">{t('download.languageLabel')}</span>
-                                <span className="text-white ml-2">{decodedLink.metadata.language}</span>
-                              </div>
-                            )}
-                            {decodedLink.metadata.sub && (
-                              <div>
-                                <span className="text-gray-400">{t('download.subtitlesLabel')}</span>
-                                <span className="text-white ml-2">{decodedLink.metadata.sub}</span>
-                              </div>
-                            )}
-                          </>
+                        {/* Langue / sous-titres : download-premium ne les retourne pas,
+                            on retombe sur selectedLink (issu de /download/:type/:id). */}
+                        {(decodedLink.metadata?.language || selectedLink?.language) && (
+                          <div>
+                            <span className="text-gray-400">{t('download.languageLabel')}</span>
+                            <span className="text-white ml-2">{decodedLink.metadata?.language || selectedLink?.language}</span>
+                          </div>
+                        )}
+                        {(decodedLink.metadata?.sub || selectedLink?.sub) && (
+                          <div>
+                            <span className="text-gray-400">{t('download.subtitlesLabel')}</span>
+                            <span className="text-white ml-2">{decodedLink.metadata?.sub || selectedLink?.sub}</span>
+                          </div>
                         )}
                       </div>
 
@@ -839,6 +880,7 @@ const DownloadPage: React.FC = () => {
   const [selectedLink, setSelectedLink] = useState<DownloadLink | null>(null);
   const [isDecoding, setIsDecoding] = useState(false);
   const [decodedLink, setDecodedLink] = useState<DecodedLink | null>(null);
+  const [queueInfo, setQueueInfo] = useState<{ size: number } | null>(null);
   const [showAdPopup, setShowAdPopup] = useState(false);
   const [pendingLinkToDecode, setPendingLinkToDecode] = useState<DownloadLink | null>(null);
   const [adUnlocked, setAdUnlocked] = useState(false);
@@ -1303,6 +1345,7 @@ const DownloadPage: React.FC = () => {
     setSelectedLink(link);
     setError(null);
     setDecodedLink(null);
+    setQueueInfo(null);
     setShowLinkSelector(true);
 
     // Les liens Movix sont déjà des URLs directes (1fichier, Mega, …) ajoutées
@@ -1346,10 +1389,55 @@ const DownloadPage: React.FC = () => {
       const params: Record<string, string> = {};
       if (currentDarkiWorldTitleId) params.title_id = currentDarkiWorldTitleId;
 
-      const response = await axios.get(`${MAIN_API}/api/darkiworld/decode/${link.id}`, {
-        params,
-        signal: abortController.signal
-      });
+      const POLL_INTERVAL_MS = 5000;
+      const MAX_POLL_ATTEMPTS = 60; // ~5 min max
+      let attempts = 0;
+      let response: any = null;
+
+      while (attempts < MAX_POLL_ATTEMPTS) {
+        if (abortController.signal.aborted) return;
+        response = await axios.get(`${MAIN_API}/api/darkiworld/decode/${link.id}`, {
+          params,
+          signal: abortController.signal,
+          validateStatus: () => true
+        });
+
+        if (response.status === 200) break;
+
+        if (response.status === 202) {
+          // Queued — show user the queue position
+          setQueueInfo({ size: response.data?.queue_size ?? 0 });
+          attempts += 1;
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+          continue;
+        }
+
+        if (response.status === 503 && response.data?.error === 'rate_limited') {
+          setError(t('download.rateLimited', { retryAt: new Date(response.data.retry_at).toLocaleTimeString() }));
+          return;
+        }
+
+        if (response.status === 503 && response.data?.error === 'queue_unavailable') {
+          setError(response.data?.message || t('download.queueUnavailable'));
+          return;
+        }
+
+        if (response.status === 404) {
+          setError(response.data?.error || t('download.decodeFailed'));
+          return;
+        }
+
+        // Unknown status
+        setError(t('download.decodeFailed'));
+        return;
+      }
+
+      if (!response || response.status !== 200) {
+        setError(t('download.queueTimeout'));
+        return;
+      }
+
+      // At this point, response.data is the decoded payload
       setDecodedLink(response.data);
     } catch (err: any) {
       // Ne pas afficher d'erreur si la requête a été annulée
@@ -1396,6 +1484,7 @@ const DownloadPage: React.FC = () => {
     setDecodedLink(null);
     setError(null);
     setSelectedLink(null);
+    setQueueInfo(null);
   };
 
   const handleAdPopupAccept = async () => {
@@ -1698,9 +1787,12 @@ const DownloadPage: React.FC = () => {
 
                 {error && (
                   <div className="mt-4 p-3 sm:p-4 bg-red-900/20 border border-red-500/50 rounded-xl backdrop-blur-sm">
-                    <div className="flex items-center gap-2 text-red-400 text-sm sm:text-base">
-                      <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />
-                      <span className="break-words">{error}</span>
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center gap-2 text-red-400 text-sm sm:text-base">
+                        <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />
+                        <span className="break-words">{error}</span>
+                      </div>
+                      <RateLimitInfoButton error={error} />
                     </div>
                   </div>
                 )}
@@ -1718,6 +1810,7 @@ const DownloadPage: React.FC = () => {
           isDecoding={isDecoding}
           decodedLink={decodedLink}
           error={error}
+          queueInfo={queueInfo}
         />
         {showAdPopup && (
           <AdFreePlayerAds

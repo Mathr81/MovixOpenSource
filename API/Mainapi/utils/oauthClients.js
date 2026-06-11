@@ -1,17 +1,63 @@
-const fs = require('fs');
-const path = require('path');
+/**
+ * Source de vérité = la table `oauth_clients` (cache en mémoire alimenté
+ * au boot par `oauthClientsDb.reloadCache()`). On garde l'API synchrone
+ * historique (`loadOAuthClients()`, `getOAuthClient()`) pour ne pas avoir
+ * à toucher aux 30+ call sites.
+ *
+ * L'env `MOVIX_OAUTH_CLIENTS_JSON` reste supportée en surcouche (dev local
+ * uniquement) ; le fichier `data/oauth-clients.json` n'est plus lu une fois
+ * la migration vers DB effectuée (il est archivé en `.migrated`).
+ */
 
-const OAUTH_CLIENTS_FILE = path.join(__dirname, '..', 'data', 'oauth-clients.json');
+const { getCachedClients } = require('./oauthClientsDb');
+
 const OAUTH_CLIENTS_ENV = 'MOVIX_OAUTH_CLIENTS_JSON';
-const KNOWN_OAUTH_SCOPES = ['profile.read', 'profile.list', 'profile.manage', 'vip.read', 'vip.manage'];
+const KNOWN_OAUTH_SCOPES = [
+  // Compte / profils
+  'profile.read',
+  'profile.list',
+  'profile.manage',
+  // VIP
+  'vip.read',
+  'vip.manage',
+  // Émission de jours VIP par l'app (depuis son balance admin-alimenté).
+  'vip.grant',
+  // Favoris (1 read + 2 write granulaires)
+  'favorites.read',
+  'favorites.add',
+  'favorites.remove',
+  // Listes personnalisées (1 read + 5 write granulaires)
+  'lists.read',
+  'lists.create',
+  'lists.rename',
+  'lists.delete',
+  'lists.add-item',
+  'lists.remove-item',
+  // Watchlist (1 read + 2 write granulaires)
+  'watchlist.read',
+  'watchlist.add',
+  'watchlist.remove',
+  // Historique (films/séries marqués comme vus)
+  'history.read',
+  'history.add',
+  'history.remove',
+  // Continue watching (reprise en cours)
+  'continue-watching.read',
+  // Notifications / alertes nouvelles saisons
+  'alerts.read',
+  'alerts.manage',
+  // Notes personnelles (1-10) + texte facultatif
+  'ratings.read',
+  'ratings.manage',
+];
 const DEFAULT_SCOPE = 'profile.read';
 const OAUTH_DEBUG_ENABLED = process.env.MOVIX_OAUTH_DEBUG === 'true';
 
-let cache = {
-  fileMtimeMs: -1,
-  envRaw: null,
-  clients: [],
-};
+// Préfixe public servant les icônes d'apps (relatif à l'API : `/oauth-icons/<filename>`).
+// Si tu sers via un CDN, set OAUTH_ICON_PUBLIC_BASE_URL.
+const OAUTH_ICON_PUBLIC_BASE_URL = (
+  process.env.OAUTH_ICON_PUBLIC_BASE_URL || '/oauth-icons'
+).replace(/\/+$/, '');
 
 function safeJsonParse(rawValue, fallback) {
   if (typeof rawValue !== 'string' || !rawValue.trim()) {
@@ -128,6 +174,17 @@ function normalizeScopes(rawScopes) {
   );
 }
 
+function buildIconUrl(iconFilename) {
+  if (typeof iconFilename !== 'string' || !iconFilename.trim()) {
+    return null;
+  }
+  // L'iconFilename est juste le basename — pas de path traversal possible
+  // (validé au moment du upload côté route admin).
+  const safeName = iconFilename.trim().replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!safeName) return null;
+  return `${OAUTH_ICON_PUBLIC_BASE_URL}/${safeName}`;
+}
+
 function normalizeClient(rawClient) {
   if (!rawClient || typeof rawClient !== 'object' || Array.isArray(rawClient)) {
     return null;
@@ -152,7 +209,10 @@ function normalizeClient(rawClient) {
   const requirePkce = rawClient.requirePkce === true || publicClient;
   const allowedScopes = normalizeScopes(rawClient.allowedScopes);
   const homepageUrl = normalizeHttpUrl(rawClient.homepageUrl);
+  // Compat ascendante : l'ancien JSON avait `logoUrl` (URL absolue), la
+  // nouvelle DB a `iconFilename` (basename). On expose les deux.
   const logoUrl = normalizeHttpUrl(rawClient.logoUrl);
+  const iconUrl = buildIconUrl(rawClient.iconFilename) || logoUrl;
   const description = typeof rawClient.description === 'string' && rawClient.description.trim()
     ? rawClient.description.trim()
     : null;
@@ -167,69 +227,30 @@ function normalizeClient(rawClient) {
     allowedScopes: allowedScopes.length > 0 ? allowedScopes : [DEFAULT_SCOPE],
     homepageUrl,
     logoUrl,
+    iconUrl,
+    iconFilename: typeof rawClient.iconFilename === 'string' ? rawClient.iconFilename : null,
     description,
+    vipDaysBalance: Number.isFinite(rawClient.vipDaysBalance) ? Number(rawClient.vipDaysBalance) : 0,
   };
-}
-
-function readClientsFile() {
-  try {
-    if (!fs.existsSync(OAUTH_CLIENTS_FILE)) {
-      return [];
-    }
-
-    const fileContent = fs.readFileSync(OAUTH_CLIENTS_FILE, 'utf8');
-    const parsed = safeJsonParse(fileContent, []);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    console.error('[OAuth Clients] Failed to read oauth-clients.json:', error.message || error);
-    return [];
-  }
-}
-
-function getClientsFileMtimeMs() {
-  try {
-    if (!fs.existsSync(OAUTH_CLIENTS_FILE)) {
-      return -1;
-    }
-
-    return fs.statSync(OAUTH_CLIENTS_FILE).mtimeMs || -1;
-  } catch {
-    return -1;
-  }
 }
 
 function loadOAuthClients() {
+  // Source 1: env var (override dev/test).
   const envRaw = process.env[OAUTH_CLIENTS_ENV] || '';
-  const fileMtimeMs = getClientsFileMtimeMs();
+  const fromEnv = envRaw ? safeJsonParse(envRaw, []) : [];
 
-  if (cache.envRaw === envRaw && cache.fileMtimeMs === fileMtimeMs) {
-    return cache.clients;
-  }
-
-  const fromEnv = safeJsonParse(envRaw, []);
-  const fromFile = readClientsFile();
-  const mergedSources = [
-    ...(Array.isArray(fromEnv) ? fromEnv : []),
-    ...(Array.isArray(fromFile) ? fromFile : []),
-  ];
+  // Source 2: DB cache (source de vérité prod).
+  const fromDb = getCachedClients() || [];
 
   const byClientId = new Map();
-  mergedSources.forEach((entry) => {
+  // L'env override la DB (utile pour les tests E2E qui injectent un client éphémère).
+  [...(Array.isArray(fromDb) ? fromDb : []), ...(Array.isArray(fromEnv) ? fromEnv : [])].forEach((entry) => {
     const normalized = normalizeClient(entry);
-    if (!normalized) {
-      return;
-    }
-
+    if (!normalized) return;
     byClientId.set(normalized.clientId, normalized);
   });
 
-  cache = {
-    envRaw,
-    fileMtimeMs,
-    clients: Array.from(byClientId.values()),
-  };
-
-  return cache.clients;
+  return Array.from(byClientId.values());
 }
 
 function getOAuthClient(clientId) {
@@ -252,6 +273,7 @@ function getOAuthClientPublicMetadata(client) {
     description: client.description,
     homepageUrl: client.homepageUrl,
     logoUrl: client.logoUrl,
+    iconUrl: client.iconUrl,
     publicClient: client.publicClient,
     requirePkce: client.requirePkce,
     allowedScopes: [...client.allowedScopes],

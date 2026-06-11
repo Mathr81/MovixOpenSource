@@ -48,6 +48,50 @@ const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 // Stocker les images déjà utilisées pour éviter les doublons
 const usedImages = new Set<string>();
 
+// Hoisted to module scope — pure constant, no closure over state/props. — perf
+const cardVariants = {
+  initial: { scale: 1 },
+  hover: { scale: 1.05, transition: { duration: 0.3 } },
+  tap: { scale: 0.95, transition: { duration: 0.1 } },
+  selected: { scale: 1.1, brightness: 1.2, transition: { duration: 0.5 } }
+};
+
+// Hoisted to module scope — 30-line map recreated per getGenreImageUrl call otherwise. — perf
+const FALLBACK_IMAGES: {
+  movie: Record<number, string>;
+  tv: Record<number, string>;
+} = {
+  movie: {
+    28: 'https://image.tmdb.org/t/p/original/628Dep6AxEtDxjZoGP78TsOxYbK.jpg', // Action
+    12: 'https://image.tmdb.org/t/p/original/bQXAqRx2Fgc46uCVWgoPz5L5Dtr.jpg', // Aventure
+    16: 'https://image.tmdb.org/t/p/original/xLWYkefC1wjRlnLKrKvaD9s3DiL.jpg', // Animation
+    35: 'https://image.tmdb.org/t/p/original/cGLL4SY6jFjjUZkz2eFxgtCtGgK.jpg', // Comédie
+    99: 'https://image.tmdb.org/t/p/original/9MwZd8PKOkVYhIhkwjJ1Z6MPfvV.jpg', // Documentaire
+    18: 'https://image.tmdb.org/t/p/original/tmU7GeKVybMWFButWEGl2M4GeiP.jpg', // Drame
+    27: 'https://image.tmdb.org/t/p/original/bShgiZFaalQoKDY89L1CbgNc6ic.jpg', // Horreur
+    10749: 'https://image.tmdb.org/t/p/original/5DUMPBSnHOZsbBv81GFXZXaKQRw.jpg', // Romance
+    878: 'https://image.tmdb.org/t/p/original/rAiYTfKGqDCRIIqo664sY9XZIvQ.jpg', // Science-Fiction
+    53: 'https://image.tmdb.org/t/p/original/7hN6WuQulU6UgOQrpgR4CbOCTfa.jpg', // Thriller
+    14: 'https://image.tmdb.org/t/p/original/8YGXxUGDtZlqc2CcFvd9bGMXuXk.jpg', // Fantastique
+    37: 'https://image.tmdb.org/t/p/original/iQ5ztdjvteGeboxtmRdXEChJOHh.jpg', // Western
+    80: 'https://image.tmdb.org/t/p/original/mqDnpWQrt0TRz2u9HRjLuaTLjL5.jpg', // Crime
+    10752: 'https://image.tmdb.org/t/p/original/zDlRxz2vXVs9YmOXN5zHHiY5Xrd.jpg', // Guerre
+  },
+  tv: {
+    10759: 'https://image.tmdb.org/t/p/original/rGBhQ4P7R5B6U4h5Qr3NKUVmQY5.jpg', // Action & Aventure
+    16: 'https://image.tmdb.org/t/p/original/3rsoG8HXQNJ2yyaZdxZ98uVzlBZ.jpg', // Animation
+    35: 'https://image.tmdb.org/t/p/original/8Xs20y8gFR0W9u8Yy9NKdpZtSu7.jpg', // Comédie
+    18: 'https://image.tmdb.org/t/p/original/7q448EVOnuE3gVAx24krzO7SNXM.jpg', // Drame
+    10765: 'https://image.tmdb.org/t/p/original/iE3s0lG5QVdEHOEZnoAxjmMtvne.jpg', // Science-Fiction & Fantastique
+    99: 'https://image.tmdb.org/t/p/original/b0WmHGc8LHTdGCVzxRb3IBMur57.jpg', // Documentaire
+    10749: 'https://image.tmdb.org/t/p/original/7TdALqc9gJK96xCvKTN3RbucSPT.jpg', // Romance
+    10768: 'https://image.tmdb.org/t/p/original/7FIKU4JSqIxmJGIXq0gAwCvnC9p.jpg', // Guerre & Politique
+    80: 'https://image.tmdb.org/t/p/original/or0E36KfzJYZwqXeiCfm1JgepKF.jpg', // Crime
+    9648: 'https://image.tmdb.org/t/p/original/lJA2RCMfsWCO3GutzLdaG2I7MOq.jpg', // Mystère
+    10764: 'https://image.tmdb.org/t/p/original/75nWz57HcNcJ4SLQ3rKCLq5fMFQ.jpg', // Téléréalité
+  }
+};
+
 interface GenrePoster {
   genreId: number;
   posterPath: string | null;
@@ -75,13 +119,7 @@ const GenreGrid: React.FC<GenreGridProps> = ({
   const [selectedGenreId, setSelectedGenreId] = useState<number | null>(null);
   const navigate = useNavigate();
 
-  // Animation variants for genre cards
-  const cardVariants = {
-    initial: { scale: 1 },
-    hover: { scale: 1.05, transition: { duration: 0.3 } },
-    tap: { scale: 0.95, transition: { duration: 0.1 } },
-    selected: { scale: 1.1, brightness: 1.2, transition: { duration: 0.5 } }
-  };
+  // cardVariants hoisted to module scope — perf
 
   // Transition variants for page navigation
   const pageTransition = {
@@ -209,47 +247,12 @@ const GenreGrid: React.FC<GenreGridProps> = ({
       return `https://image.tmdb.org/t/p/w1280${genrePoster.backdropPath}`;
     }
     
-    // Images de secours uniques pour différents genres
-    const fallbackImages: {
-      movie: Record<number, string>;
-      tv: Record<number, string>;
-    } = {
-      movie: {
-        28: 'https://image.tmdb.org/t/p/original/628Dep6AxEtDxjZoGP78TsOxYbK.jpg', // Action
-        12: 'https://image.tmdb.org/t/p/original/bQXAqRx2Fgc46uCVWgoPz5L5Dtr.jpg', // Aventure
-        16: 'https://image.tmdb.org/t/p/original/xLWYkefC1wjRlnLKrKvaD9s3DiL.jpg', // Animation
-        35: 'https://image.tmdb.org/t/p/original/cGLL4SY6jFjjUZkz2eFxgtCtGgK.jpg', // Comédie
-        99: 'https://image.tmdb.org/t/p/original/9MwZd8PKOkVYhIhkwjJ1Z6MPfvV.jpg', // Documentaire
-        18: 'https://image.tmdb.org/t/p/original/tmU7GeKVybMWFButWEGl2M4GeiP.jpg', // Drame
-        27: 'https://image.tmdb.org/t/p/original/bShgiZFaalQoKDY89L1CbgNc6ic.jpg', // Horreur
-        10749: 'https://image.tmdb.org/t/p/original/5DUMPBSnHOZsbBv81GFXZXaKQRw.jpg', // Romance
-        878: 'https://image.tmdb.org/t/p/original/rAiYTfKGqDCRIIqo664sY9XZIvQ.jpg', // Science-Fiction
-        53: 'https://image.tmdb.org/t/p/original/7hN6WuQulU6UgOQrpgR4CbOCTfa.jpg', // Thriller
-        14: 'https://image.tmdb.org/t/p/original/8YGXxUGDtZlqc2CcFvd9bGMXuXk.jpg', // Fantastique
-        37: 'https://image.tmdb.org/t/p/original/iQ5ztdjvteGeboxtmRdXEChJOHh.jpg', // Western
-        80: 'https://image.tmdb.org/t/p/original/mqDnpWQrt0TRz2u9HRjLuaTLjL5.jpg', // Crime
-        10752: 'https://image.tmdb.org/t/p/original/zDlRxz2vXVs9YmOXN5zHHiY5Xrd.jpg', // Guerre
-      },
-      tv: {
-        10759: 'https://image.tmdb.org/t/p/original/rGBhQ4P7R5B6U4h5Qr3NKUVmQY5.jpg', // Action & Aventure
-        16: 'https://image.tmdb.org/t/p/original/3rsoG8HXQNJ2yyaZdxZ98uVzlBZ.jpg', // Animation
-        35: 'https://image.tmdb.org/t/p/original/8Xs20y8gFR0W9u8Yy9NKdpZtSu7.jpg', // Comédie
-        18: 'https://image.tmdb.org/t/p/original/7q448EVOnuE3gVAx24krzO7SNXM.jpg', // Drame
-        10765: 'https://image.tmdb.org/t/p/original/iE3s0lG5QVdEHOEZnoAxjmMtvne.jpg', // Science-Fiction & Fantastique
-        99: 'https://image.tmdb.org/t/p/original/b0WmHGc8LHTdGCVzxRb3IBMur57.jpg', // Documentaire
-        10749: 'https://image.tmdb.org/t/p/original/7TdALqc9gJK96xCvKTN3RbucSPT.jpg', // Romance
-        10768: 'https://image.tmdb.org/t/p/original/7FIKU4JSqIxmJGIXq0gAwCvnC9p.jpg', // Guerre & Politique
-        80: 'https://image.tmdb.org/t/p/original/or0E36KfzJYZwqXeiCfm1JgepKF.jpg', // Crime
-        9648: 'https://image.tmdb.org/t/p/original/lJA2RCMfsWCO3GutzLdaG2I7MOq.jpg', // Mystère
-        10764: 'https://image.tmdb.org/t/p/original/75nWz57HcNcJ4SLQ3rKCLq5fMFQ.jpg', // Téléréalité
-      }
-    };
-    
     // Utiliser l'image de secours correspondant au genre et au type de média
-    if (mediaType === 'movie' && genreId in fallbackImages.movie) {
-      return fallbackImages.movie[genreId];
-    } else if (mediaType === 'tv' && genreId in fallbackImages.tv) {
-      return fallbackImages.tv[genreId];
+    // (FALLBACK_IMAGES is hoisted to module scope — perf)
+    if (mediaType === 'movie' && genreId in FALLBACK_IMAGES.movie) {
+      return FALLBACK_IMAGES.movie[genreId];
+    } else if (mediaType === 'tv' && genreId in FALLBACK_IMAGES.tv) {
+      return FALLBACK_IMAGES.tv[genreId];
     }
     
     // Image de secours par défaut si aucune correspondance

@@ -159,7 +159,7 @@ router.get(/^\/(.*)/, async (req, res) => {
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache',
       'Priority': 'u=0, i',
-      'Referer': 'https://coflix.click/',
+      'Referer': 'https://coflix.date/',
       'Sec-CH-UA': '"Brave";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
       'Sec-CH-UA-Mobile': '?0',
       'Sec-CH-UA-Platform': '"Windows"',

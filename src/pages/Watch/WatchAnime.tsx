@@ -83,6 +83,21 @@ interface VideoSource {
   id?: string; // Unique identifier for comparison
 }
 
+interface ContinueWatchingTvEntry {
+  id: number;
+  currentEpisode?: {
+    season: number;
+    episode: number;
+  };
+  lastAccessed?: string;
+  [key: string]: unknown;
+}
+
+interface ContinueWatchingStore {
+  movies: unknown[];
+  tv: ContinueWatchingTvEntry[];
+}
+
 
 /**
  * Calculates similarity between two titles to avoid false positives in anime matching
@@ -225,6 +240,44 @@ const WatchAnime: React.FC = () => {
   // État pour suivre si c'est la première sélection automatique
   const [isInitialLoad, setIsInitialLoad] = useState<boolean>(true);
 
+  const updateAnimeContinueWatching = useCallback(() => {
+    if (localStorage.getItem('settings_disable_history') === 'true') return;
+
+    const showIdInt = id ? parseInt(id) : NaN;
+    const seasonNumber = Number(season);
+    const episodeNumber = Number(episode);
+
+    if (!Number.isFinite(showIdInt) || !Number.isFinite(seasonNumber) || !Number.isFinite(episodeNumber)) {
+      return;
+    }
+
+    let continueWatching: ContinueWatchingStore;
+    try {
+      continueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}') as ContinueWatchingStore;
+    } catch {
+      continueWatching = { movies: [], tv: [] };
+    }
+
+    if (!Array.isArray(continueWatching.movies)) continueWatching.movies = [];
+    if (!Array.isArray(continueWatching.tv)) continueWatching.tv = [];
+
+    const existingShow = continueWatching.tv.find((tvShow) => tvShow.id === showIdInt);
+    const updatedShow = {
+      ...(existingShow || {}),
+      id: showIdInt,
+      currentEpisode: {
+        season: seasonNumber,
+        episode: episodeNumber
+      },
+      lastAccessed: new Date().toISOString()
+    };
+
+    continueWatching.tv = continueWatching.tv.filter((tvShow) => tvShow.id !== showIdInt);
+    continueWatching.tv.unshift(updatedShow);
+    continueWatching.tv = continueWatching.tv.slice(0, 20);
+    localStorage.setItem('continueWatching', JSON.stringify(continueWatching));
+  }, [id, season, episode]);
+
   // Movix Wrapped 2026 - Track anime viewing time
   useWrappedTracker({
     mode: 'viewing',
@@ -274,46 +327,6 @@ const WatchAnime: React.FC = () => {
           }
         }
 
-        // Add anime episode to continueWatching (if history is enabled)
-        if (localStorage.getItem('settings_disable_history') !== 'true') {
-          const continueWatching = JSON.parse(localStorage.getItem('continueWatching') || '{"movies": [], "tv": []}');
-
-          // Ensure structure exists
-          if (!continueWatching.movies) continueWatching.movies = [];
-          if (!continueWatching.tv) continueWatching.tv = [];
-
-          // Find existing TV show entry or create new one
-          const showIdInt = id ? parseInt(id) : null;
-          if (!showIdInt) return;
-          const existingShow = continueWatching.tv.find((tvShow: any) => tvShow.id === showIdInt);
-
-          if (existingShow) {
-            // Update existing show with current episode and last access time
-            existingShow.currentEpisode = {
-              season: Number(season),
-              episode: Number(episode)
-            };
-            existingShow.lastAccessed = new Date().toISOString();
-            // Move to front of array
-            continueWatching.tv = continueWatching.tv.filter((tvShow: any) => tvShow.id !== showIdInt);
-            continueWatching.tv.unshift(existingShow);
-          } else {
-            // Create new TV show entry with last access time
-            const newTvEntry = {
-              id: showIdInt,
-              currentEpisode: {
-                season: Number(season),
-                episode: Number(episode)
-              },
-              lastAccessed: new Date().toISOString()
-            };
-            continueWatching.tv.unshift(newTvEntry);
-          }
-
-          // Keep only last 20 TV shows
-          continueWatching.tv = continueWatching.tv.slice(0, 20);
-          localStorage.setItem('continueWatching', JSON.stringify(continueWatching));
-        }
       } catch (error) {
         console.error('Error fetching show details:', error);
         setError(t('watch.cannotLoadAnimeDetails'));
@@ -324,6 +337,10 @@ const WatchAnime: React.FC = () => {
       fetchShowDetails();
     }
   }, [id]);
+
+  useEffect(() => {
+    updateAnimeContinueWatching();
+  }, [updateAnimeContinueWatching]);
 
   // Pas de fetch TMDB pour les détails d'épisode anime - le numérotage ne correspond pas
 

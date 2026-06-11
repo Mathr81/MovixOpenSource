@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, Fragment } from 'react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import i18n from 'i18next';

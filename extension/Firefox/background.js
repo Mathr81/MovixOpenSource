@@ -6,9 +6,9 @@ const browserAPI = typeof browser !== "undefined" ? browser : chrome;
 
 const VAVOO_BASE_URL = "https://tvvoo.hayd.uk/cfg-fr";
 const WITV_BASE_URL = "https://witv.team";
-const SOSPLAY_BASE_URL = "https://ligue1live.xyz";
-const LIVETV_BASE_URL = "https://livetv876.me/frx/";
-const LIVETV_EMBED_ORIGIN = "https://livetv876.me";
+const SOSPLAY_BASE_URL = "https://streamonsport.art";
+const LIVETV_BASE_URL = "https://livetv882.me/frx/";
+const LIVETV_EMBED_ORIGIN = "https://livetv882.me";
 const LIVETV_EMBED_REFERER = LIVETV_BASE_URL;
 // Backend API URL for got-scraping based extraction
 const API_BASE_URL = "https://api.movix.cash";
@@ -119,7 +119,8 @@ async function setupRules() {
           "localhost",
           "127.0.0.1",
           "movix.cash",
-          "movix.cash",
+          "movix.cloud",
+          "movix.tax",
           "movix.club",
         ],
         resourceTypes: [
@@ -1804,7 +1805,7 @@ function shouldIgnoreLiveTvIframeUrl(rawUrl) {
     const combined = `${hostname}${pathname}${search}`;
 
     if (
-      hostname === "ads.livetv876.me" ||
+      hostname === "ads.livetv882.me" ||
       hostname.startsWith("ads.") ||
       hostname.startsWith("ad.")
     ) {

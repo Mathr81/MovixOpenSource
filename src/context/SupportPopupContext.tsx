@@ -1,4 +1,4 @@
-import React, { createContext, useState, useEffect, useContext } from 'react';
+import React, { createContext, useState, useEffect, useContext, useCallback, useMemo } from 'react';
 
 type SupportPopupContextType = {
   isPopupVisible: boolean;
@@ -32,14 +32,19 @@ export const SupportPopupProvider: React.FC<{ children: React.ReactNode }> = ({ 
     }
   }, []);
 
-  const hidePopup = () => {
+  const hidePopup = useCallback(() => {
     setIsPopupVisible(false);
     // Enregistrer que l'utilisateur a vu le popup
     localStorage.setItem('support_popup_seen', 'true');
-  };
+  }, []);
+
+  const value = useMemo(
+    () => ({ isPopupVisible, hidePopup }),
+    [isPopupVisible, hidePopup]
+  );
 
   return (
-    <SupportPopupContext.Provider value={{ isPopupVisible, hidePopup }}>
+    <SupportPopupContext.Provider value={value}>
       {children}
     </SupportPopupContext.Provider>
   );

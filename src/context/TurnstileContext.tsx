@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
 const TURNSTILE_INVISIBLE_SITEKEY = import.meta.env.VITE_TURNSTILE_INVISIBLE_SITEKEY;
 const TOKEN_REFRESH_MS = 250_000;
@@ -194,8 +194,13 @@ export const TurnstileProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     });
   }, [cleanupWidget, ensureWidget, resolvePendingTokens, token]);
 
+  const value = useMemo(
+    () => ({ token, isVerifying, resetToken, getValidToken }),
+    [token, isVerifying, resetToken, getValidToken]
+  );
+
   return (
-    <TurnstileContext.Provider value={{ token, isVerifying, resetToken, getValidToken }}>
+    <TurnstileContext.Provider value={value}>
       {children}
     </TurnstileContext.Provider>
   );

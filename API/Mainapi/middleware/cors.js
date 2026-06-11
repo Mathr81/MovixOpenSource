@@ -7,6 +7,8 @@ const cors = require("cors");
 const { getOAuthAllowedCorsOrigins } = require('../utils/oauthClients');
 
 const STATIC_ALLOWED_DOMAINS = [
+  'movix.tax',
+  'movix.cash',
   'movix.blog',
   'movix.rodeo',
   'movix.club',

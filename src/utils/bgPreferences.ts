@@ -24,6 +24,7 @@ export const BG_STORAGE_KEYS = {
   squareSize: 'settings_bg_square_size',
   forceColor: 'settings_bg_force_color',
   forceSquareSize: 'settings_bg_force_square_size',
+  haloEnabled: 'settings_bg_halo',
 } as const;
 
 // ─── Event bus ──────────────────────────────────────────────────────────
@@ -56,6 +57,7 @@ export interface BgPrefs {
   squareSize: number;
   forceColor: boolean;
   forceSquareSize: boolean;
+  haloEnabled: boolean;
 }
 
 export function readBgPrefs(): BgPrefs {
@@ -74,8 +76,12 @@ export function readBgPrefs(): BgPrefs {
 
   const forceColor = typeof window !== 'undefined' && localStorage.getItem(BG_STORAGE_KEYS.forceColor) === '1';
   const forceSquareSize = typeof window !== 'undefined' && localStorage.getItem(BG_STORAGE_KEYS.forceSquareSize) === '1';
+  // Default true — le halo est activé par défaut. Désactivable depuis Apparence.
+  const haloEnabled = typeof window === 'undefined'
+    ? true
+    : localStorage.getItem(BG_STORAGE_KEYS.haloEnabled) !== '0';
 
-  return { accent, customHex, squareSize, forceColor, forceSquareSize };
+  return { accent, customHex, squareSize, forceColor, forceSquareSize, haloEnabled };
 }
 
 export function getBgAccentRgb(prefs: BgPrefs): string {
@@ -104,7 +110,7 @@ let cachedKey = '';
 
 function getSnapshot(): BgPrefs {
   const next = readBgPrefs();
-  const key = `${next.accent}|${next.customHex}|${next.squareSize}|${next.forceColor}|${next.forceSquareSize}`;
+  const key = `${next.accent}|${next.customHex}|${next.squareSize}|${next.forceColor}|${next.forceSquareSize}|${next.haloEnabled}`;
   if (cachedPrefs && key === cachedKey) return cachedPrefs;
   cachedPrefs = next;
   cachedKey = key;
@@ -118,6 +124,7 @@ function getServerSnapshot(): BgPrefs {
     squareSize: 48,
     forceColor: false,
     forceSquareSize: false,
+    haloEnabled: true,
   };
 }
 

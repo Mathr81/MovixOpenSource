@@ -117,6 +117,18 @@ async function fetchAddableContent(title, category) {
   }
 }
 
+// Garde-fou : si TOUTES les requêtes upstream traînent, on coupe pour éviter
+// que /api/search reste pending côté frontend. Chaque axios a son propre
+// timeout 5s, mais si plusieurs proxies retry-loop, l'agrégat peut dépasser.
+const SEARCH_UPSTREAM_TIMEOUT_MS = 5000;
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms))
+  ]);
+}
+
 async function fetchMergedSearchData(title) {
   let searchData = null;
   let titlesData = null;
@@ -126,18 +138,18 @@ async function fetchMergedSearchData(title) {
   let titlesError = null;
 
   const [searchResult, titlesResult, addable15Result, addable2Result] = await Promise.allSettled([
-    axiosDarkinoRequest({
+    withTimeout(axiosDarkinoRequest({
       method: 'get',
       url: `/api/v1/search/${encodeURIComponent(title)}`,
       params: { loader: 'searchPage' }
-    }),
-    axiosDarkinoRequest({
+    }), SEARCH_UPSTREAM_TIMEOUT_MS, 'search'),
+    withTimeout(axiosDarkinoRequest({
       method: 'get',
       url: '/api/v1/titles',
       params: { perPage: 15, query: title }
-    }),
-    fetchAddableContent(title, 15),
-    fetchAddableContent(title, 2)
+    }), SEARCH_UPSTREAM_TIMEOUT_MS, 'titles'),
+    withTimeout(fetchAddableContent(title, 15), SEARCH_UPSTREAM_TIMEOUT_MS, 'addable15'),
+    withTimeout(fetchAddableContent(title, 2), SEARCH_UPSTREAM_TIMEOUT_MS, 'addable2')
   ]);
 
   if (searchResult.status === 'fulfilled') {

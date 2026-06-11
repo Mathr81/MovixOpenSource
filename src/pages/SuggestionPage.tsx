@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
 import axios from 'axios';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { encodeId } from '../utils/idEncoder';
 import { ArrowLeft, Shuffle, ClipboardList, Sparkles, RefreshCw, ArrowRight, Star, Users, Calendar, Film, Tv, ChevronLeft, ChevronRight } from 'lucide-react';
 import { getTmdbLanguage } from '../i18n';
@@ -749,7 +749,12 @@ const SuggestionPage: React.FC = () => {
             className="flex flex-col items-center justify-center py-16"
           >
             <div className="relative">
-              <div className="absolute inset-0 blur-[60px] bg-purple-500/30 rounded-full" />
+              {/* radial-gradient au lieu de blur-[60px] sur un loader qui tourne — le blur
+                  réappliqué à 60fps derrière un spinner est particulièrement coûteux. */}
+              <div
+                className="absolute inset-0 rounded-full pointer-events-none scale-150"
+                style={{ background: 'radial-gradient(circle, rgba(168, 85, 247, 0.45) 0%, transparent 70%)' }}
+              />
               <motion.div
                 animate={{ rotate: 360 }}
                 transition={{ repeat: Infinity, duration: 1.5, ease: 'linear' }}

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Filter } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 

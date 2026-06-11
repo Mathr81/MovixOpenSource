@@ -8,9 +8,116 @@ import {
   getSyncableLocalStorageEntries,
   hasSyncableLocalStorageData,
   isSyncableStorageKey,
-  shouldPreserveStorageKeyOnProfileLoad
+  shouldPreserveStorageKeyOnProfileLoad,
+  SYNC_OUTBOX_STORAGE_KEY
 } from '../utils/syncStorage';
 import { checkVipStatus } from '../utils/vipUtils';
+
+// Pending sync ops persisted by App.tsx flushPendingOpsSync at unload time.
+// We POST these to /api/sync BEFORE applyProfileEntriesToLocalStorage wipes
+// localStorage — otherwise unsynced writes (Firefox keepalive flake, network
+// hiccup) would be destroyed by the wipe-and-restore restoring stale backend
+// state. On success the outbox is cleared; on transient failure it's kept for
+// the next boot to retry; on 401 it's discarded (auth no longer matches).
+const SYNC_OUTBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+interface SyncOutboxPayload {
+  userType: 'oauth' | 'bip39';
+  profileId: string;
+  userId?: string;
+  ops: unknown[];
+  ts: number;
+}
+
+function isSyncOutboxPayload(value: unknown): value is SyncOutboxPayload {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<SyncOutboxPayload>;
+  return (
+    (candidate.userType === 'oauth' || candidate.userType === 'bip39')
+    && typeof candidate.profileId === 'string'
+    && candidate.profileId.length > 0
+    && Array.isArray(candidate.ops)
+    && candidate.ops.length > 0
+  );
+}
+
+async function replayOutboxIfAny(): Promise<void> {
+  let raw: string | null = null;
+  try { raw = localStorage.getItem(SYNC_OUTBOX_STORAGE_KEY); } catch { return; }
+  if (!raw) return;
+
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(raw); } catch {
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+
+  if (!isSyncOutboxPayload(parsed)) {
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+
+  const payload = parsed;
+  const ageMs = Date.now() - (typeof payload.ts === 'number' ? payload.ts : 0);
+  if (ageMs > SYNC_OUTBOX_MAX_AGE_MS) {
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+
+  const authToken = localStorage.getItem('auth_token');
+  if (!authToken) {
+    // No auth yet (e.g., logged out). Keep the outbox for a future replay.
+    return;
+  }
+
+  try {
+    await axios.post(`${API_URL}/api/sync`, {
+      userType: payload.userType,
+      profileId: payload.profileId,
+      userId: payload.userId,
+      ops: payload.ops
+    }, {
+      headers: { Authorization: `Bearer ${authToken}` }
+    });
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+  } catch (error: unknown) {
+    const response = (error as { response?: { status?: number; data?: { error?: string } } })?.response;
+    const status = response?.status;
+    const errMsg = response?.data?.error;
+
+    // Decide whether the error is permanent (clear outbox) or transient (keep
+    // for retry). Permanent rejections will never succeed on retry and would
+    // otherwise sit in localStorage until the 7-day TTL evicts them, blocking
+    // every boot's replay attempt and (with the merge logic in App.tsx)
+    // potentially dropping legitimate ops that get appended each cycle.
+    //
+    //   401 + 'Unauthorized' → token expired or invalid; user can re-auth as
+    //                          the same account → keep, retry next boot.
+    //   401 + 'UserId mismatch' → different user logged in than the outbox's
+    //                              owner → permanent, clear.
+    //   400 / 403 / 404 / 413 → malformed op, missing profile, oversize
+    //                            payload — none recover on retry → clear.
+    //   408 / 429 → timeout / rate-limit → transient → keep.
+    //   5xx / network errors → server hiccup → transient → keep.
+    let isPermanent = false;
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      if (status === 408 || status === 429) {
+        isPermanent = false;
+      } else if (status === 401 && errMsg === 'Unauthorized') {
+        isPermanent = false;
+      } else {
+        isPermanent = true;
+      }
+    }
+
+    if (isPermanent) {
+      try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+      console.warn('[outbox] replay rejected permanently, dropping outbox:', status, errMsg);
+    } else {
+      console.warn('[outbox] replay failed, will retry on next boot:', error);
+    }
+  }
+}
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 
@@ -258,6 +365,13 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
       if ((window as any).setProfileDataLoading) {
         (window as any).setProfileDataLoading(true);
       }
+
+      // Recovery flush: replay any sync ops persisted at the previous unload
+      // BEFORE the GET below pulls server state. Without this, a write that
+      // didn't reach the server (Firefox keepalive flake, network hiccup,
+      // browser crash) would be destroyed when applyProfileEntriesToLocalStorage
+      // wipes localStorage and restores stale backend data.
+      await replayOutboxIfAny();
 
       const response = await axios.get(`${API_URL}/api/profiles/${profileId}/data`, {
         headers: { Authorization: `Bearer ${authToken}` }

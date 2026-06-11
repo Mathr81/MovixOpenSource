@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { useParams, useSearchParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
-import QRCode from 'qrcode';
 import { toast } from 'sonner';
 import {
   AlertTriangle,
@@ -136,16 +136,25 @@ const VipInvoicePage: React.FC = () => {
       return;
     }
 
-    QRCode.toDataURL(invoice.qrPayload, {
-      width: 320,
-      margin: 1,
-      color: {
-        dark: '#0a0a0a',
-        light: '#ffffff'
+    let cancelled = false;
+    (async () => {
+      const qrcodeMod = await import('qrcode');
+      const QRCode = qrcodeMod.default;
+      try {
+        const url = await QRCode.toDataURL(invoice.qrPayload, {
+          width: 320,
+          margin: 1,
+          color: {
+            dark: '#0a0a0a',
+            light: '#ffffff'
+          }
+        });
+        if (!cancelled) setQrCodeUrl(url);
+      } catch {
+        if (!cancelled) setQrCodeUrl('');
       }
-    })
-      .then(setQrCodeUrl)
-      .catch(() => setQrCodeUrl(''));
+    })();
+    return () => { cancelled = true; };
   }, [invoice?.qrPayload]);
 
   useEffect(() => {

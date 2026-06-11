@@ -1,18 +1,39 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, type ComponentType } from 'react';
 import { Smile } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import emojiData from '@emoji-mart/data/sets/14/apple.json';
-import Picker from '@emoji-mart/react';
 
 interface EmojiPickerProps {
   onEmojiSelect: (emoji: string) => void;
   buttonClassName?: string;
 }
 
+// emoji-mart Picker accepts a wide config object; the upstream types are
+// not exported in a usable form so we keep this loose record type.
+type EmojiPickerProps_External = Record<string, unknown>;
+
 const EmojiPicker: React.FC<EmojiPickerProps> = ({ onEmojiSelect, buttonClassName }) => {
   const { t } = useTranslation();
   const [isOpen, setIsOpen] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
+
+  // emoji-mart Picker + dataset are loaded only when the user actually opens the picker.
+  const [PickerComponent, setPickerComponent] = useState<ComponentType<EmojiPickerProps_External> | null>(null);
+  const [emojiData, setEmojiData] = useState<unknown>(null);
+
+  useEffect(() => {
+    if (!isOpen || (PickerComponent && emojiData)) return;
+    let cancelled = false;
+    (async () => {
+      const [reactMod, dataMod] = await Promise.all([
+        import('@emoji-mart/react'),
+        import('@emoji-mart/data/sets/14/apple.json'),
+      ]);
+      if (cancelled) return;
+      setPickerComponent(() => reactMod.default as ComponentType<EmojiPickerProps_External>);
+      setEmojiData(dataMod.default ?? dataMod);
+    })();
+    return () => { cancelled = true; };
+  }, [isOpen, PickerComponent, emojiData]);
 
   useEffect(() => {
     // Ferme le picker quand on clique en dehors
@@ -26,20 +47,20 @@ const EmojiPicker: React.FC<EmojiPickerProps> = ({ onEmojiSelect, buttonClassNam
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const handleEmojiSelect = (emoji: any) => {
+  const handleEmojiSelect = (emoji: { native: string }) => {
     onEmojiSelect(emoji.native);
-    
+
     // Ajouter l'emoji aux récents
     const storedRecentEmojis = localStorage.getItem('recentEmojis');
     const recentEmojis: string[] = storedRecentEmojis ? JSON.parse(storedRecentEmojis) : [];
-    
+
     const updatedRecents = [
       emoji.native,
       ...recentEmojis.filter(e => e !== emoji.native)
     ].slice(0, 10); // Garder les 10 plus récents
-    
+
     localStorage.setItem('recentEmojis', JSON.stringify(updatedRecents));
-    
+
     // Optionnellement, fermer le picker après sélection
     setIsOpen(false);
   };
@@ -85,11 +106,17 @@ const EmojiPicker: React.FC<EmojiPickerProps> = ({ onEmojiSelect, buttonClassNam
 
       {isOpen && (
         <div className="absolute z-50 bottom-full mb-2 right-0">
-          <Picker {...pickerConfig} />
+          {PickerComponent && emojiData ? (
+            <PickerComponent {...pickerConfig} />
+          ) : (
+            <div className="bg-gray-800 text-gray-300 text-sm rounded-lg p-3">
+              {t('common.loading') || 'Loading…'}
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 };
 
-export default EmojiPicker; 
+export default EmojiPicker;

@@ -8,7 +8,17 @@ interface ExtensionResponse<T = unknown> {
 }
 
 export const isExtensionAvailable = (): boolean => {
-    return (window as Window & { hasMovixExtension?: boolean }).hasMovixExtension === true;
+    const w = window as Window & {
+        hasMovixExtension?: boolean;
+        __MOVIX_EXTENSION_INSTALLED?: boolean;
+        hasMovixUserscript?: boolean;
+    };
+    return (
+        w.hasMovixExtension === true ||
+        w.__MOVIX_EXTENSION_INSTALLED === true ||
+        w.hasMovixUserscript === true ||
+        document.documentElement?.dataset.movixExtension === 'true'
+    );
 };
 
 export const fetchFromExtension = <T = unknown>(

@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Bold, Italic, Code, Link, List, ListOrdered, Quote, Strikethrough, Eye, EyeOff, Info, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
-import { safeRemarkGfm } from '../utils/markdownPlugins';
+import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import { useTranslation } from 'react-i18next';
 import EmojiAutocomplete from './EmojiAutocomplete';
@@ -49,8 +49,6 @@ const previewComponents = {
   h5: ({ children }: any) => <p className="font-bold text-white mb-1">{children}</p>,
   h6: ({ children }: any) => <p className="font-bold text-white mb-1">{children}</p>,
 };
-
-const previewPlugins = safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji];
 
 type FormatAction = {
   icon: React.ReactNode;
@@ -178,6 +176,11 @@ const MarkdownToolbar: React.FC<MarkdownToolbarProps> = ({ textareaRef, value, o
   const [showPreview, setShowPreview] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const actions = buildActions(t);
+  const safeRemarkGfm = useSafeRemarkGfm();
+  const previewPlugins = useMemo(
+    () => (safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]),
+    [safeRemarkGfm],
+  );
 
   const applyFormat = (action: FormatAction) => {
     const textarea = textareaRef.current;

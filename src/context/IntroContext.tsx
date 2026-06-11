@@ -1,4 +1,4 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
+import React, { createContext, useState, useContext, useEffect, useCallback, useMemo } from 'react';
 
 interface IntroContextProps {
   showIntro: boolean;
@@ -34,28 +34,25 @@ export const IntroProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return () => window.removeEventListener('intro_settings_changed', handleIntroReset);
   }, []);
 
-  const completeIntro = () => {
+  const completeIntro = useCallback(() => {
     setShowIntro(false);
     setIntroCompleted(true);
     localStorage.setItem('movix_intro_seen', 'true');
-  };
+  }, []);
 
-  const skipIntro = () => {
+  const skipIntro = useCallback(() => {
     setShowIntro(false);
     setIntroCompleted(true);
     localStorage.setItem('movix_intro_seen', 'true');
-  };
+  }, []);
+
+  const value = useMemo(
+    () => ({ showIntro, setShowIntro, introCompleted, completeIntro, skipIntro }),
+    [showIntro, setShowIntro, introCompleted, completeIntro, skipIntro]
+  );
 
   return (
-    <IntroContext.Provider
-      value={{
-        showIntro,
-        setShowIntro,
-        introCompleted,
-        completeIntro,
-        skipIntro
-      }}
-    >
+    <IntroContext.Provider value={value}>
       {children}
     </IntroContext.Provider>
   );

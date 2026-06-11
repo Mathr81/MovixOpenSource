@@ -1,6 +1,6 @@
 import React from "react";
 import { Zap, Palette, Code2, Flame, Waves, Scale, Shield, Smartphone, Github } from "lucide-react";
-import { Link } from "react-router-dom";
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import "./Footer.css";
 import { useTranslation } from 'react-i18next';
 
@@ -9,9 +9,9 @@ const Footer: React.FC = () => {
   return (
   <>
     {/* Barre de délimitation */}
-    <div className="w-full h-px bg-gradient-to-r from-transparent via-gray-600 to-transparent"></div>
+    <div className="relative z-10 w-full h-px bg-gradient-to-r from-transparent via-gray-600 to-transparent"></div>
 
-    <footer className="bg-black text-gray-300 py-8 mt-0">
+    <footer className="relative z-10 bg-black text-gray-300 py-8 mt-0">
       <div className="container mx-auto px-6 max-w-6xl">
         {/* Section principale */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 mb-8">

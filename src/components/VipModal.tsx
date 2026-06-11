@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Crown } from 'lucide-react';
 import AccessCodeForm from './AccessCodeForm';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 
 interface VipModalProps {
   isOpen: boolean;

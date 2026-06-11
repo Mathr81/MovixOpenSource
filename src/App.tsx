@@ -1,28 +1,10 @@
-import React, { useEffect, useLayoutEffect, useState, useRef } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigationType, useNavigate } from 'react-router-dom';
+import React, { useEffect, useLayoutEffect, useState, useRef, lazy } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigationType, useNavigate, matchPath } from 'react-router-dom';
 import { Toaster } from './components/ui/sonner';
 import { TooltipProvider } from './components/ui/tooltip';
 import Header from './components/Header';
 import Home from './pages/Home';
-import Search from './pages/Search';
-import MovieDetails from './pages/MovieDetails';
-import TVDetails from './pages/TVDetails';
-import Movies from './pages/Movies';
-import Anime from './pages/Anime';
-import TVShows from './pages/TVShows';
-import Collections from './pages/Collections';
-import CollectionDetails from './pages/CollectionDetails';
-import GenrePage from './pages/GenrePage';
-import WatchMovie from './pages/Watch/WatchMovie';
-import WatchTv from './pages/Watch/WatchTv';
-import ProviderContent from './pages/ProviderContent';
-import ProviderCatalogPage from './pages/ProviderCatalogPage';
-import RoulettePage from './pages/RoulettePage';
-import DiscordAuth from './components/DiscordAuth';
-import GoogleAuth from './components/GoogleAuth';
 import DnsBlockBanner from './components/DnsBlockBanner';
-import HelpRouter from './pages/help/HelpRouter';
-import Profile from './pages/Profile';
 import { AdFreePopupProvider } from './context/AdFreePopupContext';
 import { SearchProvider } from './context/SearchContext';
 import { AuthProvider } from './context/AuthContext';
@@ -30,67 +12,34 @@ import { AdWarningProvider } from './context/AdWarningContext';
 import { VipModalProvider } from './context/VipModalContext';
 import { ProfileProvider, useProfile } from './context/ProfileContext';
 import { TurnstileProvider } from './context/TurnstileContext';
+import { LightModeProvider, useLightMode } from './context/LightModeContext';
 
-import LiveTV from './pages/LiveTV';
-import PersonDetails from './pages/PersonDetails';
-import SuggestionPage from './pages/SuggestionPage';
-import ExtensionPage from './pages/ExtensionPage';
-import AppDownloadPage from './pages/AppDownloadPage';
-import SharedListPage from './pages/SharedListPage';
-import SharedListsCatalogPage from './pages/SharedListsCatalogPage';
 import NotFound from './pages/NotFound';
 import 'video.js/dist/video-js.css';
 import './styles/videojs-custom.css';
-import WatchAnime from './pages/Watch/WatchAnime';
-import WatchPartyCreate from './pages/WatchPartyCreate';
-import WatchPartyRoom from './pages/WatchPartyRoom';
-import WatchPartyJoin from './pages/WatchPartyJoin';
-import WatchPartyList from './pages/WatchPartyList';
 import axios from 'axios';
 import Footer from './components/Footer';
 import CreateAccount from './pages/CreateAccount';
 import LoginBip39 from './pages/LoginBip39';
-import AlertsPage from './pages/AlertsPage';
 import { AlertService } from './services/alertService';
 import NotificationToast from './components/NotificationToast';
 import { NotificationData } from './types/alerts';
-import DMCA from './pages/DMCA';
-import AdminPage from './pages/AdminPage';
-import DownloadPage from './pages/DownloadPage';
-import DebridPage from './pages/DebridPage';
-import ProfileSelection from './pages/ProfileSelection';
-import ProfileManagement from './pages/ProfileManagement';
 import RedirectPopup from './components/RedirectPopup';
-import WishboardPage from './pages/Greenlight/WishboardPage';
-import WishboardNewRequest from './pages/Greenlight/WishboardNewRequest';
-import WishboardUserRequests from './pages/Greenlight/WishboardUserRequests';
-import SubmitLinkPage from './pages/Greenlight/SubmitLinkPage';
-import VipPage from './pages/VipPage';
-import VipDonatePage from './pages/VipDonatePage';
-import VipInvoicesPage from './pages/VipInvoicesPage';
-import VipInvoicePage from './pages/VipInvoicePage';
-import VipGiftPage from './pages/VipGiftPage';
-import WhatIsMovixPage from './pages/WhatIsMovixPage';
-import Privacy from './pages/Privacy';
-import TermsOfService from './pages/TermsOfService';
+import { TopProgressBar } from './components/TopProgressBar';
 import SmoothScroll from './components/SmoothScroll';
-import WrappedPage from './pages/WrappedPage';
-import CineGraphPage from './pages/CineGraph';
-import SettingsPage from './pages/SettingsPage';
-import Top10Page from './pages/Top10Page';
-import OAuthAuthorizePage from './pages/OAuthAuthorizePage';
-import FranceTVBrowse from './pages/FranceTV/FranceTVBrowse';
-import FranceTVInfo from './pages/FranceTV/FranceTVInfo';
-import FranceTVPlayer from './pages/FranceTV/FranceTVPlayer';
 import AprilFoolsAdminPage from './pages/AprilFoolsAdminPage';
+import ProfileSelection from './pages/ProfileSelection';
+import { ROUTES, type RouteEntry } from './routing/registry';
+import { DelayedSuspense } from './components/DelayedSuspense';
+import { RouteProgressBar } from './components/RouteProgressBar';
 import ScreenSaver from './components/ScreenSaver';
 import { useIdleTimer } from './hooks/useIdleTimer';
 import { startVipVerification } from './utils/vipUtils';
 import { broadcastAuthChange, clearStoredAuthSession, getResolvedAccountContext } from './utils/accountAuth';
-import { isSyncableStorageKey } from './utils/syncStorage';
+import { isSyncableStorageKey, SYNC_OUTBOX_STORAGE_KEY } from './utils/syncStorage';
 import i18n, { detectInitialLanguage } from './i18n';
 import { useTranslation } from 'react-i18next';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import IntroAnimation from './components/IntroAnimation';
 import { IntroProvider, useIntro } from './context/IntroContext';
 import { APRIL_FOOLS_ADMIN_PATH, isAprilFoolsAdminEnabled } from './utils/aprilFools';
@@ -519,6 +468,53 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   return isAuthenticated ? children : <Navigate to="/login" />;
 };
 
+// Cache module-level des composants Lazy par path. Sans ça, chaque appel à
+// renderRouteEntry (ROUTES.map à chaque render d'App) créerait une nouvelle
+// instance lazy() avec son propre cache de chunk → instabilité d'identité.
+const lazyComponentCache = new Map<string, React.LazyExoticComponent<React.ComponentType<unknown>>>();
+const getCachedLazy = (entry: RouteEntry) => {
+  let cached = lazyComponentCache.get(entry.path);
+  if (!cached) {
+    cached = lazy(entry.loader as () => Promise<{ default: React.ComponentType<unknown> }>);
+    lazyComponentCache.set(entry.path, cached);
+  }
+  return cached;
+};
+
+// Wrapper qui injecte `key={location.pathname}` sur le composant lazy. Sans ça,
+// quand l'utilisateur navigue entre deux URLs matchant le même Route pattern
+// (ex. /movie/abc → /movie/xyz), React Router réutilise l'instance composant
+// avec juste les params updated. Les useState de la page (movie, cast, crew,
+// loading…) gardent les valeurs de l'ancien id pendant que le nouveau fetch
+// tourne — l'utilisateur voit l'ancien film tant que TMDB répond pas.
+// Avec key={pathname}, la clé change → React remount le composant → state reset
+// → loader/skeleton affiché jusqu'au nouveau fetch.
+const RouteLazyContent: React.FC<{
+  Lazy: React.LazyExoticComponent<React.ComponentType<unknown>>;
+  fallback: React.ReactNode;
+}> = ({ Lazy, fallback }) => {
+  const location = useLocation();
+  return (
+    <DelayedSuspense fallback={fallback}>
+      <Lazy key={location.pathname} />
+    </DelayedSuspense>
+  );
+};
+
+const renderRouteEntry = (entry: RouteEntry) => {
+  const Lazy = getCachedLazy(entry);
+  let element: React.ReactNode = (
+    <RouteLazyContent
+      Lazy={Lazy}
+      fallback={entry.fallback ?? <RouteProgressBar />}
+    />
+  );
+  if (entry.guard === 'private') {
+    element = <PrivateRoute>{element}</PrivateRoute>;
+  }
+  return <Route key={entry.path} path={entry.path} element={element} />;
+};
+
 // PersistenceManager component to sync localStorage with backend (disabled for guests and VIP)
 const PersistenceManager = () => {
   const [isInitialSyncDone, setIsInitialSyncDone] = useState<boolean>(false);
@@ -544,6 +540,8 @@ const PersistenceManager = () => {
   React.useEffect(() => {
     (window as any).setProfileDataLoading = (loading: boolean) => {
       isProfileDataLoadingRef.current = loading;
+      const diag = (window as unknown as { __syncDiag?: Record<string, unknown> }).__syncDiag;
+      if (diag) diag.gateLastSetTo = loading;
       debugAppLog('Profile data loading state changed:', loading);
     };
 
@@ -625,6 +623,41 @@ const PersistenceManager = () => {
   useEffect(() => {
     // Setup localStorage sync (now allowed on watch routes)
 
+    // Diagnostic counters (window.__syncDiag) — readable from remote inspector
+    // to pinpoint which guard silently drops sync ops on Firefox mobile.
+    const syncDiag = ((window as unknown as { __syncDiag?: Record<string, unknown> }).__syncDiag = {
+      setItemIntercepted: 0,
+      removeItemIntercepted: 0,
+      diffsQueued: 0,
+      diffsDrained: 0,
+      skipSuppress: 0,
+      skipNotSyncable: 0,
+      skipNoop: 0,
+      skipForceClear: 0,
+      skipGateSet: 0,
+      skipGateRemove: 0,
+      skipGateEnqueue: 0,
+      opsEnqueued: 0,
+      flushGeneralCalled: 0,
+      flushGeneralBlockedGate: 0,
+      sendOpsCalled: 0,
+      sendOpsEmpty: 0,
+      sendOpsBlockedForceClear: 0,
+      sendOpsBlockedGate: 0,
+      sendOpsBlockedUserInfo: 0,
+      sendOpsBlockedNoToken: 0,
+      sendOpsAttempted: 0,
+      sendOpsSuccess: 0,
+      sendOpsError: 0,
+      lastSkippedKey: '',
+      lastUserInfo: '',
+      lastError: '',
+      gateInitialState: undefined as boolean | undefined,
+      gateLastSetTo: undefined as boolean | undefined,
+      profileLoadingExposed: typeof (window as unknown as { setProfileDataLoading?: unknown }).setProfileDataLoading === 'function'
+    });
+    syncDiag.gateInitialState = isProfileDataLoadingRef.current;
+
     // Initialize snapshot of current localStorage
     const prevValues = new Map<string, string | null>();
     for (let i = 0; i < localStorage.length; i++) {
@@ -658,9 +691,10 @@ const PersistenceManager = () => {
 
     const enqueueGeneralOp = (op: any) => {
       // Skip sync during profile data loading (but allow on watch routes)
-      if (isProfileDataLoadingRef.current) return;
+      if (isProfileDataLoadingRef.current) { syncDiag.skipGateEnqueue++; return; }
 
       generalOpsRef.current.push(op);
+      syncDiag.opsEnqueued++;
       if (generalFlushTimeoutRef.current) return;
       generalFlushTimeoutRef.current = setTimeout(() => {
         flushGeneralOps();
@@ -669,29 +703,38 @@ const PersistenceManager = () => {
     };
 
     const sendOps = async (ops: any[]) => {
-      if (!ops.length) return;
+      if (!ops.length) { syncDiag.sendOpsEmpty++; return; }
+      syncDiag.sendOpsCalled++;
 
       // Vérifier si un clear forcé est en cours (erreur 401)
       if ((window as any).__forceClearInProgress) {
+        syncDiag.sendOpsBlockedForceClear++;
         debugAppLog('Skipping sync - force clear in progress');
         return;
       }
 
       // Skip sync during profile data loading (but allow on watch routes)
       if (isProfileDataLoadingRef.current) {
+        syncDiag.sendOpsBlockedGate++;
         debugAppLog('Skipping sync - profile data loading in progress');
         return;
       }
 
       const userInfo = getUserInfo();
       // Only sync for oauth and bip39 users with a selected profile
-      if (!userInfo.type || !userInfo.profileId || !['oauth', 'bip39'].includes(userInfo.type)) return;
+      if (!userInfo.type || !userInfo.profileId || !['oauth', 'bip39'].includes(userInfo.type)) {
+        syncDiag.sendOpsBlockedUserInfo++;
+        syncDiag.lastUserInfo = JSON.stringify(userInfo);
+        return;
+      }
 
       const authToken = localStorage.getItem('auth_token');
       if (!authToken) {
+        syncDiag.sendOpsBlockedNoToken++;
         debugAppLog('Skipping sync - no auth token available');
         return;
       }
+      syncDiag.sendOpsAttempted++;
 
       try {
         for (let index = 0; index < ops.length; index += MAX_SYNC_OPS_PER_REQUEST) {
@@ -712,18 +755,35 @@ const PersistenceManager = () => {
           });
         }
 
+        // NOTE: don't clear SYNC_OUTBOX_STORAGE_KEY here. The outbox holds
+        // un-replayed ops from previous sessions; in-session sendOps only
+        // sees current-session ops. The two sets are disjoint, so clearing
+        // here would silently drop a previous session's ops that hadn't yet
+        // succeeded a replay. ProfileContext.replayOutboxIfAny owns the
+        // outbox lifecycle; backend ops are idempotent so leaving stale
+        // outbox entries doesn't cause incorrect state, only one extra POST
+        // on next boot.
+
+        syncDiag.sendOpsSuccess++;
         debugAppLog('Sync request successful');
         window.dispatchEvent(new CustomEvent('sync_storage_updated'));
       } catch (e) {
+        syncDiag.sendOpsError++;
+        syncDiag.lastError = (e instanceof Error ? e.message : String(e)).slice(0, 200);
         console.error('Delta sync failed', e);
       }
     };
 
     const flushGeneralOps = () => {
+      syncDiag.flushGeneralCalled++;
       const ops = generalOpsRef.current;
       generalOpsRef.current = [];
       // Skip sync during profile data loading (but allow on watch routes)
-      if (!isProfileDataLoadingRef.current && ops.length) sendOps(ops);
+      if (isProfileDataLoadingRef.current) {
+        syncDiag.flushGeneralBlockedGate++;
+        return;
+      }
+      if (ops.length) sendOps(ops);
     };
 
     const flushProgressOps = () => {
@@ -914,13 +974,13 @@ const PersistenceManager = () => {
     };
 
     const processSet = (key: string, oldVal: string | null, newVal: string) => {
-      if (suppressSyncRef.current) return;
-      if (!isSyncableStorageKey(key)) return;
-      if (oldVal === newVal) return;
+      if (suppressSyncRef.current) { syncDiag.skipSuppress++; return; }
+      if (!isSyncableStorageKey(key)) { syncDiag.skipNotSyncable++; return; }
+      if (oldVal === newVal) { syncDiag.skipNoop++; return; }
       // Vérifier si un clear forcé est en cours (erreur 401)
-      if ((window as any).__forceClearInProgress) return;
+      if ((window as any).__forceClearInProgress) { syncDiag.skipForceClear++; return; }
       // Skip sync during profile data loading (but allow on watch routes)
-      if (isProfileDataLoadingRef.current) return;
+      if (isProfileDataLoadingRef.current) { syncDiag.skipGateSet++; syncDiag.lastSkippedKey = key; return; }
       if (isProgressKey(key)) {
         // Accumulate latest patch for progress keys
         const delta = computeObjectPatch(oldVal, newVal);
@@ -953,12 +1013,12 @@ const PersistenceManager = () => {
     };
 
     const processRemove = (key: string) => {
-      if (suppressSyncRef.current) return;
-      if (!isSyncableStorageKey(key)) return;
+      if (suppressSyncRef.current) { syncDiag.skipSuppress++; return; }
+      if (!isSyncableStorageKey(key)) { syncDiag.skipNotSyncable++; return; }
       // Vérifier si un clear forcé est en cours (erreur 401)
-      if ((window as any).__forceClearInProgress) return;
+      if ((window as any).__forceClearInProgress) { syncDiag.skipForceClear++; return; }
       // Skip sync during profile data loading (but allow on watch routes)
-      if (isProfileDataLoadingRef.current) return;
+      if (isProfileDataLoadingRef.current) { syncDiag.skipGateRemove++; syncDiag.lastSkippedKey = key; return; }
       enqueueGeneralOp({ op: 'remove', key });
       if (isProgressKey(key)) {
         progressOpsMapRef.current.delete(key);
@@ -976,6 +1036,7 @@ const PersistenceManager = () => {
       queueMicrotask(() => {
         diffQueueScheduled = false;
         const batch = pendingDiffs.splice(0);
+        syncDiag.diffsDrained += batch.length;
         for (const entry of batch) {
           if (entry.newVal === null) {
             processRemove(entry.key);
@@ -986,8 +1047,13 @@ const PersistenceManager = () => {
       });
     };
 
-    // BroadcastChannel for cross-tab sync (replaces 2s/5s polling on Safari/Firefox).
-    // Other tabs receive { key, value } and reconcile against their own prevValuesRefLocal.
+    // BroadcastChannel for cross-tab sync. Receivers ONLY refresh prev so
+    // future local diffs are correct against shared localStorage state — they
+    // must NOT enqueue sync ops here. The originating tab handles its own
+    // sync; re-syncing in receivers races with this tab's pending 1s flush
+    // and can interleave a `remove` between a user's `arrayAdd X` and the
+    // backing `arrayAdd A,B,C,D` (when another tab's loadProfileData wipes
+    // and re-applies the syncable keys), losing X from the backend.
     const supportsBroadcastChannel = typeof BroadcastChannel !== 'undefined';
     let channel: BroadcastChannel | null = null;
     if (supportsBroadcastChannel && isLocalStorageAvailable) {
@@ -998,12 +1064,11 @@ const PersistenceManager = () => {
           const key = data.key;
           const value = data.value as string | null | undefined;
           if (typeof key !== 'string') return;
-          const oldVal = prevValuesRefLocal.current.get(key) ?? null;
           const newVal = (value === undefined ? null : value) as string | null;
-          if (oldVal !== newVal) {
+          if (newVal === null) {
+            prevValuesRefLocal.current.delete(key);
+          } else {
             prevValuesRefLocal.current.set(key, newVal);
-            pendingDiffs.push({ key, oldVal, newVal });
-            scheduleDiffDrain();
           }
         };
       } catch (error) {
@@ -1063,13 +1128,34 @@ const PersistenceManager = () => {
       }
     }, 2000) : null; // Poll every 2 seconds for Safari and Firefox/Librewolf without BroadcastChannel
 
-    const originalSetItem = localStorage.setItem;
-    const originalRemoveItem = localStorage.removeItem;
-    const originalClear = localStorage.clear;
+    // Patch Storage.prototype, NOT the localStorage instance. On Firefox,
+    // `localStorage` is a LegacyPlatformObject with a named-property setter:
+    // assigning `localStorage.setItem = fn` is interpreted as
+    // `setItem("setItem", fn.toString())` and stores the function as a
+    // localStorage entry — leaving the original prototype method in place,
+    // so writes are never intercepted and zero sync requests fire. Patching
+    // the prototype (a plain object, no named-property handler) works on
+    // every engine. The `this === localStorage` guard keeps sessionStorage
+    // writes on the unmodified path.
+    const originalSetItem = Storage.prototype.setItem;
+    const originalRemoveItem = Storage.prototype.removeItem;
+    const originalClear = Storage.prototype.clear;
 
-    localStorage.setItem = function (key: string, value: string) {
+    // Past versions of this code attempted `localStorage.setItem = fn` and
+    // accidentally seeded junk entries on Firefox users. Drop them once.
+    for (const junkKey of ['setItem', 'removeItem', 'clear']) {
+      const v = localStorage.getItem(junkKey);
+      if (v && v.startsWith('function')) {
+        originalRemoveItem.call(localStorage, junkKey);
+        prevValuesRefLocal.current.delete(junkKey);
+      }
+    }
+
+    Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
+      if (this !== localStorage) return originalSetItem.call(this, key, value);
       if (!isLocalStorageAvailable) return;
 
+      syncDiag.setItemIntercepted++;
       const oldVal = prevValuesRefLocal.current.get(key) ?? localStorage.getItem(key);
       originalSetItem.call(localStorage, key, value);
       prevValuesRefLocal.current.set(key, value);
@@ -1080,13 +1166,19 @@ const PersistenceManager = () => {
       // Defer JSON-diff cost off the synchronous write path.
       if (!isProfileDataLoadingRef.current) {
         pendingDiffs.push({ key, oldVal, newVal: value });
+        syncDiag.diffsQueued++;
         scheduleDiffDrain();
+      } else {
+        syncDiag.skipGateSet++;
+        syncDiag.lastSkippedKey = key;
       }
     } as any;
 
-    localStorage.removeItem = function (key: string) {
+    Storage.prototype.removeItem = function (this: Storage, key: string) {
+      if (this !== localStorage) return originalRemoveItem.call(this, key);
       if (!isLocalStorageAvailable) return;
 
+      syncDiag.removeItemIntercepted++;
       const oldVal = prevValuesRefLocal.current.get(key) ?? null;
       originalRemoveItem.call(localStorage, key);
       prevValuesRefLocal.current.delete(key);
@@ -1097,11 +1189,16 @@ const PersistenceManager = () => {
       // Defer downstream sync work into the microtask drain.
       if (!isProfileDataLoadingRef.current) {
         pendingDiffs.push({ key, oldVal, newVal: null });
+        syncDiag.diffsQueued++;
         scheduleDiffDrain();
+      } else {
+        syncDiag.skipGateRemove++;
+        syncDiag.lastSkippedKey = key;
       }
     } as any;
 
-    localStorage.clear = function () {
+    Storage.prototype.clear = function (this: Storage) {
+      if (this !== localStorage) return originalClear.call(this);
       if (!isLocalStorageAvailable) return;
 
       // Snapshot keys (with their previous values) before wiping localStorage.
@@ -1127,16 +1224,14 @@ const PersistenceManager = () => {
       prevValuesRefLocal.current.clear();
     } as any;
 
+    // Same rule as the BroadcastChannel handler: refresh prev only, never
+    // enqueue sync ops. See the channel.onmessage comment above for the
+    // race that re-syncing here re-introduces.
     const storageListener = (e: StorageEvent) => {
       if (!e.key) return;
-      // Skip sync during profile data loading (but allow on watch routes)
-      if (isProfileDataLoadingRef.current) return;
-
       if (e.newValue === null) {
-        processRemove(e.key);
         prevValuesRefLocal.current.delete(e.key);
       } else {
-        processSet(e.key, e.oldValue, e.newValue);
         prevValuesRefLocal.current.set(e.key, e.newValue);
       }
     };
@@ -1155,6 +1250,27 @@ const PersistenceManager = () => {
     const flushPendingOpsSync = () => {
       if (isProfileDataLoadingRef.current) return;
       if ((window as unknown as { __forceClearInProgress?: boolean }).__forceClearInProgress) return;
+
+      // Synchronously drain pendingDiffs FIRST. The microtask scheduled by
+      // the wrapped setItem/removeItem may not have run yet on Firefox: its
+      // unload sequencing can fire pagehide before the microtask checkpoint
+      // when the user refreshes immediately after a write (e.g., F5 right
+      // after submitting a VIP key). Without this explicit drain, in-flight
+      // diffs would never reach generalOpsRef and the outbox + keepalive
+      // path below would have nothing to flush — losing the user's write
+      // across reload. Chrome reliably drains microtasks before pagehide,
+      // which is why this manifests as "Firefox-only data loss".
+      if (pendingDiffs.length) {
+        const batch = pendingDiffs.splice(0);
+        for (const entry of batch) {
+          if (entry.newVal === null) {
+            processRemove(entry.key);
+          } else {
+            processSet(entry.key, entry.oldVal, entry.newVal);
+          }
+        }
+      }
+
       if (generalFlushTimeoutRef.current) {
         clearTimeout(generalFlushTimeoutRef.current);
         generalFlushTimeoutRef.current = null;
@@ -1179,6 +1295,61 @@ const PersistenceManager = () => {
       if (!userInfo.type || !userInfo.profileId || !['oauth', 'bip39'].includes(userInfo.type)) return;
       const authToken = localStorage.getItem('auth_token');
       if (!authToken) return;
+
+      // Persist a recovery outbox to localStorage BEFORE the keepalive fetch.
+      // fetch keepalive is best-effort: on Firefox the Authorization header
+      // triggers a CORS preflight that the browser may drop on unload, and
+      // both engines cap inflight keepalive bytes. If the request never lands
+      // server-side, the next page load would otherwise wipe localStorage and
+      // restore stale backend state — losing the user's write. ProfileContext
+      // .replayOutboxIfAny reads this on boot and POSTs before the wipe runs.
+      //
+      // We MERGE with any existing outbox for the same user/profile rather
+      // than overwriting. Without merge, a chain of partial failures (replay
+      // 5xx → next-session writes → next unload) would silently drop the
+      // older un-replayed ops every cycle. A hard cap on op count prevents
+      // unbounded growth across many failed cycles; oldest ops are dropped
+      // first since newer ops reflect later state and ops are idempotent.
+      try {
+        const MAX_OUTBOX_OPS = 10000;
+        let mergedOps: Array<Record<string, unknown>> = pending;
+        try {
+          const existingRaw = localStorage.getItem(SYNC_OUTBOX_STORAGE_KEY);
+          if (existingRaw) {
+            const parsed = JSON.parse(existingRaw) as {
+              userType?: string;
+              profileId?: string;
+              ops?: unknown;
+            } | null;
+            if (parsed
+                && parsed.userType === userInfo.type
+                && parsed.profileId === userInfo.profileId
+                && Array.isArray(parsed.ops)
+                && parsed.ops.length > 0) {
+              mergedOps = [
+                ...(parsed.ops as Array<Record<string, unknown>>),
+                ...pending
+              ];
+            }
+          }
+        } catch { /* noop */ }
+
+        if (mergedOps.length > MAX_OUTBOX_OPS) {
+          mergedOps = mergedOps.slice(mergedOps.length - MAX_OUTBOX_OPS);
+        }
+
+        const outboxPayload = {
+          userType: userInfo.type,
+          profileId: userInfo.profileId,
+          userId: userInfo.id || undefined,
+          ops: mergedOps,
+          ts: Date.now()
+        };
+        localStorage.setItem(SYNC_OUTBOX_STORAGE_KEY, JSON.stringify(outboxPayload));
+      } catch (outboxErr) {
+        // Quota exceeded or other write error — proceed with keepalive anyway.
+        console.warn('[outbox] failed to persist outbox at unload:', outboxErr);
+      }
 
       try {
         for (let index = 0; index < pending.length; index += MAX_SYNC_OPS_PER_REQUEST) {
@@ -1223,9 +1394,9 @@ const PersistenceManager = () => {
       if (browserPollingInterval) clearInterval(browserPollingInterval);
       try { channel?.close(); } catch { /* noop */ }
       channel = null;
-      localStorage.setItem = originalSetItem as any;
-      localStorage.removeItem = originalRemoveItem as any;
-      localStorage.clear = originalClear as any;
+      Storage.prototype.setItem = originalSetItem;
+      Storage.prototype.removeItem = originalRemoveItem;
+      Storage.prototype.clear = originalClear;
     };
   }, [isWatchRoute]); // Add isWatchRoute as dependency
 
@@ -1571,6 +1742,20 @@ const AppWithIntro: React.FC = () => {
     });
   }, []);
 
+  // Idle prefetch (Milestone 6): preload high-traffic route chunks shortly
+  // after mount via requestIdleCallback (setTimeout fallback for Safari/FF).
+  useEffect(() => {
+    const IDLE_PREFETCH = ['/movies', '/tv-shows', '/anime', '/search'];
+    // @ts-expect-error - requestIdleCallback not in all TS DOM lib versions
+    const ric = window.requestIdleCallback || ((cb: () => void) => setTimeout(cb, 1500));
+    ric(() => {
+      for (const path of IDLE_PREFETCH) {
+        const entry = ROUTES.find(r => matchPath(r.path, path));
+        entry?.loader({ silent: true }).catch(() => {/* swallow — best-effort prefetch */});
+      }
+    }, { timeout: 3000 });
+  }, []);
+
   return (
     <div className="min-h-screen bg-black text-white relative overflow-hidden">
       {/* Intro overlay — le site charge derrière */}
@@ -1602,83 +1787,27 @@ const AppWithIntro: React.FC = () => {
         <DefaultProfileNudge />
         <ProfileGate>
           <Routes>
+            {/* Eager — landing page, kept in main bundle */}
             <Route path="/" element={<Home />} />
-            <Route path="/search" element={<Search />} />
-            <Route path="/movies" element={<Movies />} />
-            <Route path="/anime" element={<Anime />} />
-            <Route path="/tv-shows" element={<TVShows />} />
-            <Route path="/collections" element={<Collections />} />
-            <Route path="/collection/:id" element={<CollectionDetails />} />
-            <Route path="/movie/:id" element={<MovieDetails />} />
-            <Route path="/tv/:id" element={<TVDetails />} />
-            <Route path="/download/:type/:id" element={<DownloadPage />} />
-            <Route path="/debrid" element={<DebridPage />} />
-            <Route path="/genre/:mediaType/:genreId" element={<GenrePage />} />
-            <Route path="/roulette" element={<RoulettePage />} />
-            <Route path="/provider/:providerId" element={<ProviderContent />} />
-            <Route path="/provider/:providerId/:type" element={<ProviderCatalogPage />} />
-            <Route path="/provider/:providerId/:type/:genreId" element={<ProviderCatalogPage />} />
-            <Route path="/auth" element={<DiscordAuth />} />
-            <Route path="/auth/google" element={<GoogleAuth />} />
-            <Route path="/oauth/authorize" element={<OAuthAuthorizePage />} />
-            <Route path="/create-account" element={<CreateAccount />} />
+
+            {/* Routes spéciales avec props ou logique conditionnelle */}
             <Route path="/login-bip39" element={<LoginBip39 />} />
+            <Route path="/create-account" element={<CreateAccount />} />
             <Route path="/link-bip39" element={<LoginBip39 mode="link" />} />
             <Route path="/link-bip39/create" element={<CreateAccount mode="link" />} />
-            <Route path="/person/:id" element={<PersonDetails />} />
-            <Route path="/profile" element={<PrivateRoute><Profile /></PrivateRoute>} />
-            <Route path="/alerts" element={<AlertsPage />} />
-            <Route path="/live-tv" element={<LiveTV />} />
-            <Route path="/watch/movie/:tmdbid" element={<WatchMovie />} />
-            <Route path="/watch/tv/:tmdbid/s/:season/e/:episode" element={<WatchTv />} />
-            <Route path="/watch/anime/:id/season/:season/episode/:episode" element={<WatchAnime />} />
-            {/* Watch Party Routes */}
-            <Route path="/watchparty/create" element={<WatchPartyCreate />} />
-            <Route path="/watchparty/room/:roomId" element={<WatchPartyRoom />} />
-            <Route path="/watchparty/join" element={<WatchPartyJoin />} />
-            <Route path="/watchparty/join/:code" element={<WatchPartyJoin />} />
-            <Route path="/watchparty/list" element={<WatchPartyList />} />
-            <Route path="/suggestion" element={<SuggestionPage />} />
-            <Route path="/extension" element={<ExtensionPage />} />
-            <Route path="/app" element={<AppDownloadPage />} />
-            <Route path="/list/:shareCode" element={<SharedListPage />} />
-            <Route path="/list-catalog" element={<SharedListsCatalogPage />} />
-            <Route path="/dmca" element={<DMCA />} />
-            <Route path="/admin" element={<AdminPage />} />
-            <Route path={APRIL_FOOLS_ADMIN_PATH} element={isAprilFoolsAdminRouteEnabled ? <AprilFoolsAdminPage /> : <Navigate to="/" replace />} />
-            <Route path="/profile-selection" element={<ProfileSelection />} />
-            <Route path="/profile-management" element={<ProfileManagement />} />
-            {/* Wishboard / Greenlight Routes */}
-            <Route path="/wishboard" element={<WishboardPage />} />
-            <Route path="/wishboard/new" element={<WishboardNewRequest />} />
-            <Route path="/wishboard/my-requests" element={<WishboardUserRequests />} />
-            <Route path="/wishboard/submit-link" element={<SubmitLinkPage />} />
-            {/* VIP Route */}
-            <Route path="/vip" element={<VipPage />} />
-            <Route path="/vip/don" element={<VipDonatePage />} />
-            <Route path="/vip/invoices" element={<VipInvoicesPage />} />
-            <Route path="/vip/invoice/:publicId" element={<VipInvoicePage />} />
-            <Route path="/vip/cadeau/:giftToken" element={<VipGiftPage />} />
-            {/* What is Movix Route */}
-            <Route path="/about" element={<WhatIsMovixPage />} />
-            <Route path="/help/*" element={<HelpRouter />} />
-            <Route path="/privacy" element={<Privacy />} />
-            <Route path="/terms-of-service" element={<TermsOfService />} />
             <Route path="/terms" element={<Navigate to="/terms-of-service" replace />} />
-            {/* CinéGraph Route */}
-            <Route path="/cinegraph" element={<CineGraphPage />} />
-            {/* Settings Route */}
-            <Route path="/settings" element={<SettingsPage />} />
-            {/* Top 10 Route */}
-            <Route path="/top10" element={<Top10Page />} />
-            {/* France.tv Routes */}
-            <Route path="/ftv" element={<FranceTVBrowse />} />
-            <Route path="/ftv/info/:encoded" element={<FranceTVInfo />} />
-            <Route path="/ftv/watch/:encoded" element={<FranceTVPlayer />} />
-            {/* Wrapped Route */}
-            <Route path="/wrapped" element={<WrappedPage />} />
-            <Route path="/wrapped/:year" element={<WrappedPage />} />
-            {/* Route catch-all pour la page 404 */}
+            <Route path="/profile-selection" element={<ProfileSelection />} />
+            <Route
+              path={APRIL_FOOLS_ADMIN_PATH}
+              element={isAprilFoolsAdminRouteEnabled
+                ? <AprilFoolsAdminPage />
+                : <Navigate to="/" replace />}
+            />
+
+            {/* Toutes les autres routes — depuis le registry */}
+            {ROUTES.map(renderRouteEntry)}
+
+            {/* 404 — eager (frequently entered cold) */}
             <Route path="*" element={<NotFound />} />
           </Routes>
         </ProfileGate>
@@ -1709,7 +1838,7 @@ const EmbedBlockPage = () => (
         {i18n.t('embed.message')}
       </p>
       <a
-        href="https://movix.cash"
+        href="https://movix.tax"
         target="_blank"
         rel="noopener noreferrer"
         className="mt-2 inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition sm:py-3 sm:px-6 lg:py-4 lg:px-8"
@@ -1738,6 +1867,19 @@ const MaintenancePage = ({ onContinue }: { onContinue: () => void }) => (
   </div>
 );
 
+// Wraps the tree in a <MotionConfig> tied to the Mode léger / animation prefs.
+// When `transitions` is disabled (manually or because Mode léger is on),
+// framer-motion treats EVERY animation as if `prefers-reduced-motion: reduce`
+// were set — initial/animate/exit are skipped on transform/opacity for free.
+const AnimationMotionConfig: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { effectivePrefs } = useLightMode();
+  return (
+    <MotionConfig reducedMotion={effectivePrefs.transitions ? 'user' : 'always'}>
+      {children}
+    </MotionConfig>
+  );
+};
+
 function App() {
   const [forceContinue, setForceContinue] = React.useState(false);
 
@@ -1763,6 +1905,8 @@ function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <TooltipProvider delayDuration={300}>
+      <LightModeProvider>
+      <AnimationMotionConfig>
       <SearchProvider>
         <AdFreePopupProvider>
           <AuthProvider>
@@ -1773,6 +1917,7 @@ function App() {
                     <IntroProvider>
                       <IOSHomeScreenHandler />
                       <AppWithIntro />
+                      <TopProgressBar />
                       <Toaster position="bottom-right" richColors />
                       <DnsBlockBanner />
                     </IntroProvider>
@@ -1783,6 +1928,8 @@ function App() {
           </AuthProvider>
         </AdFreePopupProvider>
       </SearchProvider>
+      </AnimationMotionConfig>
+      </LightModeProvider>
       </TooltipProvider>
     </BrowserRouter>
   );

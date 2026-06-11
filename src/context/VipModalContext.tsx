@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
 import VipModal from '../components/VipModal';
 
 interface VipModalContextType {
@@ -20,22 +20,21 @@ export const useVipModal = () => {
 export const VipModalProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isVipModalOpen, setIsVipModalOpen] = useState(false);
 
-  const openVipModal = () => {
+  const openVipModal = useCallback(() => {
     setIsVipModalOpen(true);
-  };
+  }, []);
 
-  const closeVipModal = () => {
+  const closeVipModal = useCallback(() => {
     setIsVipModalOpen(false);
-  };
+  }, []);
+
+  const value = useMemo(
+    () => ({ isVipModalOpen, openVipModal, closeVipModal }),
+    [isVipModalOpen, openVipModal, closeVipModal]
+  );
 
   return (
-    <VipModalContext.Provider 
-      value={{ 
-        isVipModalOpen, 
-        openVipModal, 
-        closeVipModal 
-      }}
-    >
+    <VipModalContext.Provider value={value}>
       {children}
       <VipModal isOpen={isVipModalOpen} onClose={closeVipModal} />
     </VipModalContext.Provider>

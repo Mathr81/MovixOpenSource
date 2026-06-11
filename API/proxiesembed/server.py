@@ -938,7 +938,7 @@ class ProxyServer:
     RE_NUMERIC_CDN = re.compile(r'([a-z0-9]+\.\d+\.net|epicquest|questher|hero.*\.com|trainer\.net|dishtrainer)', re.IGNORECASE)
     RE_DOODSTREAM = re.compile(r'd0000d\.com|doodstream\.com|dood\.(cx|la|pm|sh|so|to|watch|wf|yt|re)|cloudatacdn\.com|dsvplay\.com|doply\.net', re.IGNORECASE)
     RE_DOODSTREAM_PASS = re.compile(r'/pass_md5/[\w-]+/(?P<token>[\w-]+)')
-    RE_SEEKSTREAMING = re.compile(r'embed4me\.com|lpayer\.embed4me\.com|servicecatalog\.site|embedseek\.com', re.IGNORECASE)
+    RE_SEEKSTREAMING = re.compile(r'embed4me\.com|lpayer\.embed4me\.com|servicecatalog\.site|technicalcatalog\.site|embedseek\.com|seekplayer\.me', re.IGNORECASE)
     RE_RANGE = re.compile(r'bytes=(\d+)-(\d*)')
     RE_M3U8_URI_DQ = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
     RE_M3U8_URI_SQ = re.compile(r"URI='([^']+)'", re.IGNORECASE)
@@ -2746,27 +2746,32 @@ class ProxyServer:
                 self.vip_cache.set(access_key, False)
                 return False
             
-            # Check expiration (if set)
+            # Check expiration (if set). access_keys.expires_at is BIGINT (Unix epoch ms),
+            # but legacy/admin paths could still produce DATETIME or ISO strings — handle all three.
+            # Note: do NOT fall back to datetime.fromisoformat(str(int)) — Python 3.11+ parses
+            # e.g. "1808043002043" as year 1808, marking every non-null key as expired.
             if expires_at is not None:
                 now = datetime.now(timezone.utc)
-                if isinstance(expires_at, datetime):
-                    # MySQL returns naive datetimes (no tz) â€“ assume UTC
-                    if expires_at.tzinfo is None:
-                        expires_at = expires_at.replace(tzinfo=timezone.utc)
-                    if expires_at < now:
-                        self.vip_cache.set(access_key, False)
-                        return False
-                else:
-                    # expires_at might be a string
+                exp = None
+                if isinstance(expires_at, bool):
+                    pass  # bool is an int subclass — ignore
+                elif isinstance(expires_at, (int, float)):
                     try:
-                        exp = datetime.fromisoformat(str(expires_at))
-                        if exp.tzinfo is None:
-                            exp = exp.replace(tzinfo=timezone.utc)
-                        if exp < now:
-                            self.vip_cache.set(access_key, False)
-                            return False
+                        exp = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+                    except (ValueError, OSError, OverflowError):
+                        exp = None
+                elif isinstance(expires_at, datetime):
+                    exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+                elif isinstance(expires_at, str):
+                    try:
+                        parsed = datetime.fromisoformat(expires_at)
+                        exp = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
                     except (ValueError, TypeError):
-                        pass
+                        exp = None
+
+                if exp is not None and exp < now:
+                    self.vip_cache.set(access_key, False)
+                    return False
             
             # Key is valid
             self.vip_cache.set(access_key, True)
@@ -3239,15 +3244,19 @@ class ProxyServer:
         return full_url
     
     async def _extract_uqload_mp4_url(self, embed_url: str) -> str:
-        """Extract MP4 URL from UQLOAD embed"""
+        """Extract video URL from UQLOAD embed.
+
+        Prefers HLS master.m3u8 (audio + video) over the v.mp4 fallback,
+        because Uqload's v.mp4 is currently a video-only track.
+        """
         validated = self._validate_uqload_url(embed_url)
         urls = [validated, validated.replace('embed-', '')]
-        
+
         headers = {
             'User-Agent': 'Mozilla/5.0 Chrome/91.0.0.0',
             'Accept': 'text/html,*/*'
         }
-        
+
         html = None
         for url in urls:
             try:
@@ -3259,18 +3268,22 @@ class ProxyServer:
                         break
             except:
                 continue
-        
+
         if not html:
             raise ValueError('No content from UQLOAD')
-        
+
         if 'File was deleted' in html:
             raise ValueError('Video deleted')
-        
-        matches = re.findall(r'https?://.+/v\.mp4', html)
-        if not matches:
-            raise ValueError('MP4 URL not found')
-        
-        return matches[0]
+
+        m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+        if m3u8_matches:
+            return m3u8_matches[0]
+
+        mp4_matches = re.findall(r'https?://[^\s"\'<>]+/v\.mp4', html)
+        if not mp4_matches:
+            raise ValueError('Video URL not found')
+
+        return mp4_matches[0]
     
     async def uqload_extract_handler(self, request: Request) -> Response:
         """UQLOAD extraction"""
@@ -3392,7 +3405,20 @@ class ProxyServer:
             return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
     
     # ===== SeekStreaming (Embed4me) Extraction =====
-    
+
+    async def _check_url_alive(self, url: str, headers: Dict, timeout_s: int = 4) -> bool:
+        """Quick liveness check: True if upstream returns 2xx within timeout."""
+        try:
+            async with self.sessions['no_ssl'].get(
+                url,
+                headers=headers,
+                timeout=ClientTimeout(total=timeout_s),
+                allow_redirects=True,
+            ) as r:
+                return 200 <= r.status < 300
+        except Exception:
+            return False
+
     def _decrypt_seekstreaming_data(self, hex_str: str) -> Optional[str]:
         """Decrypt AES-CBC encrypted data from seekstreaming/embed4me API"""
         try:
@@ -3494,13 +3520,34 @@ class ProxyServer:
             # Pass the correct origin/referer to the proxy
             proxy_queries = f"&referer=https%3A//{api_domain}/&origin=https%3A//{api_domain}"
             
-            if raw_cf:
-                result['url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_cf)}{proxy_queries}"
-            if raw_source:
-                result['ip_url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_source)}{proxy_queries}"
-            
             if not raw_cf and not raw_source:
                 return web.json_response({'error': 'No video source found'}, status=404, headers=CORS_HEADERS)
+
+            # Liveness check: probe both upstreams in parallel and only return
+            # one that actually responds. CF-fronted hosts (technicalcatalog.site,
+            # servicecatalog.site, ...) can get flagged as phishing and 403
+            # globally; the IP-direct URL (signed token + expiry) keeps working.
+            # Reuse the player domain from the request as Referer/Origin.
+            upstream_headers = {
+                'Accept': '*/*',
+                'Referer': f'https://{api_domain}/',
+                'Origin': f'https://{api_domain}',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            }
+            source_alive, cf_alive = await asyncio.gather(
+                self._check_url_alive(raw_source, upstream_headers) if raw_source else asyncio.sleep(0, result=False),
+                self._check_url_alive(raw_cf, upstream_headers) if raw_cf else asyncio.sleep(0, result=False),
+            )
+
+            if not source_alive and not cf_alive:
+                return web.json_response(
+                    {'error': 'All upstream sources failed liveness check (likely 403/blocked)'},
+                    status=502,
+                    headers=CORS_HEADERS,
+                )
+
+            chosen = raw_source if source_alive else raw_cf
+            result['url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(chosen)}{proxy_queries}"
             
             self.seekstreaming_cache.set(cache_key, result)
             resp = web.json_response(result)

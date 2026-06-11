@@ -7,7 +7,7 @@ import { Copy, Share2, MessageSquare, Users, X, Send, Clipboard, Check, AlertTri
 import ChangeMediaModal from '../components/ChangeMediaModal';
 import EmojiAutocomplete from '../components/EmojiAutocomplete';
 import ReactMarkdown, { type Components } from 'react-markdown';
-import { safeRemarkGfm } from '../utils/markdownPlugins';
+import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import { useTranslation } from 'react-i18next';
 import HLSPlayer, { HLSPlayerRef } from '../components/HLSPlayer';
@@ -130,6 +130,11 @@ interface ChatMessageItemProps {
 
 const ChatMessageItem = React.memo<ChatMessageItemProps>(
   ({ message, isOwnMessage, isHostMessage, isMutedSender, isCurrentUserHost, t, onToggleMute, onDeleteMessage }) => {
+    const safeRemarkGfm = useSafeRemarkGfm();
+    const remarkPlugins = useMemo(
+      () => (safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]),
+      [safeRemarkGfm],
+    );
     return (
       <div
         className={`flex flex-col ${message.type === 'system'
@@ -179,7 +184,7 @@ const ChatMessageItem = React.memo<ChatMessageItemProps>(
 
           <div className={`text-sm break-words ${message.type === 'system' ? 'italic' : ''}`}>
             {message.type === 'system' ? message.text : (
-              <ReactMarkdown remarkPlugins={safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]} components={CHAT_MD_COMPONENTS}>
+              <ReactMarkdown remarkPlugins={remarkPlugins} components={CHAT_MD_COMPONENTS}>
                 {message.text}
               </ReactMarkdown>
             )}
@@ -215,6 +220,11 @@ const WatchPartyRoom: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const locationState = location.state as LocationState || {};
+  const safeRemarkGfm = useSafeRemarkGfm();
+  const previewRemarkPlugins = useMemo(
+    () => (safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]),
+    [safeRemarkGfm],
+  );
 
   // Track page visit for Movix Wrapped
   useWrappedTracker({
@@ -1860,7 +1870,7 @@ const WatchPartyRoom: React.FC = () => {
                 {/* Live markdown preview (debounced 150ms — see debouncedNewMessage) */}
                 {newMessage.trim() && (
                   <div className="px-3 py-2 mb-1.5 rounded-lg bg-white/5 border border-white/5 text-sm max-h-20 overflow-y-auto" data-lenis-prevent>
-                    <ReactMarkdown remarkPlugins={safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]} components={CHAT_MD_COMPONENTS}>
+                    <ReactMarkdown remarkPlugins={previewRemarkPlugins} components={CHAT_MD_COMPONENTS}>
                       {debouncedNewMessage}
                     </ReactMarkdown>
                   </div>

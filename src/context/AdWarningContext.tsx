@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 
 interface AdWarningContextType {
   showAdWarning: boolean;
@@ -16,13 +16,18 @@ export const AdWarningProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     setShowAdWarning(!adWarningAccepted);
   }, []);
 
-  const handleAccept = () => {
+  const handleAccept = useCallback(() => {
     localStorage.setItem('adWarningAccepted', 'true');
     setShowAdWarning(false);
-  };
+  }, []);
+
+  const value = useMemo(
+    () => ({ showAdWarning, setShowAdWarning, handleAccept }),
+    [showAdWarning, setShowAdWarning, handleAccept]
+  );
 
   return (
-    <AdWarningContext.Provider value={{ showAdWarning, setShowAdWarning, handleAccept }}>
+    <AdWarningContext.Provider value={value}>
       {children}
     </AdWarningContext.Provider>
   );

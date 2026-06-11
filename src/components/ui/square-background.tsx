@@ -83,7 +83,9 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
     colorRef.current = parseRGB(borderColor);
 
     const showCssGrid = mode === 'static';
-    const showHalo = mode === 'static' || mode === 'combined';
+    // Halo : seulement quand le mode l'inclut ET que l'utilisateur ne l'a pas
+    // explicitement désactivé dans Apparence → "Halo lumineux".
+    const showHalo = (mode === 'static' || mode === 'combined') && prefs.haloEnabled;
     const showCanvas = mode === 'animated' || mode === 'combined';
 
     useEffect(() => {
@@ -506,7 +508,7 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
             {showHalo && (
                 <div
                     ref={haloRef}
-                    className="absolute z-[1] pointer-events-none"
+                    className="square-bg-halo absolute z-[1] pointer-events-none"
                     style={{
                         top: 0,
                         left: 0,

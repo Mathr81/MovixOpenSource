@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import { Tv, Loader2, Radio, Search, Crown, Puzzle, ChevronDown, Lock, Zap, Wifi, Star } from 'lucide-react';
 import { toast } from 'sonner';
 
 
-import { Link, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { useTranslation } from 'react-i18next';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
 import { isLiveTvSourceEnabled, subscribeToPrefsChanges, type LiveTvSourceKey } from '../utils/extractionPrefs';
@@ -325,6 +327,98 @@ const LiveTVSectionDivider: React.FC<{ title: string; count: number }> = ({ titl
     <div className="h-px flex-1 bg-white/10" />
   </div>
 );
+
+// Tailwind-aligned breakpoints for the IPTV grid. Mirrors the className
+// `grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6`.
+const IPTV_GRID_GAP_PX = 12;
+const useResponsiveIptvColumns = () => {
+  const compute = () => {
+    if (typeof window === 'undefined') return 2;
+    const w = window.innerWidth;
+    if (w >= 1280) return 6;
+    if (w >= 1024) return 5;
+    if (w >= 768) return 4;
+    if (w >= 640) return 3;
+    return 2;
+  };
+  const [columns, setColumns] = useState(compute);
+  useEffect(() => {
+    const handler = () => setColumns(compute());
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+  return columns;
+};
+
+// Window-scrolled virtualizer for IPTV regular grid. Renders only visible
+// rows; without this, a category like France (~3000 streams) creates ~45k DOM
+// nodes and crashes the tab. — perf
+const VirtualizedIptvGrid = <T,>({
+  items,
+  columns,
+  getKey,
+  renderItem,
+}: {
+  items: T[];
+  columns: number;
+  getKey: (item: T, index: number) => React.Key;
+  renderItem: (item: T, index: number) => React.ReactNode;
+}) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const offsetRef = useRef(0);
+
+  useLayoutEffect(() => {
+    if (containerRef.current) {
+      offsetRef.current = containerRef.current.getBoundingClientRect().top + window.scrollY;
+    }
+  });
+
+  const rowCount = Math.ceil(items.length / Math.max(columns, 1));
+  const virtualizer = useWindowVirtualizer({
+    count: rowCount,
+    estimateSize: () => 220,
+    overscan: 4,
+    scrollMargin: offsetRef.current,
+  });
+
+  const virtualItems = virtualizer.getVirtualItems();
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ position: 'relative', height: `${virtualizer.getTotalSize()}px`, width: '100%' }}
+    >
+      {virtualItems.map((virtualRow) => {
+        const startIdx = virtualRow.index * columns;
+        const rowItems = items.slice(startIdx, startIdx + columns);
+        return (
+          <div
+            key={virtualRow.key}
+            data-index={virtualRow.index}
+            ref={virtualizer.measureElement}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              transform: `translateY(${virtualRow.start - virtualizer.options.scrollMargin}px)`,
+              display: 'grid',
+              gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+              gap: `${IPTV_GRID_GAP_PX}px`,
+              paddingBottom: `${IPTV_GRID_GAP_PX}px`,
+            }}
+          >
+            {rowItems.map((item, colIdx) => (
+              <React.Fragment key={getKey(item, startIdx + colIdx)}>
+                {renderItem(item, startIdx + colIdx)}
+              </React.Fragment>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
 
 // Live-updating "time until kickoff" label, isolated from the parent LiveTV
 // component so a 1s tick re-renders only this leaf instead of the whole
@@ -1316,6 +1410,8 @@ const LiveTV: React.FC = () => {
     [filteredIptvStreams, isFavoriteChannel]
   );
 
+  const iptvColumns = useResponsiveIptvColumns();
+
   const channelGridClassName = cn(
     'grid gap-3',
     (selectedCatalog.startsWith('matches_') || selectedCatalog.startsWith('livetv_'))
@@ -1323,15 +1419,15 @@ const LiveTV: React.FC = () => {
       : 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6'
   );
 
-  const renderIptvCard = (stream: IptvStream, index: number) => {
+  // No per-card framer-motion — at ~3000 cards (e.g. France IPTV category) the
+  // animation pipeline + DOM overwhelmed the tab. Plain div + CSS opacity
+  // transition on hover is the budget. — perf
+  const renderIptvCard = (stream: IptvStream, _index: number) => {
     const isFavorite = isFavoriteChannel('iptv', stream.stream_id);
 
     return (
-      <motion.div
+      <div
         key={stream.stream_id}
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.2, delay: Math.min(index * 0.01, 0.3) }}
         onClick={() => handleIptvChannelClick(stream)}
         className="group cursor-pointer"
       >
@@ -1373,7 +1469,7 @@ const LiveTV: React.FC = () => {
             <p className="text-[11px] font-medium text-white/90 truncate">{stream.name}</p>
           </div>
         </div>
-      </motion.div>
+      </div>
     );
   };
 
@@ -1945,9 +2041,12 @@ const LiveTV: React.FC = () => {
                     {favoriteIptvStreams.length > 0 && (
                       <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularIptvStreams.length} />
                     )}
-                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
-                      {regularIptvStreams.map((stream, index) => renderIptvCard(stream, favoriteIptvStreams.length + index))}
-                    </div>
+                    <VirtualizedIptvGrid
+                      items={regularIptvStreams}
+                      columns={iptvColumns}
+                      getKey={(stream) => stream.stream_id}
+                      renderItem={(stream, index) => renderIptvCard(stream, favoriteIptvStreams.length + index)}
+                    />
                   </div>
                 )}
               </motion.div>

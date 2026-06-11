@@ -1,5 +1,6 @@
 import { ReactNode, ReactElement } from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion } from 'framer-motion';
 import { Trans, useTranslation } from 'react-i18next';
 import { ArrowLeft, ExternalLink } from 'lucide-react';

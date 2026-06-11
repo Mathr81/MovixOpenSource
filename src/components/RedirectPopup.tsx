@@ -83,7 +83,7 @@ const RedirectPopup: React.FC<RedirectPopupProps> = ({
                   {t('redirect.ourNewAddress')}
                 </h2>
                 <div className="bg-red-600/20 border-2 border-red-500 rounded-lg p-4 mb-4">
-                  <p className="text-3xl font-bold text-white">movix.cash</p>
+                  <p className="text-3xl font-bold text-white">movix.tax</p>
                 </div>
                 <p className="text-gray-300 text-sm">
                   {t('redirect.joinTelegramNews')}

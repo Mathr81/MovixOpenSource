@@ -1,14 +1,14 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Heart, MessageCircle, Trash2, Send, X, AlertTriangle, Info, ExternalLink, Popcorn, Flag } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { getVipHeaders } from '../utils/vipUtils';
 import ReactMarkdown from 'react-markdown';
-import { safeRemarkGfm } from '../utils/markdownPlugins';
+import { useSafeRemarkGfm } from '../utils/markdownPlugins';
 import remarkEmoji from 'remark-emoji';
 import MarkdownToolbar from './MarkdownToolbar';
 
@@ -49,8 +49,6 @@ const mdComponents = {
   h5: ({ children }: any) => <p className="font-bold text-white mb-1">{children}</p>,
   h6: ({ children }: any) => <p className="font-bold text-white mb-1">{children}</p>,
 };
-
-const mdPlugins = safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji];
 
 declare global {
   interface Window {
@@ -280,6 +278,12 @@ const CommentItem = React.memo<CommentItemProps>((props) => {
     setIsReplySpoiler,
     setReportModal,
   } = props;
+
+  const safeRemarkGfm = useSafeRemarkGfm();
+  const mdPlugins = useMemo(
+    () => (safeRemarkGfm ? [safeRemarkGfm, remarkEmoji] : [remarkEmoji]),
+    [safeRemarkGfm],
+  );
 
   return (
     <motion.div
@@ -1484,7 +1488,8 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
         `${MAIN_API}/api/comments/${commentId}`,
         {
           content: editContent,
-          isSpoiler: editIsSpoiler
+          isSpoiler: editIsSpoiler,
+          profileId
         },
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -1516,7 +1521,8 @@ const CommentsSection: React.FC<CommentsSectionProps> = ({ contentType, contentI
         `${MAIN_API}/api/comments/replies/${replyId}`,
         {
           content: editContent,
-          isSpoiler: editIsSpoiler
+          isSpoiler: editIsSpoiler,
+          profileId
         },
         { headers: { Authorization: `Bearer ${token}` } }
       );

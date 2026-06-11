@@ -90,7 +90,7 @@ if (cluster.isPrimary ?? cluster.isMaster) {
 ╚═══════════════════════════════════════════════════════╝
   `);
 
-  // Le master ne fait RIEN d'autre — pas de require express, mysql, etc.
+  // Le master ne fait RIEN d'autre — pas de require express, mysql, redis, etc.
   return;
 }
 

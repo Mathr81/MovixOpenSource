@@ -8,6 +8,7 @@ import {
   Link2,
   ListOrdered,
   MessageSquare,
+  Plug,
   ShieldCheck,
   Sparkles,
   Sprout,
@@ -18,6 +19,7 @@ import AdminComments from './AdminComments';
 import AdminHelpFeedback from './AdminHelpFeedback';
 import AdminLinkSubmissions from './Greenlight/AdminLinkSubmissions';
 import AdminWishboard from './Greenlight/AdminWishboard';
+import AdminOAuthApps from './AdminOAuthApps';
 import AdminReports from './AdminReports';
 import AdminSharedLists from './AdminSharedLists';
 import StreamingLinksManager from './StreamingLinksManager';
@@ -30,6 +32,7 @@ type AdminSection =
   | 'links'
   | 'vip-keys'
   | 'vip-invoices'
+  | 'oauth-apps'
   | 'wishboard'
   | 'link-submissions'
   | 'comments'
@@ -79,6 +82,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ role }) => {
         icon: Sparkles,
         accent: 'text-yellow-300',
         highlight: '234 179 8'
+      },
+      {
+        id: 'oauth-apps',
+        title: t('adminOauthApps.cardTitle'),
+        description: t('adminOauthApps.cardDesc'),
+        icon: Plug,
+        accent: 'text-purple-300',
+        highlight: '168 85 247'
       },
       {
         id: 'wishboard',
@@ -303,6 +314,16 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ role }) => {
                 {t('admin.helpFeedback.sectionTitle')}
               </h2>
               <AdminHelpFeedback />
+            </div>
+          )}
+
+          {activeSection === 'oauth-apps' && role === 'admin' && (
+            <div>
+              <h2 className="mb-6 flex items-center gap-3 text-2xl font-bold text-white">
+                <Plug className="h-6 w-6 text-purple-300" />
+                {t('adminOauthApps.cardTitle')}
+              </h2>
+              <AdminOAuthApps />
             </div>
           )}
         </AnimatedBorderCard>

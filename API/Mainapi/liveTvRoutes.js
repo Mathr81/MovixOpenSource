@@ -95,7 +95,7 @@ const WITV_CATEGORIES = {
 };
 
 // URL de base pour Sosplay
-const SOSPLAY_BASE_URL = "https://ligue1live.xyz";
+const SOSPLAY_BASE_URL = "https://streamonsport.art";
 
 // Source Bolaloca/Elitegol (remplace l'ancien catalogue Sosplay pour les chaines)
 const BOLALOCA_BASE_URL = "https://bolaloca.my";
@@ -265,7 +265,7 @@ const BOLALOCA_CHANNELS = [
   },
 ];
 
-const LIVETV_BASE_URL = "https://livetv876.me";
+const LIVETV_BASE_URL = "https://livetv882.me";
 const LIVETV_EMBED_REFERER = `${LIVETV_BASE_URL}/`;
 const LIVETV_ALLUPCOMING_PATHS = ["/frx/allupcoming/", "/frx/ads/"];
 const LIVETV_CATEGORIES = {
@@ -1958,7 +1958,7 @@ function shouldIgnoreLiveTvIframeUrl(rawUrl) {
     const combined = `${hostname}${pathname}${search}`;
 
     if (
-      hostname === "ads.livetv876.me" ||
+      hostname === "ads.livetv882.me" ||
       hostname.startsWith("ads.") ||
       hostname.startsWith("ad.")
     ) {
@@ -3571,7 +3571,6 @@ router.get("/manifest", async (req, res) => {
     manifest.catalogs = [...matchesCatalogs, ...manifest.catalogs];
     manifest.idPrefixes.push("match_");
 
-
     // [DÉSACTIVÉ] Linkzy temporairement désactivé
     // for (const [catId, config] of Object.entries(LINKZY_CATEGORIES)) {
     //     manifest.catalogs.push({
@@ -3762,8 +3761,7 @@ router.get("/stream/:type/:channelId", async (req, res) => {
 
     // Block VIP-only sources immediately if not VIP
     if (
-      (channelId.startsWith("matches_") ||
-        channelId.startsWith("iptv_")) &&
+      (channelId.startsWith("matches_") || channelId.startsWith("iptv_")) &&
       !isVip.vip
     ) {
       return res.status(403).json({ error: "Réservé aux membres VIP" });
@@ -4328,8 +4326,8 @@ router.delete("/cache", async (req, res) => {
 const XTREAM_URL = (process.env.XTREAM_URL || "").replace(/\/+$/, "");
 const XTREAM_USER = process.env.XTREAM_USER || "";
 const XTREAM_PASS = process.env.XTREAM_PASS || "";
-const IPTV_IMAGE_PROXY = "https://proxy.movix.blog/proxy";
-const IPTV_STREAM_PROXY = "https://proxiesembed.movix.blog/proxy";
+const IPTV_IMAGE_PROXY = "https://proxy.movix.tax/proxy";
+const IPTV_STREAM_PROXY = "https://proxiesembed.movix.tax/proxy";
 
 // Cache catégories IPTV en mémoire (change rarement)
 let iptvCategoriesCache = null;
@@ -4390,7 +4388,7 @@ router.get("/iptv/categories", requireVip, async (req, res) => {
 /**
  * GET /api/livetv/iptv/streams/:categoryId
  * Récupère les chaînes d'une catégorie Xtream (VIP only)
- * Images proxifiées via proxy.movix.blog
+ * Images proxifiées via proxy.movix.cash
  */
 router.get("/iptv/streams/:categoryId", requireVip, async (req, res) => {
   const { categoryId } = req.params;

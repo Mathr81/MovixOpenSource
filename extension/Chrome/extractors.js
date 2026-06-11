@@ -748,11 +748,18 @@ async function extractUqload(uqloadUrl) {
         if (!html) return { success: false, error: 'Uqload: Could not fetch page' };
         if (html.includes('File was deleted')) return { success: false, error: 'Uqload: File was deleted' };
 
-        const matches = html.match(/https?:\/\/.+\/v\.mp4/g);
-        if (!matches || matches.length === 0) return { success: false, error: 'Uqload: MP4 URL not found' };
+        // Préférer le HLS master.m3u8 (multi-bitrate) au mp4 single-quality
+        const m3u8Matches = html.match(/https?:\/\/[^"'\s]+\/master\.m3u8/g) || html.match(/https?:\/\/[^"'\s]+\.m3u8/g);
+        let videoUrl = m3u8Matches?.[0];
 
-        const mp4Url = matches[0];
-        const result = { m3u8Url: mp4Url, success: true, source: 'uqload' };
+        if (!videoUrl) {
+            const mp4Matches = html.match(/https?:\/\/.+\/v\.mp4/g);
+            videoUrl = mp4Matches?.[0];
+        }
+
+        if (!videoUrl) return { success: false, error: 'Uqload: video URL not found' };
+
+        const result = { m3u8Url: videoUrl, success: true, source: 'uqload' };
         caches.uqload.set(cacheKey, result);
         return result;
 

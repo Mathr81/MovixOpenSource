@@ -462,7 +462,10 @@ const SlideIntro: React.FC<{ slide: WrappedSlide; stats: WrappedData['stats'] }>
             className="mb-5 sm:mb-6"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-purple-500/30 rounded-full" />
+                <div
+                    className="absolute inset-0 rounded-full pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(168, 85, 247, 0.45) 0%, transparent 70%)' }}
+                />
                 <span className="relative text-7xl md:text-8xl">🎬</span>
             </div>
         </motion.div>
@@ -539,7 +542,10 @@ const SlideTop1: React.FC<{ slide: WrappedSlide; topItem?: WrappedTopContent; tm
                     className="mb-4 sm:mb-6"
                 >
                     <div className="relative">
-                        <div className="absolute inset-0 blur-3xl bg-amber-500/40 rounded-full scale-150" />
+                        <div
+                            className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                            style={{ background: 'radial-gradient(circle, rgba(245, 158, 11, 0.60) 0%, transparent 70%)' }}
+                        />
                         {posterUrl ? (
                             <div className="relative h-36 w-24 overflow-hidden rounded-2xl shadow-2xl ring-4 ring-amber-400/50 sm:h-44 sm:w-32 md:h-56 md:w-40">
                                 <img 
@@ -883,8 +889,8 @@ const SlidePersona: React.FC<{ slide: WrappedSlide; persona: WrappedData['person
         >
             <div className="relative">
                 <div
-                    className="absolute inset-0 blur-3xl rounded-full scale-150"
-                    style={{ backgroundColor: `${persona.color}40` }}
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: `radial-gradient(circle, ${persona.color}66 0%, transparent 70%)` }}
                 />
                 <div
                     className="relative w-36 h-36 md:w-44 md:h-44 rounded-full flex items-center justify-center text-7xl md:text-8xl"
@@ -946,7 +952,10 @@ const SlidePeakMonth: React.FC<{ slide: WrappedSlide; peakMonth: WrappedData['pe
             className="mb-8"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-indigo-500/40 rounded-full scale-150" />
+                <div
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(99, 102, 241, 0.60) 0%, transparent 70%)' }}
+                />
                 <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-blue-500 via-indigo-500 to-violet-600 flex items-center justify-center shadow-2xl rotate-3">
                     <Calendar className="w-14 h-14 md:w-16 md:h-16 text-white" />
                 </div>
@@ -1005,7 +1014,10 @@ const SlideTopGenres: React.FC<{ slide: WrappedSlide; topGenres?: WrappedData['t
             className="mb-8"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-rose-500/30 rounded-full scale-150" />
+                <div
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(244, 63, 94, 0.45) 0%, transparent 70%)' }}
+                />
                 <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-rose-500 via-pink-500 to-fuchsia-600 flex items-center justify-center shadow-2xl -rotate-3">
                     <Music className="w-14 h-14 md:w-16 md:h-16 text-white" />
                 </div>
@@ -1074,7 +1086,10 @@ const SlideListeningClock: React.FC<{ slide: WrappedSlide; listeningClock?: Wrap
                 className="mb-6"
             >
                 <div className="relative">
-                    <div className="absolute inset-0 blur-3xl bg-sky-500/30 rounded-full scale-150" />
+                    <div
+                        className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                        style={{ background: 'radial-gradient(circle, rgba(14, 165, 233, 0.45) 0%, transparent 70%)' }}
+                    />
                     <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-full bg-gradient-to-br from-sky-500 via-blue-500 to-indigo-600 flex items-center justify-center shadow-2xl">
                         <Clock className="w-14 h-14 md:w-16 md:h-16 text-white" />
                     </div>
@@ -1158,7 +1173,10 @@ const SlideStreak: React.FC<{ slide: WrappedSlide; stats: WrappedData['stats'] }
             className="mb-8"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-orange-500/40 rounded-full scale-150" />
+                <div
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(249, 115, 22, 0.60) 0%, transparent 70%)' }}
+                />
                 <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-orange-400 via-red-500 to-rose-600 flex items-center justify-center shadow-2xl">
                     <Flame className="w-16 h-16 md:w-20 md:h-20 text-white" />
                 </div>
@@ -1220,7 +1238,10 @@ const SlideFunFact: React.FC<{ slide: WrappedSlide }> = ({ slide }) => (
             className="mb-8"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-emerald-500/30 rounded-full scale-150" />
+                <div
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(16, 185, 129, 0.45) 0%, transparent 70%)' }}
+                />
                 <span className="relative text-8xl md:text-9xl">{slide.highlight || '💡'}</span>
             </div>
         </motion.div>
@@ -1655,7 +1676,10 @@ const SlideSessionSummary: React.FC<{
             className="mb-8"
         >
             <div className="relative">
-                <div className="absolute inset-0 blur-3xl bg-cyan-500/25 rounded-full scale-150" />
+                <div
+                    className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                    style={{ background: 'radial-gradient(circle, rgba(6, 182, 212, 0.38) 0%, transparent 70%)' }}
+                />
                 <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-cyan-500 via-sky-500 to-blue-600 flex items-center justify-center shadow-2xl">
                     <Clock className="w-14 h-14 md:w-16 md:h-16 text-white" />
                 </div>
@@ -1769,7 +1793,10 @@ const SlideWatchBookends: React.FC<{
                 className="mb-8"
             >
                 <div className="relative">
-                    <div className="absolute inset-0 blur-3xl bg-emerald-500/25 rounded-full scale-150" />
+                    <div
+                        className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                        style={{ background: 'radial-gradient(circle, rgba(16, 185, 129, 0.38) 0%, transparent 70%)' }}
+                    />
                     <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-emerald-500 via-teal-500 to-fuchsia-500 flex items-center justify-center shadow-2xl">
                         <Calendar className="w-14 h-14 md:w-16 md:h-16 text-white" />
                     </div>
@@ -1942,7 +1969,10 @@ const WrappedPage: React.FC = () => {
                         className="mb-6 scale-75 sm:mb-8 sm:scale-100"
                     >
                         <div className="relative">
-                            <div className="absolute inset-0 scale-150 rounded-full bg-violet-500/25 blur-3xl" />
+                            <div
+                                className="absolute inset-0 scale-150 rounded-full pointer-events-none"
+                                style={{ background: 'radial-gradient(circle, rgba(139, 92, 246, 0.38) 0%, transparent 70%)' }}
+                            />
                             <LogIn className="relative h-16 w-16 text-violet-300 sm:h-20 sm:w-20" />
                         </div>
                     </motion.div>
@@ -2013,7 +2043,10 @@ const WrappedPage: React.FC = () => {
                         className="mb-6 scale-75 sm:mb-8 sm:scale-100"
                     >
                         <div className="relative">
-                            <div className="absolute inset-0 scale-150 rounded-full bg-red-500/20 blur-3xl" />
+                            <div
+                                className="absolute inset-0 scale-150 rounded-full pointer-events-none"
+                                style={{ background: 'radial-gradient(circle, rgba(239, 68, 68, 0.30) 0%, transparent 70%)' }}
+                            />
                             <ShieldOff className="relative h-16 w-16 text-red-400 sm:h-20 sm:w-20" />
                         </div>
                     </motion.div>
@@ -2765,7 +2798,7 @@ const WrappedPage: React.FC = () => {
 
         ctx.fillStyle = 'rgba(255,255,255,0.36)';
         ctx.font = '600 26px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        const domainLabel = 'movix.cash';
+        const domainLabel = 'movix.tax';
         ctx.fillText(domainLabel, width - 78 - ctx.measureText(domainLabel).width, footerTextY);
 
         return new Promise((resolve) => {
@@ -3001,7 +3034,10 @@ const WrappedPage: React.FC = () => {
                         className="mb-6 sm:mb-8"
                     >
                         <div className="relative">
-                            <div className="absolute inset-0 blur-3xl bg-purple-500/20 rounded-full scale-150" />
+                            <div
+                                className="absolute inset-0 rounded-full scale-150 pointer-events-none"
+                                style={{ background: 'radial-gradient(circle, rgba(168, 85, 247, 0.30) 0%, transparent 70%)' }}
+                            />
                             <span className="relative text-8xl md:text-9xl">🍿</span>
                         </div>
                     </motion.div>
@@ -3171,8 +3207,10 @@ const WrappedPage: React.FC = () => {
                 />
             </AnimatePresence>
 
-            {/* Ambient glow */}
-            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] blur-[120px] opacity-30 pointer-events-none"
+            {/* Ambient glow — déjà un radial-gradient, on supprime juste le
+                blur-[120px] qui s'appliquait par-dessus (double coût GPU pour
+                aucun gain visuel — le gradient produit déjà la diffusion). */}
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] opacity-30 pointer-events-none"
                 style={{ background: `radial-gradient(circle, ${bg.color.replace('0.15', '0.4')}, transparent)` }}
             />
             </div>

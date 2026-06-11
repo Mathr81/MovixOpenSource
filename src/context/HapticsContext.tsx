@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef, useCallback, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useCallback, useState } from 'react';
 import { useWebHaptics } from 'web-haptics/react';
 
 interface HapticsContextValue {
@@ -88,8 +88,13 @@ export const HapticsProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return () => window.removeEventListener('storage', onStorage);
   }, []);
 
+  const value = useMemo(
+    () => ({ enabled, setEnabled, triggerHaptic }),
+    [enabled, setEnabled, triggerHaptic]
+  );
+
   return (
-    <HapticsContext.Provider value={{ enabled, setEnabled, triggerHaptic }}>
+    <HapticsContext.Provider value={value}>
       {children}
     </HapticsContext.Provider>
   );

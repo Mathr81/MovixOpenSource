@@ -664,8 +664,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
         ja3: CHROME_JA3,
         userAgent: CHROME_UA,
         headers: {
-          Referer: "https://coflix.click/",
-          Origin: "https://coflix.click",
+          Referer: "https://coflix.date/",
+          Origin: "https://coflix.date",
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "fr-FR,fr;q=0.9",
@@ -714,8 +714,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
           userAgent: CHROME_UA,
           proxy: proxyUrl,
           headers: {
-            Referer: "https://coflix.click/",
-            Origin: "https://coflix.click",
+            Referer: "https://coflix.date/",
+            Origin: "https://coflix.date",
             Accept:
               "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9",
