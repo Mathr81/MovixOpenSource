@@ -39,6 +39,9 @@ jobs:
       - name: 🗂️ • Install Node Dependencies
         run: npm ci --legacy-peer-deps
 
+      - name: 📝 • Generate userscript source
+        run: npm run build:userscript
+
       - name: 💎 • Setup Ruby & CocoaPods 1.16.2
         uses: ruby/setup-ruby@v1
         with:
@@ -82,7 +85,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            2>&1 | xcpretty --color
+            2>&1 | tee /tmp/xcodebuild.log | xcpretty --color
+          exit ${PIPESTATUS[0]}
+
+      - name: 📋 • Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: /tmp/xcodebuild.log
+          retention-days: 7
 
       - name: 📦 • Package IPA
         run: |
