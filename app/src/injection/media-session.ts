@@ -198,6 +198,37 @@ export function buildMediaSession(): string {
   }, true);
 
   installHandlers();
+
+  // --- Auto-PiP quand l'app passe en arrière-plan ---
+  // autoPictureInPicture ne fonctionne pas avec MSE (HLS.js) sur WKWebView.
+  // iOS 16+/iPadOS 16+ exempte requestPictureInPicture() de la user-gesture
+  // requirement lorsqu'il est appelé depuis l'event 'visibilitychange' au moment
+  // où le document devient caché (app mise en arrière-plan / bouton Home).
+  // requestPictureInPicture() fonctionne bien avec MSE — c'est d'ailleurs l'API
+  // que le lecteur Movix utilise pour son bouton PiP manuel.
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) return;
+    if (!activeVideo || activeVideo.paused) return;
+    if (document.pictureInPictureElement) return; // déjà en PiP
+
+    // API standard (iOS 16+, iPadOS 16+, Chrome Android)
+    if (typeof document.pictureInPictureEnabled !== 'undefined' &&
+        document.pictureInPictureEnabled &&
+        typeof activeVideo.requestPictureInPicture === 'function') {
+      activeVideo.requestPictureInPicture().catch(function() {
+        // Fallback WebKit si la promesse est rejetée (iOS < 16)
+        if (typeof activeVideo.webkitSetPresentationMode === 'function') {
+          try { activeVideo.webkitSetPresentationMode('picture-in-picture'); } catch (e2) {}
+        }
+      });
+      return;
+    }
+
+    // Fallback direct pour iOS/iPadOS < 16
+    if (typeof activeVideo.webkitSetPresentationMode === 'function') {
+      try { activeVideo.webkitSetPresentationMode('picture-in-picture'); } catch (e) {}
+    }
+  });
 })();
 true;
 `;
