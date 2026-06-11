@@ -16,6 +16,7 @@ import {
   stopCast,
   subscribeCastSessionEvents,
 } from './cast';
+import { pushLog, type LogLevel } from './debugLog';
 
 /** Minimal interface required by the shim helpers — satisfied by both WebView and WebViewBrowserRef. */
 interface InjectableRef {
@@ -371,6 +372,13 @@ export async function handleBridgeMessage(
     const p = parsed as Record<string, unknown>;
     if (typeof p.type === 'string' && p.type.startsWith('CASTSHIM_')) {
       await handleCastShimMessage(parsed as CastShimRequest, webViewRef);
+      return;
+    }
+    // Logs du WebView relayés vers la console de debug.
+    if (p.type === 'CONSOLE_LOG') {
+      const level = (p.level as LogLevel) || 'log';
+      const args = Array.isArray(p.args) ? (p.args as unknown[]) : [];
+      pushLog(level, 'web', args);
       return;
     }
   }

@@ -2,6 +2,7 @@ import React, {
   forwardRef,
   useCallback,
   useImperativeHandle,
+  useMemo,
   useRef,
 } from 'react';
 import { Linking, Platform } from 'react-native';
@@ -25,16 +26,19 @@ export interface WebViewBrowserRef {
 
 interface WebViewBrowserProps {
   url: string;
+  proxyEnabled?: boolean;
   onNavigationStateChange?: (state: WebViewNavigation) => void;
   onError?: (error: string) => void;
   onLoadEnd?: () => void;
 }
 
-const injectedJS = buildInjectedJavaScript();
-
 const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
-  ({ url, onNavigationStateChange, onError, onLoadEnd }, ref) => {
+  ({ url, proxyEnabled = true, onNavigationStateChange, onError, onLoadEnd }, ref) => {
     const webViewRef = useRef<WebView>(null);
+    const injectedJS = useMemo(
+      () => buildInjectedJavaScript({ proxyEnabled }),
+      [proxyEnabled],
+    );
 
     useImperativeHandle(ref, () => ({
       goBack: () => webViewRef.current?.goBack(),

@@ -130,9 +130,10 @@ export default function BrowserScreen() {
       {showWebView && (
         <View style={styles.webViewContainer}>
           <WebViewBrowser
-            key={activeUrl}
+            key={`${activeUrl}:${uiPrefs.proxyEnabled ? 'proxy' : 'direct'}`}
             ref={webViewRef}
             url={activeUrl}
+            proxyEnabled={uiPrefs.proxyEnabled}
             onNavigationStateChange={onNavigationStateChange}
             onError={onWebViewError}
             onLoadEnd={onWebViewLoadEnd}
