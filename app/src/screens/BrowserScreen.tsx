@@ -6,6 +6,7 @@ import {
   AppState,
   BackHandler,
   Platform,
+  StatusBar,
   Modal,
   TouchableOpacity,
   Image,
@@ -28,6 +29,7 @@ export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
   const isVideoPlayingRef = useRef(false);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -83,6 +85,22 @@ export default function BrowserScreen() {
 
   const onMediaPlayback = useCallback((playing: boolean) => {
     isVideoPlayingRef.current = playing;
+    setIsVideoPlaying(playing);
+  }, []);
+
+  // iOS : barre de statut et toolbar masquées pendant la lecture vidéo.
+  // UIViewControllerBasedStatusBarAppearance = false → StatusBar.setHidden
+  // est global et fonctionne même en mode plein-écran WebView.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+    StatusBar.setHidden(isVideoPlaying && !settingsVisible, 'slide');
+  }, [isVideoPlaying, settingsVisible]);
+
+  // Restaure la barre de statut en quittant l'écran.
+  useEffect(() => {
+    return () => {
+      if (Platform.OS === 'ios') StatusBar.setHidden(false, 'none');
+    };
   }, []);
 
   // iOS : quand l'app passe en "inactive" (transition vers l'arrière-plan),
@@ -93,20 +111,19 @@ export default function BrowserScreen() {
     const sub = AppState.addEventListener('change', state => {
       if (state !== 'inactive') return;
       if (!isVideoPlayingRef.current) return;
+      // webkitSetPresentationMode est synchrone — appel en premier pour que
+      // le WKWebView démarre la transition PiP AVANT la suspension JS.
+      // requestPictureInPicture (async Promise) sert de fallback.
       const pipScript = `
 (function(){
   try {
     var v = window.__movixActiveVideo;
     if (!v || v.paused) return;
     if (document.pictureInPictureElement) return;
-    if (document.pictureInPictureEnabled && typeof v.requestPictureInPicture === 'function') {
-      v.requestPictureInPicture().catch(function() {
-        if (typeof v.webkitSetPresentationMode === 'function') {
-          try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e2) {}
-        }
-      });
-    } else if (typeof v.webkitSetPresentationMode === 'function') {
-      try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e) {}
+    if (typeof v.webkitSetPresentationMode === 'function') {
+      try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e1) {}
+    } else if (document.pictureInPictureEnabled && typeof v.requestPictureInPicture === 'function') {
+      v.requestPictureInPicture().catch(function() {});
     }
   } catch(e) {}
 })(); true;`;
@@ -161,8 +178,11 @@ export default function BrowserScreen() {
   const showWebView = !isLoading && !!config && !allMirrorsFailed;
   const showSplash = (!webViewReady || isLoading || !config) && !allMirrorsFailed;
 
+  // Mode immersif : pas de toolbar, pas de paddingTop (vidéo bord à bord).
+  const immersive = Platform.OS === 'ios' && isVideoPlaying && !settingsVisible;
+
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <View style={[styles.container, { paddingTop: immersive ? 0 : insets.top }]}>
       {showWebView && (
         <View style={styles.webViewContainer}>
           <WebViewBrowser
@@ -183,7 +203,7 @@ export default function BrowserScreen() {
         <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
       )}
 
-      {!toolbarHidden && showWebView && (
+      {!toolbarHidden && showWebView && !immersive && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -220,7 +240,7 @@ export default function BrowserScreen() {
         </Modal>
       )}
 
-      {navBarHidden && showWebView && (
+      {navBarHidden && showWebView && !immersive && (
         <MiniPill onPress={() => setSettingsVisible(true)} />
       )}
 

@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import <React/RCTBundleURLProvider.h>
 #import <AVFoundation/AVFoundation.h>
+#import <WebKit/WebKit.h>
 
 #if __has_include(<GoogleCast/GoogleCast.h>)
 #import <GoogleCast/GoogleCast.h>
@@ -35,6 +36,56 @@
 #endif
 
   return [super application:application didFinishLaunchingWithOptions:launchOptions];
+}
+
+// Traverse the view hierarchy to locate the WKWebView instance.
+- (WKWebView *)findWKWebViewIn:(UIView *)view {
+  if ([view isKindOfClass:[WKWebView class]]) return (WKWebView *)view;
+  for (UIView *sub in view.subviews) {
+    WKWebView *found = [self findWKWebViewIn:sub];
+    if (found) return found;
+  }
+  return nil;
+}
+
+// Called BEFORE JS context is suspended — the only reliable window to call
+// webkitSetPresentationMode('picture-in-picture') synchronously for MSE/HLS.js.
+// This fires earlier and more reliably than AppState 'inactive' via the RN bridge.
+- (void)applicationWillResignActive:(UIApplication *)application {
+  [super applicationWillResignActive:application];
+
+  UIView *root = self.window.rootViewController.view;
+  WKWebView *webView = [self findWKWebViewIn:root];
+  if (!webView) return;
+
+  NSString *script = @"(function(){"
+    "try{"
+    "var v=window.__movixActiveVideo;"
+    "if(!v||v.paused)return;"
+    "if(document.pictureInPictureElement)return;"
+    // webkitSetPresentationMode is synchronous — no async Promise gap.
+    "if(typeof v.webkitSetPresentationMode==='function'){"
+    "v.webkitSetPresentationMode('picture-in-picture');"
+    "}else if(document.pictureInPictureEnabled&&typeof v.requestPictureInPicture==='function'){"
+    "v.requestPictureInPicture().catch(function(){});"
+    "}"
+    "}catch(e){}"
+    "})();true;";
+
+  [webView evaluateJavaScript:script completionHandler:nil];
+}
+
+// Toggling userInteractionEnabled resets WKWebView gesture recognizers that
+// get stuck after notification center is dragged over the app during playback.
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+  [super applicationDidBecomeActive:application];
+
+  UIView *root = self.window.rootViewController.view;
+  if (!root) return;
+  root.userInteractionEnabled = NO;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+    root.userInteractionEnabled = YES;
+  });
 }
 
 - (NSURL *)sourceURLForBridge:(RCTBridge *)bridge
