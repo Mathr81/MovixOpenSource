@@ -18,8 +18,9 @@ target 'MovixApp' do
   config = use_native_modules!
 
   # Google Cast SDK (iOS Chromecast support).
-  # Version sans ARC — compatible avec react-native et les builds statiques.
-  pod 'google-cast-sdk-no-arc', '~> 4.8'
+  # Pour activer Chromecast, décommente la ligne ci-dessous et assure-toi
+  # d'avoir `use_frameworks! :linkage => :static` (requis par le SDK Cast).
+  # pod 'google-cast-sdk-no-bluetooth', '~> 4.8'
 
   use_react_native!(
     :path => config[:reactNativePath],
