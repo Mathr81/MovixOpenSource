@@ -1,5 +1,6 @@
 package com.movix.app.pip
 
+import android.os.Build
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
@@ -20,6 +21,11 @@ class PipModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun setVideoPlaying(playing: Boolean) {
         MainActivity.isVideoPlaying = playing
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            currentActivity?.runOnUiThread {
+                (currentActivity as? MainActivity)?.updatePipParams(playing)
+            }
+        }
     }
 
     // Requis par l'interface NativeModule côté event-emitter ; no-op ici.

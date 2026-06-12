@@ -3,6 +3,7 @@ import {
   View,
   Text,
   StyleSheet,
+  AppState,
   BackHandler,
   Platform,
   Modal,
@@ -26,6 +27,7 @@ import SettingsScreen from './SettingsScreen';
 export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
+  const isVideoPlayingRef = useRef(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -79,6 +81,40 @@ export default function BrowserScreen() {
     return unsub;
   }, []);
 
+  const onMediaPlayback = useCallback((playing: boolean) => {
+    isVideoPlayingRef.current = playing;
+  }, []);
+
+  // iOS : quand l'app passe en "inactive" (transition vers l'arrière-plan),
+  // le WKWebView est encore actif — c'est la seule fenêtre où
+  // requestPictureInPicture() peut être appelé sans gesture utilisateur.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'inactive') return;
+      if (!isVideoPlayingRef.current) return;
+      const pipScript = `
+(function(){
+  try {
+    var v = window.__movixActiveVideo;
+    if (!v || v.paused) return;
+    if (document.pictureInPictureElement) return;
+    if (document.pictureInPictureEnabled && typeof v.requestPictureInPicture === 'function') {
+      v.requestPictureInPicture().catch(function() {
+        if (typeof v.webkitSetPresentationMode === 'function') {
+          try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e2) {}
+        }
+      });
+    } else if (typeof v.webkitSetPresentationMode === 'function') {
+      try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e) {}
+    }
+  } catch(e) {}
+})(); true;`;
+      webViewRef.current?.injectJavaScript(pipScript);
+    });
+    return () => sub.remove();
+  }, []);
+
   const onNavigationStateChange = useCallback((state: WebViewNavigation) => {
     setCanGoBack(state.canGoBack);
     setCanGoForward(state.canGoForward);
@@ -130,13 +166,15 @@ export default function BrowserScreen() {
       {showWebView && (
         <View style={styles.webViewContainer}>
           <WebViewBrowser
-            key={`${activeUrl}:${uiPrefs.proxyEnabled ? 'proxy' : 'direct'}`}
+            key={`${activeUrl}:${uiPrefs.proxyEnabled ? 'proxy' : 'direct'}:${uiPrefs.castMode}`}
             ref={webViewRef}
             url={activeUrl}
             proxyEnabled={uiPrefs.proxyEnabled}
+            castMode={uiPrefs.castMode}
             onNavigationStateChange={onNavigationStateChange}
             onError={onWebViewError}
             onLoadEnd={onWebViewLoadEnd}
+            onMediaPlayback={onMediaPlayback}
           />
         </View>
       )}

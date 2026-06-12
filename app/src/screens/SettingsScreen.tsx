@@ -43,7 +43,7 @@ export default function SettingsScreen() {
   const [appVersion, setAppVersion] = useState<string>('—');
   const [extractionPrefs, setExtractionPrefs] = useState<ExtractionPrefs>(buildDefaultExtractionPrefs);
   const [debugVisible, setDebugVisible] = useState(false);
-  const { prefs: uiPrefs, setShowUrlBar, setShowNavBar, setProxyEnabled } = useBrowserUIPrefs();
+  const { prefs: uiPrefs, setShowUrlBar, setShowNavBar, setProxyEnabled, setCastMode } = useBrowserUIPrefs();
 
   useEffect(() => {
     getLocalVersionName()
@@ -223,6 +223,46 @@ export default function SettingsScreen() {
             : "Extension désactivée : le site ne la détecte plus et utilise son propre chemin de requêtes. La page est rechargée à chaque changement."}
         </Text>
       </View>
+
+      {/* Casting iOS — AirPlay vs Chromecast */}
+      {Platform.OS === 'ios' && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Casting</Text>
+
+          <View style={styles.card}>
+            <TouchableOpacity
+              style={[styles.row, styles.castOption, uiPrefs.castMode === 'airplay' && styles.castOptionSelected]}
+              onPress={() => setCastMode('airplay')}>
+              <View style={styles.rowLeft}>
+                <Text style={styles.rowTitle}>AirPlay</Text>
+                <Text style={styles.rowSubtitle}>Pour Apple TV et autres appareils AirPlay</Text>
+              </View>
+              {uiPrefs.castMode === 'airplay' && (
+                <View style={styles.castCheckmark}><Text style={styles.castCheckmarkText}>✓</Text></View>
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.divider} />
+
+            <TouchableOpacity
+              style={[styles.row, styles.castOption, uiPrefs.castMode === 'chromecast' && styles.castOptionSelected]}
+              onPress={() => setCastMode('chromecast')}>
+              <View style={styles.rowLeft}>
+                <Text style={styles.rowTitle}>Chromecast</Text>
+                <Text style={styles.rowSubtitle}>Pour Chromecast et Google TV</Text>
+              </View>
+              {uiPrefs.castMode === 'chromecast' && (
+                <View style={styles.castCheckmark}><Text style={styles.castCheckmarkText}>✓</Text></View>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          <Text style={styles.hint}>
+            AirPlay utilise le bouton natif du lecteur vidéo. Chromecast utilise
+            le bouton Cast intégré à Movix (nécessite Google Cast).
+          </Text>
+        </View>
+      )}
 
       {/* Affichage Section */}
       <View style={styles.section}>
@@ -465,5 +505,24 @@ const styles = StyleSheet.create({
     fontWeight: '300',
     marginLeft: 8,
     marginTop: -4,
+  },
+  castOption: {
+    paddingVertical: 4,
+  },
+  castOptionSelected: {
+    // La mise en évidence est portée par le checkmark, pas par un fond.
+  },
+  castCheckmark: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#8b5cf6',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  castCheckmarkText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });

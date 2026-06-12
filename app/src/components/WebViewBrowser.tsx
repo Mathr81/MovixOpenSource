@@ -12,8 +12,8 @@ import type {
   WebViewMessageEvent,
   ShouldStartLoadRequest,
 } from 'react-native-webview/lib/WebViewTypes';
-import { handleBridgeMessage } from '../services/bridge';
-import { buildInjectedJavaScript } from '../injection/inject';
+import { handleBridgeMessage, type BridgeMessageOptions } from '../services/bridge';
+import { buildInjectedJavaScript, type InjectOptions } from '../injection/inject';
 import { CONFIG } from '../config';
 
 export interface WebViewBrowserRef {
@@ -27,17 +27,19 @@ export interface WebViewBrowserRef {
 interface WebViewBrowserProps {
   url: string;
   proxyEnabled?: boolean;
+  castMode?: InjectOptions['castMode'];
   onNavigationStateChange?: (state: WebViewNavigation) => void;
   onError?: (error: string) => void;
   onLoadEnd?: () => void;
+  onMediaPlayback?: (playing: boolean) => void;
 }
 
 const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
-  ({ url, proxyEnabled = true, onNavigationStateChange, onError, onLoadEnd }, ref) => {
+  ({ url, proxyEnabled = true, castMode, onNavigationStateChange, onError, onLoadEnd, onMediaPlayback }, ref) => {
     const webViewRef = useRef<WebView>(null);
     const injectedJS = useMemo(
-      () => buildInjectedJavaScript({ proxyEnabled }),
-      [proxyEnabled],
+      () => buildInjectedJavaScript({ proxyEnabled, castMode }),
+      [proxyEnabled, castMode],
     );
 
     useImperativeHandle(ref, () => ({
@@ -54,9 +56,17 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       },
     }));
 
-    const onMessage = useCallback((event: WebViewMessageEvent) => {
-      handleBridgeMessage(event.nativeEvent.data, webViewRef);
-    }, []);
+    const bridgeOptions = useMemo<BridgeMessageOptions>(
+      () => ({ onMediaPlayback }),
+      [onMediaPlayback],
+    );
+
+    const onMessage = useCallback(
+      (event: WebViewMessageEvent) => {
+        handleBridgeMessage(event.nativeEvent.data, webViewRef, bridgeOptions);
+      },
+      [bridgeOptions],
+    );
 
     const onHttpError = useCallback(
       (event: any) => {
@@ -136,7 +146,9 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         cacheEnabled={true}
         // Désactive le zoom pour un rendu app-like
         scalesPageToFit={true}
-        // Android
+        // Android — bloque les fenêtres popup (window.open())
+        setSupportMultipleWindows={false}
+        onOpenWindow={() => {}}
         overScrollMode="never"
         thirdPartyCookiesEnabled={true}
         // iOS

@@ -36,13 +36,29 @@ class MainActivity : ReactActivity() {
         }
     }
 
-    private fun enterPipSafely() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    /** Met à jour les params PiP en temps réel (API 31+). setAutoEnterEnabled(true) permet
+     *  au système de basculer automatiquement en PiP dans tous les scénarios de background
+     *  (bouton Home, swipe, écran éteint, bouton Power) sans passer par onUserLeaveHint. */
+    fun updatePipParams(playing: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         try {
             val params = PictureInPictureParams.Builder()
                 .setAspectRatio(Rational(16, 9))
+                .setAutoEnterEnabled(playing)
                 .build()
-            enterPictureInPictureMode(params)
+            setPictureInPictureParams(params)
+        } catch (_: Throwable) {}
+    }
+
+    private fun enterPipSafely() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        try {
+            val builder = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(16, 9))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                builder.setAutoEnterEnabled(isVideoPlaying)
+            }
+            enterPictureInPictureMode(builder.build())
         } catch (_: Throwable) {
             // PiP indisponible (désactivé par l'utilisateur, OEM, etc.) — on
             // laisse simplement l'app passer en arrière-plan normalement.

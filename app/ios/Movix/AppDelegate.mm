@@ -2,6 +2,11 @@
 #import <React/RCTBundleURLProvider.h>
 #import <AVFoundation/AVFoundation.h>
 
+#if __has_include(<GoogleCast/GoogleCast.h>)
+#import <GoogleCast/GoogleCast.h>
+#define MOVIX_CAST_AVAILABLE 1
+#endif
+
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
@@ -18,6 +23,16 @@
                     options:0
                       error:nil];
   [audioSession setActive:YES error:nil];
+
+#ifdef MOVIX_CAST_AVAILABLE
+  // Initialise le contexte Google Cast. L'App ID DEFAULT_MEDIA_RECEIVER_APP_ID
+  // pointe vers le récepteur générique (pas de compte Cast Console requis).
+  GCKDiscoveryCriteria *criteria = [[GCKDiscoveryCriteria alloc]
+      initWithApplicationID:kGCKDefaultMediaReceiverApplicationID];
+  GCKCastOptions *castOptions = [[GCKCastOptions alloc] initWithDiscoveryCriteria:criteria];
+  castOptions.physicalVolumeButtonsWillControlDeviceVolume = YES;
+  [GCKCastContext setSharedInstanceWith:castOptions];
+#endif
 
   return [super application:application didFinishLaunchingWithOptions:launchOptions];
 }

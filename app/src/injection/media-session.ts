@@ -144,6 +144,23 @@ export function buildMediaSession(): string {
     });
   }
 
+  // --- Wake Lock (garde l'écran allumé pendant la lecture) ---
+  var _wakeLock = null;
+  function acquireWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    if (_wakeLock) return;
+    try {
+      navigator.wakeLock.request('screen').then(function(lock) {
+        _wakeLock = lock;
+      }).catch(function() {});
+    } catch (e) {}
+  }
+  function releaseWakeLock() {
+    if (!_wakeLock) return;
+    try { _wakeLock.release(); } catch (e) {}
+    _wakeLock = null;
+  }
+
   var _posTimer = null;
   function startPositionTimer() {
     stopPositionTimer();
@@ -157,9 +174,9 @@ export function buildMediaSession(): string {
 
   function onVideoPlay(video) {
     activeVideo = video;
+    window.__movixActiveVideo = video;
 
-    // Auto-PiP iOS + autorise le PiP (utile aussi pour Safari/iPad).
-    try { video.autoPictureInPicture = true; } catch (e) {}
+    // Autorise le PiP (utile aussi pour Safari/iPad).
     try { video.disablePictureInPicture = false; } catch (e) {}
     try { video.setAttribute('x-webkit-airplay', 'allow'); } catch (e) {}
 
@@ -167,6 +184,7 @@ export function buildMediaSession(): string {
     updatePositionState(video);
     try { ms.playbackState = 'playing'; } catch (e) {}
     startPositionTimer();
+    acquireWakeLock();
     postNative({ type: 'MEDIA_PLAYBACK', playing: true });
   }
 
@@ -174,6 +192,8 @@ export function buildMediaSession(): string {
     if (video !== activeVideo) return;
     try { ms.playbackState = 'paused'; } catch (e) {}
     updatePositionState(video);
+    stopPositionTimer();
+    releaseWakeLock();
     postNative({ type: 'MEDIA_PLAYBACK', playing: false });
   }
 
@@ -199,34 +219,17 @@ export function buildMediaSession(): string {
 
   installHandlers();
 
-  // --- Auto-PiP quand l'app passe en arrière-plan ---
-  // autoPictureInPicture ne fonctionne pas avec MSE (HLS.js) sur WKWebView.
-  // iOS 16+/iPadOS 16+ exempte requestPictureInPicture() de la user-gesture
-  // requirement lorsqu'il est appelé depuis l'event 'visibilitychange' au moment
-  // où le document devient caché (app mise en arrière-plan / bouton Home).
-  // requestPictureInPicture() fonctionne bien avec MSE — c'est d'ailleurs l'API
-  // que le lecteur Movix utilise pour son bouton PiP manuel.
+  // Gestion visibilité : arrêt/reprise du timer de position + wake lock.
+  // Le PiP auto est géré depuis le côté natif (AppState inactive sur iOS).
   document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) return;
-    if (!activeVideo || activeVideo.paused) return;
-    if (document.pictureInPictureElement) return; // déjà en PiP
-
-    // API standard (iOS 16+, iPadOS 16+, Chrome Android)
-    if (typeof document.pictureInPictureEnabled !== 'undefined' &&
-        document.pictureInPictureEnabled &&
-        typeof activeVideo.requestPictureInPicture === 'function') {
-      activeVideo.requestPictureInPicture().catch(function() {
-        // Fallback WebKit si la promesse est rejetée (iOS < 16)
-        if (typeof activeVideo.webkitSetPresentationMode === 'function') {
-          try { activeVideo.webkitSetPresentationMode('picture-in-picture'); } catch (e2) {}
-        }
-      });
-      return;
-    }
-
-    // Fallback direct pour iOS/iPadOS < 16
-    if (typeof activeVideo.webkitSetPresentationMode === 'function') {
-      try { activeVideo.webkitSetPresentationMode('picture-in-picture'); } catch (e) {}
+    if (document.hidden) {
+      stopPositionTimer();
+      releaseWakeLock();
+    } else {
+      if (activeVideo && !activeVideo.paused) {
+        startPositionTimer();
+        acquireWakeLock();
+      }
     }
   });
 })();

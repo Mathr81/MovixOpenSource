@@ -24,6 +24,10 @@ interface InjectableRef {
   injectJavaScript: (script: string) => void;
 }
 
+export interface BridgeMessageOptions {
+  onMediaPlayback?: (playing: boolean) => void;
+}
+
 type CastShimRequest =
   | { type: 'CASTSHIM_INIT'; id: string }
   | { type: 'CASTSHIM_LOAD_MEDIA'; id: string; url: string; title: string; poster: string; currentTime: number }
@@ -360,6 +364,7 @@ function sendToWebView(
 export async function handleBridgeMessage(
   data: string,
   webViewRef: RefObject<WebView | null>,
+  options?: BridgeMessageOptions,
 ) {
   let parsed: unknown;
   try {
@@ -382,11 +387,11 @@ export async function handleBridgeMessage(
       pushLog(level, 'web', args);
       return;
     }
-    // État de lecture (Media Session) — pilote le PiP Android via onUserLeaveHint.
-    // Sur iOS l'auto-PiP est géré nativement par WebKit (no-op ici).
+    // État de lecture (Media Session) — pilote le PiP Android + callback cross-platform.
     if (p.type === 'MEDIA_PLAYBACK') {
+      const playing = p.playing === true;
+      options?.onMediaPlayback?.(playing);
       if (Platform.OS === 'android') {
-        const playing = p.playing === true;
         const pip = NativeModules.PipModule as
           | { setVideoPlaying?: (b: boolean) => void }
           | undefined;
