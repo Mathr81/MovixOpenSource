@@ -31,7 +31,7 @@
       initWithApplicationID:kGCKDefaultMediaReceiverApplicationID];
   GCKCastOptions *castOptions = [[GCKCastOptions alloc] initWithDiscoveryCriteria:criteria];
   castOptions.physicalVolumeButtonsWillControlDeviceVolume = YES;
-  [GCKCastContext setSharedInstanceWith:castOptions];
+  [GCKCastContext setSharedInstanceWithOptions:castOptions];
 #endif
 
   return [super application:application didFinishLaunchingWithOptions:launchOptions];

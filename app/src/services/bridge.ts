@@ -387,6 +387,21 @@ export async function handleBridgeMessage(
       pushLog(level, 'web', args);
       return;
     }
+    // Demande PiP manuelle depuis le lecteur web (bouton PiP) — Android only.
+    // Le WebView Android n'a pas l'API Web PiP ; on bascule l'Activity en PiP.
+    if (p.type === 'ENTER_PIP') {
+      if (Platform.OS === 'android') {
+        const pip = NativeModules.PipModule as
+          | { enterPipNow?: () => void }
+          | undefined;
+        try {
+          pip?.enterPipNow?.();
+        } catch {
+          // Module absent (vieux build) — ignore silencieusement.
+        }
+      }
+      return;
+    }
     // État de lecture (Media Session) — pilote le PiP Android + callback cross-platform.
     if (p.type === 'MEDIA_PLAYBACK') {
       const playing = p.playing === true;

@@ -50,6 +50,11 @@ class MainActivity : ReactActivity() {
         } catch (_: Throwable) {}
     }
 
+    /** Entrée PiP déclenchée explicitement par le bouton PiP du lecteur web. */
+    fun enterPipNow() {
+        enterPipSafely()
+    }
+
     private fun enterPipSafely() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         try {

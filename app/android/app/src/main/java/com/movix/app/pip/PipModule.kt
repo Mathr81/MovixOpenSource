@@ -28,6 +28,18 @@ class PipModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * Bascule immédiatement l'Activity en Picture-in-Picture. Appelé quand
+     * l'utilisateur clique sur le bouton PiP du lecteur web (le WebView Android
+     * n'ayant pas l'API Web PiP, on shimme l'appel jusqu'ici).
+     */
+    @ReactMethod
+    fun enterPipNow() {
+        currentActivity?.runOnUiThread {
+            (currentActivity as? MainActivity)?.enterPipNow()
+        }
+    }
+
     // Requis par l'interface NativeModule côté event-emitter ; no-op ici.
     @ReactMethod
     fun addListener(eventName: String) {

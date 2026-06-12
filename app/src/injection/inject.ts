@@ -1,4 +1,5 @@
 import { Platform } from 'react-native';
+import { buildAndroidPipShim } from './android-pip-shim';
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
 import { buildMediaSession } from './media-session';
@@ -39,11 +40,17 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const injectCastShim = Platform.OS !== 'ios' || castMode === 'chromecast';
   const castShimBlock = injectCastShim ? buildCastShim() : '// Cast shim omis (AirPlay mode)';
 
+  // Android : shim PiP (le WebView système n'a pas l'API Web PiP).
+  const androidPipShim =
+    Platform.OS === 'android' ? buildAndroidPipShim() : '// PiP shim natif iOS (WebKit)';
+
   // Cast shim FIRST — must be on window before any page JS runs.
   // Media Session : toujours injecté (jaquette notif + contrôles écran
   // verrouillé + auto-PiP), indépendant du proxy.
   return `
 ${castShimBlock}
+
+${androidPipShim}
 
 ${bridge}
 
