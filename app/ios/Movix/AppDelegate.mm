@@ -54,16 +54,23 @@
 - (void)applicationWillResignActive:(UIApplication *)application {
   [super applicationWillResignActive:application];
 
+  // isViewLoaded avoids forcing viewDidLoad on an uninitialised VC.
+  // This guards against the Cast SDK triggering a local-network permission
+  // dialog at startup before React Native has finished setting up.
+  if (!self.window.rootViewController.isViewLoaded) return;
   UIView *root = self.window.rootViewController.view;
   WKWebView *webView = [self findWKWebViewIn:root];
   if (!webView) return;
+
+  // Only inject if a page is already loaded (avoids calling into an
+  // uninitialised WKWebView during startup permission dialogs).
+  if (webView.URL == nil) return;
 
   NSString *script = @"(function(){"
     "try{"
     "var v=window.__movixActiveVideo;"
     "if(!v||v.paused)return;"
     "if(document.pictureInPictureElement)return;"
-    // webkitSetPresentationMode is synchronous — no async Promise gap.
     "if(typeof v.webkitSetPresentationMode==='function'){"
     "v.webkitSetPresentationMode('picture-in-picture');"
     "}else if(document.pictureInPictureEnabled&&typeof v.requestPictureInPicture==='function'){"
@@ -72,14 +79,22 @@
     "}catch(e){}"
     "})();true;";
 
-  [webView evaluateJavaScript:script completionHandler:nil];
+  [webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {}];
 }
 
 // Toggling userInteractionEnabled resets WKWebView gesture recognizers that
 // get stuck after notification center is dragged over the app during playback.
+// Skip on initial launch — only run on true background resumes.
+static BOOL _gestureResetSkipFirstActivation = YES;
 - (void)applicationDidBecomeActive:(UIApplication *)application {
   [super applicationDidBecomeActive:application];
 
+  if (_gestureResetSkipFirstActivation) {
+    _gestureResetSkipFirstActivation = NO;
+    return;
+  }
+
+  if (!self.window.rootViewController.isViewLoaded) return;
   UIView *root = self.window.rootViewController.view;
   if (!root) return;
   root.userInteractionEnabled = NO;
