@@ -72,6 +72,11 @@ class CastModule: RCTEventEmitter {
     // Cast est disponible dès que le SDK est lié (le picker affichera
     // « aucun appareil » s'il n'y a pas de Chromecast à proximité). Identique
     // au comportement Android qui renvoie true si Play Services est présent.
+    // isSupported() est appelé par le shim au chargement de la page (mode
+    // Chromecast uniquement) : c'est le bon moment pour lancer le scan réseau,
+    // ce qui déclenche la popup iOS « Réseau local » et pré-remplit la liste
+    // d'appareils avant même que l'utilisateur n'ouvre le picker.
+    DispatchQueue.main.async { self.startDiscoveryIfNeeded() }
     resolve(true)
 #else
     resolve(false)
@@ -85,6 +90,7 @@ class CastModule: RCTEventEmitter {
   ) {
 #if canImport(GoogleCast)
     DispatchQueue.main.async {
+      self.startDiscoveryIfNeeded()
       GCKCastContext.sharedInstance().presentCastDialog()
       resolve(true)
     }
@@ -109,6 +115,7 @@ class CastModule: RCTEventEmitter {
       return
     }
     DispatchQueue.main.async {
+      self.startDiscoveryIfNeeded()
       let manager = GCKCastContext.sharedInstance().sessionManager
       if let session = manager.currentCastSession, session.connectionState == .connected {
         self.playMedia(on: session, url: url, title: title, poster: poster, position: currentTimeSec)
@@ -191,6 +198,26 @@ class CastModule: RCTEventEmitter {
   }
 
 #if canImport(GoogleCast)
+  /// Démarre le scan réseau Bonjour si nécessaire.
+  ///
+  /// Le SDK Google Cast ne lance la découverte automatiquement que lorsqu'un
+  /// `GCKUICastButton` est affiché pour la première fois. Or Movix présente le
+  /// picker programmatiquement (`presentCastDialog`) sans jamais instancier de
+  /// cast button : la découverte ne démarrait donc JAMAIS, aucun scan réseau
+  /// n'avait lieu, et iOS n'affichait jamais la popup « Réseau local » (l'app
+  /// n'apparaissait même pas dans Réglages → Réseau local).
+  ///
+  /// Démarrer la découverte manuellement déclenche le scan Bonjour, ce qui fait
+  /// apparaître la popup de permission iOS et permet de trouver les Chromecast.
+  /// Idempotent : ne relance pas si déjà en cours.
+  private func startDiscoveryIfNeeded() {
+    let dm = GCKCastContext.sharedInstance().discoveryManager
+    dm.passiveScan = false
+    if dm.discoveryState != .running {
+      dm.startDiscovery()
+    }
+  }
+
   private func playMedia(
     on session: GCKCastSession,
     url: String,
