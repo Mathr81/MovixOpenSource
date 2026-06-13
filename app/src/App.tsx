@@ -12,8 +12,12 @@ import UpdateScreen from './screens/UpdateScreen';
 import UpdateDialog from './components/UpdateDialog';
 import { useAppUpdate } from './hooks/useAppUpdate';
 import { AddressProvider, useAddress } from './context/AddressContext';
+import { installConsoleCapture } from './services/debugLog';
 
 const { DnsModule } = NativeModules;
+
+// Capture les `console.*` dès le chargement du module pour la console de debug.
+installConsoleCapture();
 
 function promptDns() {
   Alert.alert(

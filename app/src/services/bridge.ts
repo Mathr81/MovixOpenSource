@@ -7,6 +7,7 @@
  */
 
 import { type RefObject } from 'react';
+import { NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   getCurrentDeviceName,
@@ -16,10 +17,15 @@ import {
   stopCast,
   subscribeCastSessionEvents,
 } from './cast';
+import { pushLog, type LogLevel } from './debugLog';
 
 /** Minimal interface required by the shim helpers — satisfied by both WebView and WebViewBrowserRef. */
 interface InjectableRef {
   injectJavaScript: (script: string) => void;
+}
+
+export interface BridgeMessageOptions {
+  onMediaPlayback?: (playing: boolean) => void;
 }
 
 type CastShimRequest =
@@ -358,6 +364,7 @@ function sendToWebView(
 export async function handleBridgeMessage(
   data: string,
   webViewRef: RefObject<WebView | null>,
+  options?: BridgeMessageOptions,
 ) {
   let parsed: unknown;
   try {
@@ -371,6 +378,44 @@ export async function handleBridgeMessage(
     const p = parsed as Record<string, unknown>;
     if (typeof p.type === 'string' && p.type.startsWith('CASTSHIM_')) {
       await handleCastShimMessage(parsed as CastShimRequest, webViewRef);
+      return;
+    }
+    // Logs du WebView relayés vers la console de debug.
+    if (p.type === 'CONSOLE_LOG') {
+      const level = (p.level as LogLevel) || 'log';
+      const args = Array.isArray(p.args) ? (p.args as unknown[]) : [];
+      pushLog(level, 'web', args);
+      return;
+    }
+    // Demande PiP manuelle depuis le lecteur web (bouton PiP) — Android only.
+    // Le WebView Android n'a pas l'API Web PiP ; on bascule l'Activity en PiP.
+    if (p.type === 'ENTER_PIP') {
+      if (Platform.OS === 'android') {
+        const pip = NativeModules.PipModule as
+          | { enterPipNow?: () => void }
+          | undefined;
+        try {
+          pip?.enterPipNow?.();
+        } catch {
+          // Module absent (vieux build) — ignore silencieusement.
+        }
+      }
+      return;
+    }
+    // État de lecture (Media Session) — pilote le PiP Android + callback cross-platform.
+    if (p.type === 'MEDIA_PLAYBACK') {
+      const playing = p.playing === true;
+      options?.onMediaPlayback?.(playing);
+      if (Platform.OS === 'android') {
+        const pip = NativeModules.PipModule as
+          | { setVideoPlaying?: (b: boolean) => void }
+          | undefined;
+        try {
+          pip?.setVideoPlaying?.(playing);
+        } catch {
+          // Module absent (vieux build) — ignore silencieusement.
+        }
+      }
       return;
     }
   }

@@ -2,6 +2,7 @@ import React, {
   forwardRef,
   useCallback,
   useImperativeHandle,
+  useMemo,
   useRef,
 } from 'react';
 import { Linking, Platform } from 'react-native';
@@ -11,8 +12,8 @@ import type {
   WebViewMessageEvent,
   ShouldStartLoadRequest,
 } from 'react-native-webview/lib/WebViewTypes';
-import { handleBridgeMessage } from '../services/bridge';
-import { buildInjectedJavaScript } from '../injection/inject';
+import { handleBridgeMessage, type BridgeMessageOptions } from '../services/bridge';
+import { buildInjectedJavaScript, type InjectOptions } from '../injection/inject';
 import { CONFIG } from '../config';
 
 export interface WebViewBrowserRef {
@@ -25,16 +26,21 @@ export interface WebViewBrowserRef {
 
 interface WebViewBrowserProps {
   url: string;
+  proxyEnabled?: boolean;
+  castMode?: InjectOptions['castMode'];
   onNavigationStateChange?: (state: WebViewNavigation) => void;
   onError?: (error: string) => void;
   onLoadEnd?: () => void;
+  onMediaPlayback?: (playing: boolean) => void;
 }
 
-const injectedJS = buildInjectedJavaScript();
-
 const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
-  ({ url, onNavigationStateChange, onError, onLoadEnd }, ref) => {
+  ({ url, proxyEnabled = true, castMode, onNavigationStateChange, onError, onLoadEnd, onMediaPlayback }, ref) => {
     const webViewRef = useRef<WebView>(null);
+    const injectedJS = useMemo(
+      () => buildInjectedJavaScript({ proxyEnabled, castMode }),
+      [proxyEnabled, castMode],
+    );
 
     useImperativeHandle(ref, () => ({
       goBack: () => webViewRef.current?.goBack(),
@@ -50,9 +56,17 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       },
     }));
 
-    const onMessage = useCallback((event: WebViewMessageEvent) => {
-      handleBridgeMessage(event.nativeEvent.data, webViewRef);
-    }, []);
+    const bridgeOptions = useMemo<BridgeMessageOptions>(
+      () => ({ onMediaPlayback }),
+      [onMediaPlayback],
+    );
+
+    const onMessage = useCallback(
+      (event: WebViewMessageEvent) => {
+        handleBridgeMessage(event.nativeEvent.data, webViewRef, bridgeOptions);
+      },
+      [bridgeOptions],
+    );
 
     const onHttpError = useCallback(
       (event: any) => {
@@ -119,6 +133,11 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         mediaPlaybackRequiresUserAction={false}
         allowsInlineMediaPlayback={true}
         allowsFullscreenVideo={true}
+        // Picture-in-Picture : permet de garder la vidéo flottante quand on
+        // quitte l'app (iOS auto-PiP via video.autoPictureInPicture).
+        allowsPictureInPictureMediaPlayback={true}
+        // AirPlay natif depuis le lecteur web.
+        allowsAirPlayForMediaPlayback={true}
         allowsBackForwardNavigationGestures={true}
         // Sécurité
         originWhitelist={['https://*', 'http://*', 'about:*', 'blob:*']}
@@ -127,7 +146,9 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         cacheEnabled={true}
         // Désactive le zoom pour un rendu app-like
         scalesPageToFit={true}
-        // Android
+        // Android — bloque les fenêtres popup (window.open())
+        setSupportMultipleWindows={false}
+        onOpenWindow={() => {}}
         overScrollMode="never"
         thirdPartyCookiesEnabled={true}
         // iOS

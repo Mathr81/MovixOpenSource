@@ -5,10 +5,12 @@ import {
   StyleSheet,
   BackHandler,
   Platform,
+  StatusBar,
   Modal,
   TouchableOpacity,
   Image,
   Animated,
+  DeviceEventEmitter,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -26,6 +28,8 @@ import SettingsScreen from './SettingsScreen';
 export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [isAndroidPip, setIsAndroidPip] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -79,6 +83,58 @@ export default function BrowserScreen() {
     return unsub;
   }, []);
 
+  // Android : pilotage de la fenêtre Picture-in-Picture.
+  //  - PIP_MODE_CHANGED : masque la barre de paramètres (MiniPill/toolbar) tant
+  //    que la fenêtre flottante est affichée.
+  //  - PIP_CONTROL : relaie les appuis sur les boutons play/pause de la fenêtre
+  //    PiP vers l'élément <video> du lecteur web.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+
+    const modeSub = DeviceEventEmitter.addListener(
+      'PIP_MODE_CHANGED',
+      (e: { inPip?: boolean }) => setIsAndroidPip(!!e?.inPip),
+    );
+    const controlSub = DeviceEventEmitter.addListener(
+      'PIP_CONTROL',
+      (e: { control?: string }) => {
+        if (e?.control === 'play') {
+          webViewRef.current?.injectJavaScript(
+            'try{window.__movixActiveVideo&&window.__movixActiveVideo.play();}catch(e){} true;',
+          );
+        } else if (e?.control === 'pause') {
+          webViewRef.current?.injectJavaScript(
+            'try{window.__movixActiveVideo&&window.__movixActiveVideo.pause();}catch(e){} true;',
+          );
+        }
+      },
+    );
+
+    return () => {
+      modeSub.remove();
+      controlSub.remove();
+    };
+  }, []);
+
+  const onMediaPlayback = useCallback((playing: boolean) => {
+    setIsVideoPlaying(playing);
+  }, []);
+
+  // iOS : barre de statut et toolbar masquées pendant la lecture vidéo.
+  // UIViewControllerBasedStatusBarAppearance = false → StatusBar.setHidden
+  // est global et fonctionne même en mode plein-écran WebView.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+    StatusBar.setHidden(isVideoPlaying && !settingsVisible, 'slide');
+  }, [isVideoPlaying, settingsVisible]);
+
+  // Restaure la barre de statut en quittant l'écran.
+  useEffect(() => {
+    return () => {
+      if (Platform.OS === 'ios') StatusBar.setHidden(false, 'none');
+    };
+  }, []);
+
   const onNavigationStateChange = useCallback((state: WebViewNavigation) => {
     setCanGoBack(state.canGoBack);
     setCanGoForward(state.canGoForward);
@@ -125,17 +181,27 @@ export default function BrowserScreen() {
   const showWebView = !isLoading && !!config && !allMirrorsFailed;
   const showSplash = (!webViewReady || isLoading || !config) && !allMirrorsFailed;
 
+  // Mode immersif : pas de toolbar, pas de paddingTop (vidéo bord à bord).
+  // iOS : pendant la lecture vidéo. Android : pendant le Picture-in-Picture
+  // (la fenêtre flottante ne doit afficher que la WebView, sans la barre de
+  // paramètres ni le padding de status bar).
+  const immersive =
+    (Platform.OS === 'ios' && isVideoPlaying && !settingsVisible) || isAndroidPip;
+
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <View style={[styles.container, { paddingTop: immersive ? 0 : insets.top }]}>
       {showWebView && (
         <View style={styles.webViewContainer}>
           <WebViewBrowser
-            key={activeUrl}
+            key={`${activeUrl}:${uiPrefs.proxyEnabled ? 'proxy' : 'direct'}:${uiPrefs.castMode}`}
             ref={webViewRef}
             url={activeUrl}
+            proxyEnabled={uiPrefs.proxyEnabled}
+            castMode={uiPrefs.castMode}
             onNavigationStateChange={onNavigationStateChange}
             onError={onWebViewError}
             onLoadEnd={onWebViewLoadEnd}
+            onMediaPlayback={onMediaPlayback}
           />
         </View>
       )}
@@ -144,7 +210,7 @@ export default function BrowserScreen() {
         <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
       )}
 
-      {!toolbarHidden && showWebView && (
+      {!toolbarHidden && showWebView && !immersive && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -181,7 +247,7 @@ export default function BrowserScreen() {
         </Modal>
       )}
 
-      {navBarHidden && showWebView && (
+      {navBarHidden && showWebView && !immersive && (
         <MiniPill onPress={() => setSettingsVisible(true)} />
       )}
 
