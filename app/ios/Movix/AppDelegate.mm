@@ -52,7 +52,12 @@
 // webkitSetPresentationMode('picture-in-picture') synchronously for MSE/HLS.js.
 // This fires earlier and more reliably than AppState 'inactive' via the RN bridge.
 - (void)applicationWillResignActive:(UIApplication *)application {
-  [super applicationWillResignActive:application];
+  // RCTAppDelegate (UIResponder) n'implémente PAS applicationWillResignActive:.
+  // Appeler [super ...] aveuglément envoie un sélecteur non reconnu → crash.
+  // On ne relaie au super que s'il répond réellement au sélecteur.
+  if ([[self superclass] instancesRespondToSelector:_cmd]) {
+    [super applicationWillResignActive:application];
+  }
 
   // isViewLoaded avoids forcing viewDidLoad on an uninitialised VC.
   // This guards against the Cast SDK triggering a local-network permission
@@ -87,7 +92,13 @@
 // Skip on initial launch — only run on true background resumes.
 static BOOL _gestureResetSkipFirstActivation = YES;
 - (void)applicationDidBecomeActive:(UIApplication *)application {
-  [super applicationDidBecomeActive:application];
+  // RCTAppDelegate (UIResponder) n'implémente PAS applicationDidBecomeActive:.
+  // Cette méthode est appelée à CHAQUE lancement : un [super ...] aveugle
+  // crashait l'app au démarrage (unrecognized selector). On garde l'appel
+  // conditionnel pour rester compatible si une future version de RN l'ajoute.
+  if ([[self superclass] instancesRespondToSelector:_cmd]) {
+    [super applicationDidBecomeActive:application];
+  }
 
   if (_gestureResetSkipFirstActivation) {
     _gestureResetSkipFirstActivation = NO;
