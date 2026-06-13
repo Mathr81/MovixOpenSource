@@ -180,6 +180,15 @@ export function buildMediaSession(): string {
     try { video.disablePictureInPicture = false; } catch (e) {}
     try { video.setAttribute('x-webkit-airplay', 'allow'); } catch (e) {}
 
+    // PiP automatique iOS : quand l'app passe en arrière-plan, WebKit bascule
+    // la vidéo en Picture-in-Picture tout seul, par le MÊME chemin que le bouton
+    // PiP du lecteur (qui fonctionne déjà). Contrairement à une injection
+    // webkitSetPresentationMode au moment du background (qui échoue faute de
+    // user-gesture et bloque le tactile), cet attribut est géré nativement par
+    // WebKit et ne corrompt pas l'état de présentation.
+    try { video.autoPictureInPicture = true; } catch (e) {}
+    try { video.setAttribute('autopictureinpicture', ''); } catch (e) {}
+
     updateMetadata(video);
     updatePositionState(video);
     try { ms.playbackState = 'playing'; } catch (e) {}

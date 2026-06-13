@@ -3,7 +3,6 @@ import {
   View,
   Text,
   StyleSheet,
-  AppState,
   BackHandler,
   Platform,
   StatusBar,
@@ -28,7 +27,6 @@ import SettingsScreen from './SettingsScreen';
 export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
-  const isVideoPlayingRef = useRef(false);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
@@ -84,7 +82,6 @@ export default function BrowserScreen() {
   }, []);
 
   const onMediaPlayback = useCallback((playing: boolean) => {
-    isVideoPlayingRef.current = playing;
     setIsVideoPlaying(playing);
   }, []);
 
@@ -101,35 +98,6 @@ export default function BrowserScreen() {
     return () => {
       if (Platform.OS === 'ios') StatusBar.setHidden(false, 'none');
     };
-  }, []);
-
-  // iOS : quand l'app passe en "inactive" (transition vers l'arrière-plan),
-  // le WKWebView est encore actif — c'est la seule fenêtre où
-  // requestPictureInPicture() peut être appelé sans gesture utilisateur.
-  useEffect(() => {
-    if (Platform.OS !== 'ios') return;
-    const sub = AppState.addEventListener('change', state => {
-      if (state !== 'inactive') return;
-      if (!isVideoPlayingRef.current) return;
-      // webkitSetPresentationMode est synchrone — appel en premier pour que
-      // le WKWebView démarre la transition PiP AVANT la suspension JS.
-      // requestPictureInPicture (async Promise) sert de fallback.
-      const pipScript = `
-(function(){
-  try {
-    var v = window.__movixActiveVideo;
-    if (!v || v.paused) return;
-    if (document.pictureInPictureElement) return;
-    if (typeof v.webkitSetPresentationMode === 'function') {
-      try { v.webkitSetPresentationMode('picture-in-picture'); } catch(e1) {}
-    } else if (document.pictureInPictureEnabled && typeof v.requestPictureInPicture === 'function') {
-      v.requestPictureInPicture().catch(function() {});
-    }
-  } catch(e) {}
-})(); true;`;
-      webViewRef.current?.injectJavaScript(pipScript);
-    });
-    return () => sub.remove();
   }, []);
 
   const onNavigationStateChange = useCallback((state: WebViewNavigation) => {

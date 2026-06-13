@@ -1,7 +1,6 @@
 #import "AppDelegate.h"
 #import <React/RCTBundleURLProvider.h>
 #import <AVFoundation/AVFoundation.h>
-#import <WebKit/WebKit.h>
 
 #if __has_include(<GoogleCast/GoogleCast.h>)
 #import <GoogleCast/GoogleCast.h>
@@ -38,81 +37,12 @@
   return [super application:application didFinishLaunchingWithOptions:launchOptions];
 }
 
-// Traverse the view hierarchy to locate the WKWebView instance.
-- (WKWebView *)findWKWebViewIn:(UIView *)view {
-  if ([view isKindOfClass:[WKWebView class]]) return (WKWebView *)view;
-  for (UIView *sub in view.subviews) {
-    WKWebView *found = [self findWKWebViewIn:sub];
-    if (found) return found;
-  }
-  return nil;
-}
-
-// Called BEFORE JS context is suspended — the only reliable window to call
-// webkitSetPresentationMode('picture-in-picture') synchronously for MSE/HLS.js.
-// This fires earlier and more reliably than AppState 'inactive' via the RN bridge.
-- (void)applicationWillResignActive:(UIApplication *)application {
-  // RCTAppDelegate (UIResponder) n'implémente PAS applicationWillResignActive:.
-  // Appeler [super ...] aveuglément envoie un sélecteur non reconnu → crash.
-  // On ne relaie au super que s'il répond réellement au sélecteur.
-  if ([[self superclass] instancesRespondToSelector:_cmd]) {
-    [super applicationWillResignActive:application];
-  }
-
-  // isViewLoaded avoids forcing viewDidLoad on an uninitialised VC.
-  // This guards against the Cast SDK triggering a local-network permission
-  // dialog at startup before React Native has finished setting up.
-  if (!self.window.rootViewController.isViewLoaded) return;
-  UIView *root = self.window.rootViewController.view;
-  WKWebView *webView = [self findWKWebViewIn:root];
-  if (!webView) return;
-
-  // Only inject if a page is already loaded (avoids calling into an
-  // uninitialised WKWebView during startup permission dialogs).
-  if (webView.URL == nil) return;
-
-  NSString *script = @"(function(){"
-    "try{"
-    "var v=window.__movixActiveVideo;"
-    "if(!v||v.paused)return;"
-    "if(document.pictureInPictureElement)return;"
-    "if(typeof v.webkitSetPresentationMode==='function'){"
-    "v.webkitSetPresentationMode('picture-in-picture');"
-    "}else if(document.pictureInPictureEnabled&&typeof v.requestPictureInPicture==='function'){"
-    "v.requestPictureInPicture().catch(function(){});"
-    "}"
-    "}catch(e){}"
-    "})();true;";
-
-  [webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {}];
-}
-
-// Toggling userInteractionEnabled resets WKWebView gesture recognizers that
-// get stuck after notification center is dragged over the app during playback.
-// Skip on initial launch — only run on true background resumes.
-static BOOL _gestureResetSkipFirstActivation = YES;
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-  // RCTAppDelegate (UIResponder) n'implémente PAS applicationDidBecomeActive:.
-  // Cette méthode est appelée à CHAQUE lancement : un [super ...] aveugle
-  // crashait l'app au démarrage (unrecognized selector). On garde l'appel
-  // conditionnel pour rester compatible si une future version de RN l'ajoute.
-  if ([[self superclass] instancesRespondToSelector:_cmd]) {
-    [super applicationDidBecomeActive:application];
-  }
-
-  if (_gestureResetSkipFirstActivation) {
-    _gestureResetSkipFirstActivation = NO;
-    return;
-  }
-
-  if (!self.window.rootViewController.isViewLoaded) return;
-  UIView *root = self.window.rootViewController.view;
-  if (!root) return;
-  root.userInteractionEnabled = NO;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-    root.userInteractionEnabled = YES;
-  });
-}
+// Note : le Picture-in-Picture automatique est géré côté Web via l'attribut
+// video.autoPictureInPicture = true (voir media-session.ts). WebKit bascule
+// alors la vidéo en PiP tout seul au passage en arrière-plan, par le même
+// chemin que le bouton PiP du lecteur. On n'injecte donc PLUS de PiP manuel
+// depuis applicationWillResignActive: (ça échouait faute de user-gesture et
+// bloquait le tactile au retour dans l'app).
 
 - (NSURL *)sourceURLForBridge:(RCTBridge *)bridge
 {

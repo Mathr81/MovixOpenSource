@@ -55,15 +55,15 @@ export function buildAndroidPipShim(): string {
     // Route la demande PiP du lecteur vers le PiP natif de l'Activity.
     HTMLVideoElement.prototype.requestPictureInPicture = function() {
       postNative({ type: 'ENTER_PIP' });
-      // Objet minimal façon PictureInPictureWindow pour ne pas casser le lecteur
-      // s'il tente d'écouter des évènements dessus.
-      var fakeWindow = {
-        width: 0,
-        height: 0,
-        addEventListener: function() {},
-        removeEventListener: function() {},
-      };
-      return Promise.resolve(fakeWindow);
+      // IMPORTANT : on ne résout JAMAIS cette promesse.
+      // En PiP Web standard, la vidéo est détachée vers une fenêtre flottante
+      // et le lecteur affiche un overlay « lecture en PiP » à la place. Mais sur
+      // Android, le PiP est au niveau de l'Activity : c'est la WebView entière
+      // qui est capturée. Si le lecteur basculait sur son overlay, le PiP
+      // afficherait cet overlay (boutons play/pause) au lieu du film.
+      // En laissant la promesse en suspens, le lecteur garde la vidéo inline
+      // dans la WebView → le PiP de l'Activity capture bien le film.
+      return new Promise(function() {});
     };
   } catch (e) {}
 
