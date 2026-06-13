@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   Image,
   Animated,
+  DeviceEventEmitter,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -28,6 +29,7 @@ export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [isAndroidPip, setIsAndroidPip] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -79,6 +81,39 @@ export default function BrowserScreen() {
   useEffect(() => {
     const unsub = startCastShimEventForwarding(webViewRef);
     return unsub;
+  }, []);
+
+  // Android : pilotage de la fenêtre Picture-in-Picture.
+  //  - PIP_MODE_CHANGED : masque la barre de paramètres (MiniPill/toolbar) tant
+  //    que la fenêtre flottante est affichée.
+  //  - PIP_CONTROL : relaie les appuis sur les boutons play/pause de la fenêtre
+  //    PiP vers l'élément <video> du lecteur web.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+
+    const modeSub = DeviceEventEmitter.addListener(
+      'PIP_MODE_CHANGED',
+      (e: { inPip?: boolean }) => setIsAndroidPip(!!e?.inPip),
+    );
+    const controlSub = DeviceEventEmitter.addListener(
+      'PIP_CONTROL',
+      (e: { control?: string }) => {
+        if (e?.control === 'play') {
+          webViewRef.current?.injectJavaScript(
+            'try{window.__movixActiveVideo&&window.__movixActiveVideo.play();}catch(e){} true;',
+          );
+        } else if (e?.control === 'pause') {
+          webViewRef.current?.injectJavaScript(
+            'try{window.__movixActiveVideo&&window.__movixActiveVideo.pause();}catch(e){} true;',
+          );
+        }
+      },
+    );
+
+    return () => {
+      modeSub.remove();
+      controlSub.remove();
+    };
   }, []);
 
   const onMediaPlayback = useCallback((playing: boolean) => {
@@ -147,7 +182,11 @@ export default function BrowserScreen() {
   const showSplash = (!webViewReady || isLoading || !config) && !allMirrorsFailed;
 
   // Mode immersif : pas de toolbar, pas de paddingTop (vidéo bord à bord).
-  const immersive = Platform.OS === 'ios' && isVideoPlaying && !settingsVisible;
+  // iOS : pendant la lecture vidéo. Android : pendant le Picture-in-Picture
+  // (la fenêtre flottante ne doit afficher que la WebView, sans la barre de
+  // paramètres ni le padding de status bar).
+  const immersive =
+    (Platform.OS === 'ios' && isVideoPlaying && !settingsVisible) || isAndroidPip;
 
   return (
     <View style={[styles.container, { paddingTop: immersive ? 0 : insets.top }]}>

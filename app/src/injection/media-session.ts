@@ -180,12 +180,17 @@ export function buildMediaSession(): string {
     try { video.disablePictureInPicture = false; } catch (e) {}
     try { video.setAttribute('x-webkit-airplay', 'allow'); } catch (e) {}
 
-    // PiP automatique iOS : quand l'app passe en arrière-plan, WebKit bascule
-    // la vidéo en Picture-in-Picture tout seul, par le MÊME chemin que le bouton
-    // PiP du lecteur (qui fonctionne déjà). Contrairement à une injection
-    // webkitSetPresentationMode au moment du background (qui échoue faute de
-    // user-gesture et bloque le tactile), cet attribut est géré nativement par
-    // WebKit et ne corrompt pas l'état de présentation.
+    // PiP automatique iOS (best-effort) : l'attribut autoPictureInPicture
+    // demande à WebKit de basculer en PiP quand l'app passe en arrière-plan.
+    // ATTENTION (limitation WebKit documentée) : pour une vidéo HTML5 inline —
+    // a fortiori pilotée par MSE/HLS.js (blob:), comme le lecteur Movix — WebKit
+    // n'honore l'auto-PiP QUE depuis le plein écran natif (transition
+    // fullscreen → background), jamais depuis la lecture inline. Le seul moyen
+    // d'un auto-PiP inline fiable serait un AVPlayerViewController natif
+    // (canStartPictureInPictureAutomaticallyFromInline), incompatible avec le
+    // flux MSE du site. On pose donc l'attribut (cas plein écran couvert) sans
+    // injecter de webkitSetPresentationMode au background : un appel hors
+    // user-gesture échoue silencieusement et corrompt l'état tactile au retour.
     try { video.autoPictureInPicture = true; } catch (e) {}
     try { video.setAttribute('autopictureinpicture', ''); } catch (e) {}
 
