@@ -116,6 +116,7 @@ async function setupRules() {
           "movix.cloud",
           "movix.tax",
           "movix.club",
+          "movix.golf",
         ],
         resourceTypes: [
           "xmlhttprequest",

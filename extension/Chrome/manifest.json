@@ -43,7 +43,9 @@
       "*://movix.tax/*",
       "*://*.movix.tax/*",
       "*://movix.club/*",
-      "*://*.movix.club/*"
+      "*://*.movix.club/*",
+      "*://movix.golf/*",
+      "*://*.movix.golf/*"
     ]
   },
   "web_accessible_resources": [

@@ -16,6 +16,8 @@
 // @match        https://*.movix.cloud/*
 // @match        https://movix.tax/*
 // @match        https://*.movix.tax/*
+// @match        https://movix.golf/*
+// @match        https://*.movix.golf/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -2539,6 +2541,7 @@
             "movix.club",
             "movix.cloud",
             "movix.tax",
+            "movix.golf",
           ],
           resourceTypes: [
             "xmlhttprequest",
@@ -2933,7 +2936,9 @@
         currentHostname === "movix.cloud" ||
         currentHostname.endsWith(".movix.cloud") ||
         currentHostname === "movix.tax" ||
-        currentHostname.endsWith(".movix.tax")
+        currentHostname.endsWith(".movix.tax") ||
+        currentHostname === "movix.golf" ||
+        currentHostname.endsWith(".movix.golf")
       ) {
         return (currentOrigin || "https://movix.cash").replace(/\/$/, "");
       }
