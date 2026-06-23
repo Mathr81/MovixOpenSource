@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Movix Proxy Extension",
-  "version": "1.3.3",
+  "version": "1.3.7",
   "description": "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   "icons": {
     "16": "movix.png",
@@ -45,7 +45,9 @@
       "*://movix.club/*",
       "*://*.movix.club/*",
       "*://movix.golf/*",
-      "*://*.movix.golf/*"
+      "*://*.movix.golf/*",
+      "*://movix.chat/*",
+      "*://*.movix.chat/*"
     ]
   },
   "web_accessible_resources": [

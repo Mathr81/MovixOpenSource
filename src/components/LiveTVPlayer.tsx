@@ -73,9 +73,16 @@ class ProxyLoader {
     abort() { this.delegate.abort(); }
 
     load(context: any, config: any, callbacks: any) {
-        const isManifest = context.type === 'manifest';
-        const isDirectLevelReload = context.type === 'level' && ProxyLoader._forceLevelReloads;
         const url: string = context.url;
+        const isManifest = context.type === 'manifest';
+        // A child playlist already rewritten by proxiesembed uses the path form
+        // `${base}/proxy/<token>.m3u8`, distinct from the manifest/direct query form
+        // `${base}/proxy?url=...`. Such children are stable, independently reloadable
+        // URLs — never force them back to the master, otherwise a single-variant
+        // master loops forever: master → variant → forced to master → variant → ...
+        const isRewrittenChild = url.includes('/proxy/') && !url.includes('/proxy?url=');
+        const isDirectLevelReload =
+            context.type === 'level' && ProxyLoader._forceLevelReloads && !isRewrittenChild;
 
         if (isManifest || isDirectLevelReload) {
             // Keep only the top-level manifest anchored on the original proxy URL.
@@ -254,6 +261,14 @@ interface Stream {
     originalUrl?: string; // Original unproxied URL for extension use (Wiflix streams)
     referer?: string;
     userAgent?: string;
+    _fctvReferer?: string; // FCTV native (free): player Referer for the extension to inject
+    _fctvLocal?: { // FCTV native (free): resolve in-browser via the extension (IP-locked stream)
+        matchId: string | number;
+        streamId: string | number;
+        siteType: string | number;
+        sportType: string | number;
+        apiBase: string;
+    };
 }
 
 interface LiveTvSourceOption {
@@ -370,6 +385,28 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     const [sourceOptions, setSourceOptions] = useState<LiveTvSourceOption[]>([]);
     const [selectedSourceIndex, setSelectedSourceIndex] = useState<number | null>(null);
     const [currentStreamIndex, setCurrentStreamIndex] = useState(0);
+
+    // FCTV native (matches) is IP-locked: the token must be minted from the
+    // user's IP. So free users resolve each server in the browser via the
+    // extension/userscript (RESOLVE_FCTV), which also installs the Referer rule.
+    // Stubs that can't be resolved (no extension) keep an empty url and get
+    // filtered out below -> those users fall back to the embed player.
+    const resolveFctvStubs = useCallback(async (rawStreams: Stream[]): Promise<Stream[]> => {
+        if (!Array.isArray(rawStreams) || !rawStreams.some((s) => s._fctvLocal)) return rawStreams;
+        if (!isExtensionAvailable()) return rawStreams;
+        return Promise.all(rawStreams.map(async (s) => {
+            if (!s._fctvLocal) return s;
+            try {
+                const res = await fetchFromExtension<{ url?: string }>('RESOLVE_FCTV', {
+                    ...s._fctvLocal,
+                    referer: s._fctvReferer,
+                });
+                if (res?.url) return { ...s, url: res.url };
+            } catch { /* keep stub -> filtered out */ }
+            return s;
+        }));
+    }, []);
+
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [isPlaying, setIsPlaying] = useState(false);
@@ -574,21 +611,46 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
     // Initialize Cast APIs
     useEffect(() => {
-        void initializeCastApi();
+        // The Cast SDK loads async from index.html — at mount time
+        // chrome.cast.isAvailable is often still false. Initializing once and
+        // giving up left the cast button permanently dead on first visits, so
+        // hook __onGCastApiAvailable to retry when the SDK announces itself.
+        let restoreCastCallback: (() => void) | undefined;
+        if ((window as any).chrome?.cast?.isAvailable) {
+            void initializeCastApi();
+        } else {
+            const previousCallback = (window as any).__onGCastApiAvailable;
+            (window as any).__onGCastApiAvailable = (isAvailable: boolean) => {
+                if (typeof previousCallback === 'function') {
+                    previousCallback(isAvailable);
+                }
+                if (isAvailable) {
+                    void initializeCastApi();
+                }
+            };
+            restoreCastCallback = () => {
+                (window as any).__onGCastApiAvailable = previousCallback;
+            };
+        }
 
         // Initialize AirPlay
+        let airplayCleanup: (() => void) | undefined;
         if (videoRef.current && isAirPlaySupported()) {
-            const cleanup = initializeAirPlay(videoRef.current, (state) => {
+            airplayCleanup = initializeAirPlay(videoRef.current, (state) => {
                 setAirplayState(state);
             });
-            return cleanup;
         }
+
+        return () => {
+            restoreCastCallback?.();
+            airplayCleanup?.();
+        };
     }, []);
 
 
     // API Base URL
     const API_BASE = import.meta.env.VITE_MAIN_API || 'http://localhost:25565';
-    const isLiveTvChannel = channelId.startsWith('livetv_');
+    const isLiveTvChannel = channelId.startsWith('livetv_') || channelId.startsWith('daddylive_');
 
     const fetchChannelPayload = useCallback(async (requestOptions: StreamRequestOptions = {}) => {
         const isLinkzy = channelId.startsWith('linkzy');
@@ -640,7 +702,8 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             for (let attempt = 0; attempt < MAX_404_RETRIES && !loaded; attempt++) {
                 try {
                     const data = await fetchChannelPayload(requestOptions);
-                    const validStreams = (data.streams || []).filter((stream: Stream) =>
+                    const rawStreams = await resolveFctvStubs(data.streams || []);
+                    const validStreams = rawStreams.filter((stream: Stream) =>
                         stream.url && !hasNonStandardPort(stream.url)
                     );
 
@@ -765,7 +828,8 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         }
 
                         // Streams are already pre-parsed by the backend (each source is a separate stream entry)
-                        const validStreams = (data.streams || []).filter((stream: Stream) =>
+                        const rawStreams = await resolveFctvStubs(data.streams || []);
+                        const validStreams = rawStreams.filter((stream: Stream) =>
                             stream.url && !hasNonStandardPort(stream.url)
                         );
 
@@ -1676,6 +1740,14 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         const selectedStream = streams[currentStreamIndex];
         if (!selectedStream) return;
 
+        // Embed pages (iframe players) can't be loaded by the Default Media
+        // Receiver — it only plays direct media URLs. Tell the user instead
+        // of sending a text/html contentId that fails silently on the TV.
+        if (selectedStream._isEmbed) {
+            toast.error(t('watch.someSourcesIncompatible'));
+            return;
+        }
+
         // Snapshot selected server at click time so async cast dialog can't drift to another server.
         const castUrl = currentCastUrlRef.current || selectedStream.url;
         const castTitle = selectedStream.title
@@ -1684,23 +1756,54 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
         try {
             const session = await requestCastSession();
+
+            // Live channels must be declared streamType LIVE — BUFFERED makes
+            // receivers treat the stream as seekable VOD, which breaks or stalls
+            // playback on several Chromecast generations. castUrl already reflects
+            // the URL the player is using for the current server.
             const mediaInfo = prepareCastMediaInfo(
                 castUrl,
                 castTitle,
                 channelPoster,
-                0
+                0,
+                'LIVE'
             );
             await loadMediaOnCast(session, mediaInfo);
+
             setIsCasting(true);
         } catch (err) {
             console.error('Cast error:', err);
+            // "cancel" = user closed the device picker — not an error worth surfacing.
+            const code = (err as any)?.code;
+            if (code !== 'cancel') {
+                toast.error(t('watch.castError'));
+            }
         }
     };
 
     const handleAirPlay = async () => {
-        if (!videoRef.current) return;
+        const video = videoRef.current;
+        if (!video) return;
         try {
-            await requestAirPlay(videoRef.current);
+            // Picker first, synchronously inside the user gesture (transient
+            // activation) — same ordering fix as HLSPlayer.startAirPlay.
+            await requestAirPlay(video);
+
+            // When playback runs through hls.js (MSE), the AirPlay target only
+            // sees a blob: URL and renders nothing. Swap to Safari-native HLS
+            // (same URL the engine was reading, proxied or not) so the device
+            // streams the real manifest. mpegts/dash engines have no native
+            // equivalent — leave them as-is, the system picker still offers
+            // screen mirroring as a fallback.
+            const nativeUrl = currentCastUrlRef.current;
+            if (hlsRef.current && nativeUrl && isAirPlaySupported()) {
+                console.log('[AirPlay] Swapping hls.js (MSE) to native HLS for AirPlay:', nativeUrl);
+                hlsRef.current.destroy();
+                hlsRef.current = null;
+                video.src = nativeUrl;
+                video.load();
+                video.play().catch(() => { /* autoplay may need the AirPlay connect to settle */ });
+            }
         } catch (err) {
             console.error('AirPlay error:', err);
         }
@@ -1793,7 +1896,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className={`fixed inset-0 z-[12000] bg-black flex items-center justify-center ${shouldHideCursor ? 'cursor-none' : ''}`}
+            className={`fixed inset-0 z-[12000] flex items-center justify-center ${isEmbedStream ? 'bg-black/80 p-4 backdrop-blur-md sm:p-6' : 'bg-black'} ${shouldHideCursor ? 'cursor-none' : ''}`}
             ref={containerRef}
             onMouseMove={isEmbedStream ? undefined : handleMouseMove}
             onClick={isEmbedStream ? undefined : handleMouseMove}
@@ -1835,65 +1938,68 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 )}
             </AnimatePresence>
 
-            {isEmbedStream && hasActiveStream && !error && (
-                <>
-                    <div className="absolute top-4 left-4 z-50 flex items-center gap-3">
-                        <button
-                            onClick={onClose}
-                            className="flex items-center gap-2 rounded-lg bg-black/75 px-3 py-2 text-white shadow-lg transition-colors hover:bg-black/90"
-                        >
-                            <ArrowLeft size={18} />
-                            <span className="hidden sm:inline">{t('common.back')}</span>
-                        </button>
-                    </div>
-
-                    <div className="absolute top-4 left-1/2 z-40 -translate-x-1/2 rounded-lg bg-black/60 px-4 py-2 text-center text-white shadow-lg backdrop-blur-sm">
-                        <p className="text-xs uppercase tracking-[0.22em] text-red-400">Embed</p>
-                        <p className="text-sm font-semibold whitespace-nowrap">
-                            {activeStream?.title || channelName}
-                        </p>
-                    </div>
-
-                    <div className="absolute top-4 right-4 z-50 flex items-center gap-2">
-                        <button
-                            onClick={() => window.open(activeEmbedUrl, '_blank', 'noopener,noreferrer')}
-                            className="rounded-lg bg-gray-800/90 p-2 text-white shadow-lg transition-colors hover:bg-gray-700/90"
-                            title={t('watch.openInNewPage')}
-                        >
-                            <ExternalLink size={18} />
-                        </button>
-
-                        {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
-                            <button
-                                onClick={() => setShowSettings(true)}
-                                className="flex items-center gap-2 rounded-lg bg-black/75 px-3 py-2 text-white shadow-lg transition-colors hover:bg-black/90"
-                                title={t('watch.sources')}
-                            >
-                                <Settings size={18} />
-                                <span className="hidden sm:inline">{t('watch.sources')}</span>
-                            </button>
-                        )}
-
-                        <button
-                            onClick={() => { void toggleFullscreen(); }}
-                            className="rounded-lg bg-black/75 p-2 text-white shadow-lg transition-colors hover:bg-black/90"
-                            title={isFullscreen ? t('watchParty.exitFullscreen') : t('watchParty.fullscreen')}
-                        >
-                            {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
-                        </button>
-                    </div>
-                </>
-            )}
-
-            {/* Video */}
             {/* Video or Iframe */}
             {isEmbedStream ? (
-                <iframe
-                    src={activeEmbedUrl}
-                    className="w-full h-full border-0 bg-black"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowFullScreen
-                />
+                <div className="relative w-full max-w-5xl">
+                    {/* Header bar (controls) above the centered iframe */}
+                    {hasActiveStream && !error && (
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                            <button
+                                onClick={onClose}
+                                className="flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                            >
+                                <ArrowLeft size={18} />
+                                <span className="hidden sm:inline">{t('common.back')}</span>
+                            </button>
+
+                            <div className="min-w-0 text-center">
+                                <p className="text-[11px] uppercase tracking-[0.22em] text-red-400">Embed</p>
+                                <p className="truncate text-sm font-semibold text-white">
+                                    {activeStream?.title || channelName}
+                                </p>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                                <button
+                                    onClick={() => window.open(activeEmbedUrl, '_blank', 'noopener,noreferrer')}
+                                    className="rounded-lg bg-white/10 p-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                    title={t('watch.openInNewPage')}
+                                >
+                                    <ExternalLink size={18} />
+                                </button>
+
+                                {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
+                                    <button
+                                        onClick={() => setShowSettings(true)}
+                                        className="flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                        title={t('watch.sources')}
+                                    >
+                                        <Settings size={18} />
+                                        <span className="hidden sm:inline">{t('watch.sources')}</span>
+                                    </button>
+                                )}
+
+                                <button
+                                    onClick={() => { void toggleFullscreen(); }}
+                                    className="rounded-lg bg-white/10 p-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                    title={isFullscreen ? t('watchParty.exitFullscreen') : t('watchParty.fullscreen')}
+                                >
+                                    {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Centered 16:9 iframe card */}
+                    <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
+                        <iframe
+                            src={activeEmbedUrl}
+                            className="absolute inset-0 h-full w-full border-0"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                            allowFullScreen
+                        />
+                    </div>
+                </div>
             ) : (
                 <video
                     ref={videoRef}

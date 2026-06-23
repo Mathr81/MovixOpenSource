@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, memo } from 'react';
+import ReactCountryFlag from 'react-country-flag';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import { Tv, Loader2, Radio, Search, Crown, Puzzle, ChevronDown, Lock, Zap, Wifi, Star } from 'lucide-react';
@@ -49,6 +50,21 @@ interface Channel {
   _sportKey?: string;
   _score?: string;
   _emoji?: string;
+  _serverCount?: number;
+  _homeTeam?: string;
+  _awayTeam?: string;
+  _homeLogo?: string;
+  _awayLogo?: string;
+  _leagueLogo?: string;
+  _country?: string;
+  _countryLogo?: string;
+  _pageUrl?: string;
+  _servers?: Array<{
+    id: number;
+    name: string;
+    siteType?: number;
+    sportType?: number;
+  }>;
 }
 
 interface IptvCategory {
@@ -181,20 +197,22 @@ const livetvStatusOptions = [
 // Source display names for dropdown
 const sourceDisplayNames: { [key: string]: string } = {
   'linkzy': 'liveTV.freeSource',
-  'matches': 'liveTV.matchesCatalogSource',
+  'fctv': 'FCTV33',
   'wiflix': 'Landscape',
   'sosplay': 'Bolaloca',
   'livetv': 'LiveTV',
+  'daddylive': 'Daddylive',
   'iptv': 'liveTV.iptvWebSource',
 };
 
 // Get source key from catalog ID
 const getSourceKey = (catalogId: string): string => {
   if (catalogId.startsWith('linkzy_')) return 'linkzy';
-  if (catalogId.startsWith('matches_')) return 'matches';
+  if (catalogId.startsWith('matches_')) return 'fctv';
   if (catalogId.startsWith('wiflix_')) return 'wiflix';
   if (catalogId.startsWith('sosplay_')) return 'sosplay';
   if (catalogId.startsWith('livetv_')) return 'livetv';
+  if (catalogId.startsWith('daddylive_')) return 'daddylive';
   return 'other';
 };
 
@@ -466,10 +484,11 @@ const LiveTV: React.FC = () => {
   const [catalogs, setCatalogs] = useState<Catalog[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selectedCatalog, setSelectedCatalog] = useState<string>('');
-  const [selectedSource, setSelectedSource] = useState<string>('matches'); // Default source
+  const [selectedSource, setSelectedSource] = useState<string>('fctv'); // Default source
   const [loadingCatalogs, setLoadingCatalogs] = useState(true);
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [collapsedMatches, setCollapsedMatches] = useState<Record<string, boolean>>({});
   const [searchQuery, setSearchQuery] = useState('');
   const [livetvStatusFilter, setLivetvStatusFilter] = useState<'playable' | 'live' | 'upcoming' | 'all'>('playable');
   const [livetvSportFilter, setLivetvSportFilter] = useState<string>('all');
@@ -529,8 +548,10 @@ const LiveTV: React.FC = () => {
   const hasExtension = isExtensionAvailable();
   const hasFullAccess = isVip || hasExtension;
   
-  // Matches & IPTV require VIP specifically (not just extension)
-  const isVipOnlySource = selectedSource === 'matches' || selectedSource === 'iptv';
+  // IPTV requires VIP specifically. Matches (fctv) now works for free users via
+  // the extension/userscript (local resolution) or the embed player, so it only
+  // needs full access (VIP OR extension), not VIP.
+  const isVipOnlySource = selectedSource === 'iptv';
   const hasAccess = isVipOnlySource ? isVip : hasFullAccess;
 
   const filteredChannels = channels.filter(channel => {
@@ -830,7 +851,7 @@ const LiveTV: React.FC = () => {
       return;
     }
 
-    const sourceNeedsVip = launchTarget.source === 'matches' || launchTarget.source === 'iptv';
+    const sourceNeedsVip = launchTarget.source === 'iptv';
     const sourceAccessible = sourceNeedsVip ? isVip : hasFullAccess;
     if (!sourceAccessible) {
       return;
@@ -958,7 +979,10 @@ const LiveTV: React.FC = () => {
   };
 
   const isPlayableEventChannel = (channel: Channel) =>
-    !isTimedEventChannel(channel) || Boolean(channel._isLive) || isImminentEventChannel(channel);
+    !isTimedEventChannel(channel)
+    || Boolean(channel._isLive)
+    || isImminentEventChannel(channel)
+    || (channel.id.startsWith('match_') && (channel._serverCount || 0) > 0);
 
   useEffect(() => {
     if (selectedSource !== 'livetv') {
@@ -1172,7 +1196,7 @@ const LiveTV: React.FC = () => {
       return;
     }
 
-    const sourceNeedsVip = launchTarget.source === 'matches' || launchTarget.source === 'iptv';
+    const sourceNeedsVip = launchTarget.source === 'iptv';
     const sourceAccessible = sourceNeedsVip ? isVip : hasFullAccess;
 
     if (!sourceAccessible) {
@@ -1247,7 +1271,7 @@ const LiveTV: React.FC = () => {
     let name = catalog.name;
 
     // 1. Enlever les préfixes de source connus
-    const prefixes = ['Linkzy', 'Wiflix', 'Sosplay', 'Bolaloca', 'LiveTV', 'Matches'];
+    const prefixes = ['Linkzy', 'Wiflix', 'Sosplay', 'Bolaloca', 'LiveTV', 'FCTV'];
     for (const prefix of prefixes) {
       if (name.toLowerCase().startsWith(prefix.toLowerCase() + ' ')) {
         name = name.slice(prefix.length + 1);
@@ -1290,18 +1314,39 @@ const LiveTV: React.FC = () => {
     if (lowerId.includes('movie') || lowerId.includes('film') || lowerId.includes('cinema') || lowerName.includes('film') || lowerName.includes('ciné')) return '🎬';
     if (lowerId.includes('news') || lowerId.includes('info') || lowerName.includes('info')) return '📰';
     if (lowerId.includes('kid') || lowerId.includes('enfant') || lowerName.includes('enfant')) return '👶';
-    if (lowerId.includes('music') || lowerName.includes('musi')) return '🎵';
+    if (lowerId.includes('music') || lowerId.includes('musi')) return '🎵';
     if (lowerId.includes('docu') || lowerName.includes('docu')) return '🌍';
     if (lowerId.includes('general') || lowerName.includes('general')) return '📺';
 
     return '📺';
   };
 
+  // Non-ISO buckets that have no country flag -> emoji fallback.
+  const daddyliveBucketEmoji: Record<string, string> = { arabic: '🌐', africa: '🌍', other: '🌎' };
+
+  // Catalog icon: daddylive country catalogs render a flag via react-country-flag.
+  const getCatalogIcon = (catalog: Catalog): React.ReactNode => {
+    if (catalog.id.startsWith('daddylive_')) {
+      const code = catalog.id.slice('daddylive_'.length);
+      if (code.length === 2) {
+        return (
+          <ReactCountryFlag
+            countryCode={code.toUpperCase()}
+            svg
+            style={{ width: '1.15em', height: '1.15em', borderRadius: '2px' }}
+            aria-label={code.toUpperCase()}
+          />
+        );
+      }
+      return <span className="text-base">{daddyliveBucketEmoji[code] || '🌎'}</span>;
+    }
+    return <span className="text-base">{getCatalogEmoji(catalog)}</span>;
+  };
 
   // Source icons mapping
   const sourceIcons: Record<string, React.ReactNode> = {
     'linkzy': <Zap className="w-3.5 h-3.5" />,
-    'matches': <span className="text-sm leading-none">⚽</span>,
+    'fctv': <span className="text-sm leading-none">⚽</span>,
     'wiflix': <Tv className="w-3.5 h-3.5" />,
     'sosplay': <Radio className="w-3.5 h-3.5" />,
     'livetv': <Radio className="w-3.5 h-3.5" />,
@@ -1316,7 +1361,7 @@ const LiveTV: React.FC = () => {
   }, [availableSources, isVip]);
 
   const handleSourceChange = (newSource: string) => {
-    const srcIsVipOnly = newSource === 'matches' || newSource === 'iptv';
+    const srcIsVipOnly = newSource === 'iptv';
     if (srcIsVipOnly && !isVip) return;
     if (!srcIsVipOnly && !hasFullAccess) return;
 
@@ -1512,6 +1557,171 @@ const LiveTV: React.FC = () => {
     );
   };
 
+  const toggleMatchCollapse = (matchId: string) => {
+    setCollapsedMatches((prev) => ({
+      ...prev,
+      [matchId]: !prev[matchId],
+    }));
+  };
+
+  const renderMatchAccordion = (channel: Channel, index: number) => {
+    const isExpanded = !collapsedMatches[channel.id];
+    const isFavorite = isFavoriteChannel(selectedSource, channel.id);
+    const isLive = Boolean(channel._isLive);
+    const hasServers = (channel._servers && channel._servers.length > 0) || (channel._serverCount || 0) > 0;
+
+    return (
+      <motion.div
+        key={channel.id}
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.2, delay: Math.min(index * 0.015, 0.3) }}
+        className="w-full bg-white/[0.015] border border-white/[0.04] rounded-2xl overflow-hidden backdrop-blur-md transition-all duration-300 hover:border-white/[0.08] hover:bg-white/[0.02]"
+      >
+        {/* Header Block */}
+        <div
+          onClick={() => toggleMatchCollapse(channel.id)}
+          className="flex flex-col sm:flex-row sm:items-center justify-between p-4 sm:p-5 gap-4 cursor-pointer select-none"
+        >
+          {/* Left info: League, status/timer, names */}
+          <div className="flex items-center gap-4 flex-1 min-w-0">
+            {/* Sport/League Logo */}
+            <div className="w-10 h-10 rounded-full bg-white/[0.03] border border-white/[0.08] flex items-center justify-center flex-shrink-0">
+              {channel._leagueLogo ? (
+                <img src={channel._leagueLogo} alt="League" className="w-6 h-6 object-contain" />
+              ) : (
+                <span className="text-xl">⚽</span>
+              )}
+            </div>
+
+            {/* Match info and teams */}
+            <div className="flex-1 min-w-0 space-y-1.5">
+              {/* League & Country */}
+              <div className="flex items-center gap-2 text-white/45 text-[11px] font-medium tracking-wide">
+                {channel._countryLogo && (
+                  <img src={channel._countryLogo} alt="" className="w-3.5 h-2.5 object-cover rounded-[1px]" />
+                )}
+                <span className="truncate">{channel._competition || channel._sport}</span>
+              </div>
+
+              {/* Team Matchup with Logos */}
+              <div className="flex flex-wrap items-center gap-2.5 text-white/95 font-semibold text-sm sm:text-base">
+                {/* Home Team */}
+                <div className="flex items-center gap-2 min-w-0">
+                  {channel._homeLogo && (
+                    <img src={channel._homeLogo} alt="" className="w-5 h-5 object-contain flex-shrink-0" />
+                  )}
+                  <span className="truncate">{channel._homeTeam || channel.name}</span>
+                </div>
+                
+                <span className="text-white/30 text-xs font-normal">vs</span>
+
+                {/* Away Team */}
+                <div className="flex items-center gap-2 min-w-0">
+                  {channel._awayLogo && (
+                    <img src={channel._awayLogo} alt="" className="w-5 h-5 object-contain flex-shrink-0" />
+                  )}
+                  <span className="truncate">{channel._awayTeam || ""}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right controls: Time/Score, Favorites button, expand/collapse indicator */}
+          <div className="flex items-center justify-between sm:justify-end gap-3 sm:gap-4 border-t border-white/[0.04] pt-3 sm:pt-0 sm:border-0">
+            {/* Live badge or timer */}
+            <div className="flex-shrink-0">
+              {isLive ? (
+                <div className="flex items-center gap-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2.5 py-1 rounded-full text-xs font-semibold">
+                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
+                  {channel._score ? `LIVE ${channel._score}` : "LIVE"}
+                </div>
+              ) : channel._timestamp ? (
+                <TimeRemaining timestamp={channel._timestamp} t={t} />
+              ) : channel._timeText ? (
+                <span className="text-xs font-medium text-amber-400/80 bg-amber-500/10 px-2.5 py-1 rounded-full border border-amber-500/10">
+                  {channel._timeText}
+                </span>
+              ) : null}
+            </div>
+
+            {/* Favorite and Chevron buttons */}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <FavoriteChannelButton
+                active={isFavorite}
+                activeLabel={t('liveTV.removeFromFavorites')}
+                inactiveLabel={t('liveTV.addToFavorites')}
+                onToggle={(event) => {
+                  event.stopPropagation();
+                  toggleFavoriteChannel(event, {
+                    source: selectedSource,
+                    id: channel.id,
+                    name: channel.name,
+                    poster: channel.poster,
+                    kind: 'channel',
+                    catalogId: selectedCatalog,
+                  });
+                }}
+              />
+              
+              {/* Chevron icon */}
+              <div className="w-8 h-8 rounded-full bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/50 transition-colors hover:text-white/80">
+                <ChevronDown className={cn("w-4 h-4 transition-transform duration-300", isExpanded ? "rotate-180" : "")} />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Content Block (collapsible accordion) */}
+        <AnimatePresence initial={false}>
+          {isExpanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2, ease: "easeInOut" }}
+            >
+              <div className="px-5 pb-5 pt-1 border-t border-white/[0.03] bg-white/[0.005] space-y-4">
+                {/* Servers title */}
+                <div className="flex items-center gap-2 text-white/45 text-[11px] font-semibold uppercase tracking-wider">
+                  <Wifi className="w-3.5 h-3.5" />
+                  <span>{t('liveTV.availableServers')}</span>
+                </div>
+
+                {/* Watch action — opens the player picker (Lecteur intégré ⭐ + serveurs natifs) */}
+                {hasServers ? (
+                  <div className="space-y-2">
+                    <button
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleChannelClick(channel);
+                      }}
+                      className="w-full sm:w-auto px-5 py-3 rounded-xl text-sm font-semibold bg-emerald-500/15 border border-emerald-500/25 text-emerald-300 hover:bg-emerald-500/25 hover:text-emerald-200 active:scale-95 transition-all duration-200 cursor-pointer flex items-center justify-center gap-2 shadow-sm"
+                    >
+                      <Tv className="w-4 h-4" />
+                      {t('liveTV.watchMatch')}
+                    </button>
+                    {(channel._serverCount || 0) > 0 && (
+                      <p className="text-white/35 text-[11px]">
+                        {t('liveTV.serversAvailable', { count: channel._serverCount })}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-white/35 text-xs italic">
+                    {isLive
+                      ? t('liveTV.noServersFound')
+                      : t('liveTV.upcomingServersNote')}
+                  </p>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.div>
+    );
+  };
+
   const renderChannelCard = (channel: Channel, index: number) => {
     const isWiflix = selectedCatalog.startsWith('wiflix_');
     const isSosplay = selectedCatalog.startsWith('sosplay_');
@@ -1664,11 +1874,17 @@ const LiveTV: React.FC = () => {
               </div>
             </div>
 
+            {/* ── STREAM DISCLAIMER ── */}
+            <div className="flex items-start gap-2.5 px-3.5 py-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl">
+              <Wifi className="w-4 h-4 text-white/35 shrink-0 mt-0.5" />
+              <p className="text-white/45 text-xs sm:text-sm leading-snug">{t('liveTV.streamDisclaimer')}</p>
+            </div>
+
             {/* ── SOURCE PILL TABS ── */}
             {!loadingCatalogs && hasFullAccess && allSources.length > 0 && (
               <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none -mx-1 px-1">
                 {allSources.map((source) => {
-                  const srcIsVipOnly = source === 'matches' || source === 'iptv';
+                  const srcIsVipOnly = source === 'iptv';
                   const isLocked = srcIsVipOnly ? !isVip : !hasFullAccess;
                   const isActive = selectedSource === source;
                   const label = sourceDisplayNames[source]?.startsWith('liveTV.') ? t(sourceDisplayNames[source]) : (sourceDisplayNames[source] || source);
@@ -1878,7 +2094,7 @@ const LiveTV: React.FC = () => {
                           : 'bg-white/[0.02] text-white/50 border-transparent hover:bg-white/[0.05] hover:text-white/70'
                       )}
                     >
-                      <span className="text-base">{getCatalogEmoji(catalog)}</span>
+                      {getCatalogIcon(catalog)}
                       {formatCatalogName(catalog)}
                     </button>
                   );
@@ -2074,26 +2290,50 @@ const LiveTV: React.FC = () => {
                 transition={{ duration: 0.25 }}
                 className="space-y-5"
               >
-                {favoriteDisplayedChannels.length > 0 && (
-                  <div className="space-y-3">
-                    <LiveTVSectionDivider title={t('liveTV.favorites')} count={favoriteDisplayedChannels.length} />
-                    <div className={channelGridClassName}>
-                      {favoriteDisplayedChannels.map((channel, index) => renderChannelCard(channel, index))}
-                    </div>
-                  </div>
-                )}
-
-                {regularDisplayedChannels.length > 0 && (
-                  <div className="space-y-3">
+                {selectedCatalog.startsWith('matches_') ? (
+                  <div className="space-y-4">
                     {favoriteDisplayedChannels.length > 0 && (
-                      <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularDisplayedChannels.length} />
+                      <div className="space-y-3">
+                        <LiveTVSectionDivider title={t('liveTV.favorites')} count={favoriteDisplayedChannels.length} />
+                        <div className="flex flex-col gap-4">
+                          {favoriteDisplayedChannels.map((channel, index) => renderMatchAccordion(channel, index))}
+                        </div>
+                      </div>
                     )}
-                    <div className={channelGridClassName}>
-                      {regularDisplayedChannels.map((channel, index) => renderChannelCard(channel, favoriteDisplayedChannels.length + index))}
-                    </div>
+                    {regularDisplayedChannels.length > 0 && (
+                      <div className="space-y-3">
+                        {favoriteDisplayedChannels.length > 0 && (
+                          <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularDisplayedChannels.length} />
+                        )}
+                        <div className="flex flex-col gap-4">
+                          {regularDisplayedChannels.map((channel, index) => renderMatchAccordion(channel, favoriteDisplayedChannels.length + index))}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                )}
+                ) : (
+                  <>
+                    {favoriteDisplayedChannels.length > 0 && (
+                      <div className="space-y-3">
+                        <LiveTVSectionDivider title={t('liveTV.favorites')} count={favoriteDisplayedChannels.length} />
+                        <div className={channelGridClassName}>
+                          {favoriteDisplayedChannels.map((channel, index) => renderChannelCard(channel, index))}
+                        </div>
+                      </div>
+                    )}
 
+                    {regularDisplayedChannels.length > 0 && (
+                      <div className="space-y-3">
+                        {favoriteDisplayedChannels.length > 0 && (
+                          <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularDisplayedChannels.length} />
+                        )}
+                        <div className={channelGridClassName}>
+                          {regularDisplayedChannels.map((channel, index) => renderChannelCard(channel, favoriteDisplayedChannels.length + index))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
               </motion.div>
             )}
           </div>
