@@ -32,6 +32,11 @@
   GCKCastOptions *castOptions = [[GCKCastOptions alloc] initWithDiscoveryCriteria:criteria];
   castOptions.physicalVolumeButtonsWillControlDeviceVolume = YES;
   [GCKCastContext setSharedInstanceWithOptions:castOptions];
+  // Active la page de contrôle Cast native plein écran (play/pause/seek/volume/
+  // stop). Le lecteur web ne fournit pas d'UI de contrôle fiable une fois la
+  // diffusion lancée : on présente donc ces contrôles natifs depuis CastModule
+  // au démarrage de la session, ce qui évite de rester bloqué sur le film.
+  [GCKCastContext sharedInstance].useDefaultExpandedMediaControls = YES;
 #endif
 
   return [super application:application didFinishLaunchingWithOptions:launchOptions];

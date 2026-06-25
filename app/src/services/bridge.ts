@@ -7,7 +7,7 @@
  */
 
 import { type RefObject } from 'react';
-import { NativeModules, Platform } from 'react-native';
+import { Linking, NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   getCurrentDeviceName,
@@ -96,6 +96,20 @@ export function startCastShimEventForwarding(
         }
         const shimEvent = evt.type === 'CAST_SESSION_STARTED' ? 'STARTED' : 'RESUMED';
         sendShimSessionEvent(webViewRef, shimEvent, { deviceName: evt.deviceName, durationSec: evt.durationSec });
+        // La diffusion a démarré sur la TV : on met en pause la vidéo locale
+        // pour éviter une double lecture (son en double sur l'iPad/Android,
+        // l'écran qui reste sur le film derrière la page de contrôle Cast).
+        webViewRef.current?.injectJavaScript(`
+          (function() {
+            try {
+              var vids = document.querySelectorAll('video');
+              for (var i = 0; i < vids.length; i++) {
+                try { vids[i].pause(); } catch (e) {}
+              }
+            } catch (e) {}
+          })();
+          true;
+        `);
         break;
       }
       case 'CAST_SESSION_ENDED':
@@ -400,6 +414,17 @@ export async function handleBridgeMessage(
         } catch {
           // Module absent (vieux build) — ignore silencieusement.
         }
+      }
+      return;
+    }
+    // Pub / popup interceptée par le shim window.open (cf. popup-redirect) :
+    // ouverte dans le navigateur système au lieu de piéger l'utilisateur dans
+    // la WebView. Le shim a déjà renvoyé un faux window au site pour débloquer
+    // sa gate publicitaire.
+    if (p.type === 'OPEN_EXTERNAL') {
+      const target = typeof p.url === 'string' ? p.url : '';
+      if (/^https?:\/\//i.test(target)) {
+        Linking.openURL(target).catch(() => {});
       }
       return;
     }

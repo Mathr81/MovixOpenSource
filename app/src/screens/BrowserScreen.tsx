@@ -89,6 +89,25 @@ export default function BrowserScreen() {
     AsyncStorage.setItem(STORAGE_SNAPSHOT_KEY, JSON.stringify(data)).catch(() => {});
   }, []);
 
+  // Réinitialisation des données du site (déclenchée depuis les Réglages) :
+  // vide localStorage/sessionStorage de la WebView + l'instantané persisté
+  // (sinon il serait re-restauré au prochain chargement) puis recharge la page.
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('MOVIX_CLEAR_SITE_DATA', () => {
+      setStorageSnapshot(null);
+      AsyncStorage.removeItem(STORAGE_SNAPSHOT_KEY).catch(() => {});
+      webViewRef.current?.injectJavaScript(`
+        (function() {
+          try { localStorage.clear(); } catch (e) {}
+          try { sessionStorage.clear(); } catch (e) {}
+          try { location.reload(); } catch (e) {}
+        })();
+        true;
+      `);
+    });
+    return () => sub.remove();
+  }, []);
+
   useEffect(() => {
     AsyncStorage.getItem('dns_enabled').then(val => {
       setDnsEnabled(val === 'true');
@@ -135,18 +154,38 @@ export default function BrowserScreen() {
       (e: { control?: string }) => {
         const control = e?.control;
         if (!control) return;
-        // Fallback document.querySelector('video') si __movixActiveVideo est
-        // absent/périmé, + log diagnostique visible dans la Debug Console
-        // (Settings) pour vérifier que le script s'exécute bien côté WebView.
+        // Choisit la vidéo la plus pertinente : __movixActiveVideo, sinon la
+        // première vidéo réellement en lecture, sinon n'importe laquelle.
+        // Pour play/pause, on BASCULE selon l'état réel (v.paused) plutôt que de
+        // faire confiance au libellé du bouton : si l'état du bouton PiP est
+        // désynchronisé (icône figée sur « Lecture » alors que ça joue), un
+        // « play » sur une vidéo déjà en lecture ne faisait rien — d'où le
+        // bouton qui « ne marche pas » alors que reculer/avancer fonctionnent.
         const script = `
           (function() {
             try {
-              var v = window.__movixActiveVideo || document.querySelector('video');
-              console.log('[PIP_CONTROL]', ${JSON.stringify(control)}, 'video found:', !!v);
+              var v = window.__movixActiveVideo;
+              if (!v || v.paused) {
+                var vids = document.querySelectorAll('video');
+                var playing = null;
+                for (var i = 0; i < vids.length; i++) {
+                  if (!vids[i].paused) { playing = vids[i]; break; }
+                }
+                v = playing || v || vids[0] || null;
+              }
+              console.log('[PIP_CONTROL]', ${JSON.stringify(control)}, 'video:', !!v, v ? ('paused=' + v.paused) : '');
               if (!v) return;
               switch (${JSON.stringify(control)}) {
-                case 'play': v.play().catch(function(err){ console.log('[PIP_CONTROL] play() failed', err && err.message); }); break;
-                case 'pause': v.pause(); break;
+                case 'play':
+                case 'pause':
+                  if (v.paused) {
+                    var p = v.play();
+                    if (p && p.catch) p.catch(function(err){ console.log('[PIP_CONTROL] play() failed', err && err.message); });
+                  } else {
+                    v.pause();
+                  }
+                  setTimeout(function(){ console.log('[PIP_CONTROL] after toggle paused=', v.paused); }, 300);
+                  break;
                 case 'rewind': v.currentTime = Math.max(0, v.currentTime - 10); break;
                 case 'forward':
                   var dur = isFinite(v.duration) ? v.duration : Infinity;

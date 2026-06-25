@@ -3,6 +3,7 @@ import { buildAndroidPipShim } from './android-pip-shim';
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
 import { buildMediaSession } from './media-session';
+import { buildPopupRedirectScript } from './popup-redirect';
 import { buildStorageCaptureScript, buildStorageRestoreScript } from './site-storage-sync';
 import { USERSCRIPT_SOURCE } from './userscript-source';
 
@@ -38,6 +39,7 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const mediaSession = buildMediaSession();
   const storageRestore = buildStorageRestoreScript(storageSnapshot);
   const storageCapture = buildStorageCaptureScript();
+  const popupRedirect = buildPopupRedirectScript();
 
   const userscript = proxyEnabled
     ? `// --- Userscript Movix ---\n${USERSCRIPT_SOURCE}`
@@ -60,6 +62,8 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   // verrouillé + auto-PiP), indépendant du proxy.
   return `
 ${storageRestore}
+
+${popupRedirect}
 
 ${castShimBlock}
 

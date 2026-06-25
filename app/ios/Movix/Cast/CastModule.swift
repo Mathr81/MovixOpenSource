@@ -241,6 +241,23 @@ class CastModule: RCTEventEmitter {
     let options = GCKMediaLoadOptions()
     options.playPosition = position
     session.remoteMediaClient?.loadMedia(mediaInfo, with: options)
+    // Affiche la page de contrôle Cast native (play/pause/seek/volume/stop).
+    // Sinon l'iPad reste sur le film sans aucun contrôle de la diffusion.
+    presentExpandedControlsWithRetry(0)
+  }
+
+  /// Présente les contrôles Cast natifs plein écran. `presentDefaultExpanded…`
+  /// renvoie `false` tant que le média n'a pas démarré sur le récepteur (ou si
+  /// le picker est encore en cours de fermeture) : on réessaie quelques fois.
+  private func presentExpandedControlsWithRetry(_ attempt: Int) {
+    DispatchQueue.main.async {
+      let ok = GCKCastContext.sharedInstance().presentDefaultExpandedMediaControls()
+      if !ok && attempt < 6 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+          self.presentExpandedControlsWithRetry(attempt + 1)
+        }
+      }
+    }
   }
 
   private func durationSec(for session: GCKSession) -> Double {

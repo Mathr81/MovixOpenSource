@@ -10,6 +10,7 @@ import {
   Platform,
   TouchableOpacity,
   Linking,
+  DeviceEventEmitter,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CONFIG } from '../config';
@@ -97,6 +98,21 @@ export default function SettingsScreen() {
   const updateExtractionPrefs = useCallback((next: ExtractionPrefs) => {
     setExtractionPrefs(next);
     AsyncStorage.setItem('movix_extraction_prefs', JSON.stringify(next));
+  }, []);
+
+  const clearSiteData = useCallback(() => {
+    Alert.alert(
+      'Vider les données du site',
+      'Efface le stockage local du site (session, préférences) et recharge la page. Tu seras peut-être déconnecté. Continuer ?',
+      [
+        { text: 'Annuler', style: 'cancel' },
+        {
+          text: 'Vider',
+          style: 'destructive',
+          onPress: () => DeviceEventEmitter.emit('MOVIX_CLEAR_SITE_DATA'),
+        },
+      ],
+    );
   }, []);
 
   const toggleDns = useCallback(async (value: boolean) => {
@@ -342,6 +358,34 @@ export default function SettingsScreen() {
 
         <Text style={styles.hint}>
           Ces réglages s'appliquent à l'extraction native de l'app. Pour régler l'extension ou le userscript, va sur {primaryUrl.replace(/^https?:\/\//, '')}/settings#extractions.
+        </Text>
+      </View>
+
+      {/* Données du site Section */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Données du site</Text>
+
+        <TouchableOpacity
+          style={styles.card}
+          activeOpacity={0.7}
+          onPress={clearSiteData}>
+          <View style={styles.row}>
+            <View style={styles.rowLeft}>
+              <Text style={[styles.rowTitle, { color: '#ef4444' }]}>
+                Vider les données du site
+              </Text>
+              <Text style={styles.rowSubtitle}>
+                Efface le localStorage / sessionStorage et recharge la page
+              </Text>
+            </View>
+            <Text style={styles.chevron}>›</Text>
+          </View>
+        </TouchableOpacity>
+
+        <Text style={styles.hint}>
+          À utiliser si le site reste bloqué, affiche un état périmé, ou pour
+          forcer un rechargement complet. La session sauvegardée pour les
+          changements de domaine est également effacée.
         </Text>
       </View>
 
