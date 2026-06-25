@@ -40,13 +40,16 @@ class MainActivity : ReactActivity() {
         private const val EXTRA_CONTROL = "control"
         private const val CONTROL_PLAY = 1
         private const val CONTROL_PAUSE = 2
-        private const val CONTROL_FULLSCREEN = 3
+        private const val CONTROL_REWIND = 4
+        private const val CONTROL_FORWARD = 5
     }
 
     /**
-     * Reçoit les appuis sur les boutons de la fenêtre PiP (play/pause/plein écran).
-     * play/pause sont relayés au JS (qui pilote l'élément <video>) ; plein écran
-     * ramène l'app au premier plan (sort du PiP).
+     * Reçoit les appuis sur les boutons de la fenêtre PiP (rembobiner/lecture-
+     * pause/avancer). Tous sont relayés au JS, qui pilote l'élément <video>.
+     * Le bouton plein écran custom a été retiré : Android affiche déjà son
+     * propre bouton d'agrandissement natif sur la fenêtre PiP, le nôtre faisait
+     * doublon.
      */
     private val pipReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -54,16 +57,8 @@ class MainActivity : ReactActivity() {
             when (intent.getIntExtra(EXTRA_CONTROL, 0)) {
                 CONTROL_PLAY -> emitPipEvent("PIP_CONTROL", control = "play")
                 CONTROL_PAUSE -> emitPipEvent("PIP_CONTROL", control = "pause")
-                CONTROL_FULLSCREEN -> {
-                    // Ramène l'Activity au premier plan : Android replie alors la
-                    // fenêtre PiP et restaure l'app en plein écran.
-                    val launch = Intent(applicationContext, MainActivity::class.java)
-                        .addFlags(
-                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP,
-                        )
-                    startActivity(launch)
-                }
+                CONTROL_REWIND -> emitPipEvent("PIP_CONTROL", control = "rewind")
+                CONTROL_FORWARD -> emitPipEvent("PIP_CONTROL", control = "forward")
             }
         }
     }
@@ -154,17 +149,18 @@ class MainActivity : ReactActivity() {
         }
     }
 
-    /** Construit les boutons de contrôle affichés dans la fenêtre PiP :
-     *  lecture/pause (icône selon l'état) + plein écran. */
+    /** Construit les boutons de contrôle affichés dans la fenêtre PiP, dans
+     *  l'ordre YouTube : reculer 10s / lecture-pause / avancer 10s. */
     @RequiresApi(Build.VERSION_CODES.O)
     private fun buildPipActions(playing: Boolean): ArrayList<RemoteAction> {
         val actions = ArrayList<RemoteAction>()
+        actions.add(makeRemoteAction(R.drawable.ic_pip_rewind, "Reculer 10s", CONTROL_REWIND))
         if (playing) {
             actions.add(makeRemoteAction(R.drawable.ic_pip_pause, "Pause", CONTROL_PAUSE))
         } else {
             actions.add(makeRemoteAction(R.drawable.ic_pip_play, "Lecture", CONTROL_PLAY))
         }
-        actions.add(makeRemoteAction(R.drawable.ic_pip_fullscreen, "Plein écran", CONTROL_FULLSCREEN))
+        actions.add(makeRemoteAction(R.drawable.ic_pip_forward, "Avancer 10s", CONTROL_FORWARD))
         return actions
     }
 

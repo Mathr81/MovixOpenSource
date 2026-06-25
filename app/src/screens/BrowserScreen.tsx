@@ -25,6 +25,8 @@ import { useBrowserUIPrefs } from '../hooks/useBrowserUIPrefs';
 import { useAddress } from '../context/AddressContext';
 import SettingsScreen from './SettingsScreen';
 
+const STORAGE_SNAPSHOT_KEY = '@movix/site_storage_snapshot';
+
 export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
@@ -41,6 +43,20 @@ export default function BrowserScreen() {
     return [config.primaryUrl, ...config.mirrors];
   }, [config]);
 
+  // Hôtes du site (domaine actif + miroirs) : la navigation y reste dans la
+  // WebView ; tout le reste s'ouvre dans le navigateur système (cf. C, pubs).
+  const allowedHosts = useMemo(() => {
+    const hosts: string[] = [];
+    for (const u of urlChain) {
+      try {
+        hosts.push(new URL(u).hostname);
+      } catch {
+        // URL invalide — ignorée.
+      }
+    }
+    return hosts;
+  }, [urlChain]);
+
   const [mirrorIndex, setMirrorIndex] = useState(0);
   const [allMirrorsFailed, setAllMirrorsFailed] = useState(false);
   const [canGoBack, setCanGoBack] = useState(false);
@@ -50,9 +66,28 @@ export default function BrowserScreen() {
   const [dnsEnabled, setDnsEnabled] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [webViewReady, setWebViewReady] = useState(false);
+  const [storageSnapshot, setStorageSnapshot] = useState<Record<string, string> | null>(null);
   const splashFade = useRef(new Animated.Value(1)).current;
 
   const activeUrl = urlChain[mirrorIndex] ?? '';
+
+  // Charge l'instantané de session du dernier domaine actif (cf. D, persistance
+  // inter-domaines) avant le premier chargement de la WebView.
+  useEffect(() => {
+    AsyncStorage.getItem(STORAGE_SNAPSHOT_KEY).then(raw => {
+      if (!raw) return;
+      try {
+        setStorageSnapshot(JSON.parse(raw));
+      } catch {
+        // Donnée corrompue — ignorée.
+      }
+    });
+  }, []);
+
+  const onStorageSnapshot = useCallback((data: Record<string, string>) => {
+    setStorageSnapshot(data);
+    AsyncStorage.setItem(STORAGE_SNAPSHOT_KEY, JSON.stringify(data)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     AsyncStorage.getItem('dns_enabled').then(val => {
@@ -98,15 +133,31 @@ export default function BrowserScreen() {
     const controlSub = DeviceEventEmitter.addListener(
       'PIP_CONTROL',
       (e: { control?: string }) => {
-        if (e?.control === 'play') {
-          webViewRef.current?.injectJavaScript(
-            'try{window.__movixActiveVideo&&window.__movixActiveVideo.play();}catch(e){} true;',
-          );
-        } else if (e?.control === 'pause') {
-          webViewRef.current?.injectJavaScript(
-            'try{window.__movixActiveVideo&&window.__movixActiveVideo.pause();}catch(e){} true;',
-          );
-        }
+        const control = e?.control;
+        if (!control) return;
+        // Fallback document.querySelector('video') si __movixActiveVideo est
+        // absent/périmé, + log diagnostique visible dans la Debug Console
+        // (Settings) pour vérifier que le script s'exécute bien côté WebView.
+        const script = `
+          (function() {
+            try {
+              var v = window.__movixActiveVideo || document.querySelector('video');
+              console.log('[PIP_CONTROL]', ${JSON.stringify(control)}, 'video found:', !!v);
+              if (!v) return;
+              switch (${JSON.stringify(control)}) {
+                case 'play': v.play().catch(function(err){ console.log('[PIP_CONTROL] play() failed', err && err.message); }); break;
+                case 'pause': v.pause(); break;
+                case 'rewind': v.currentTime = Math.max(0, v.currentTime - 10); break;
+                case 'forward':
+                  var dur = isFinite(v.duration) ? v.duration : Infinity;
+                  v.currentTime = Math.min(dur, v.currentTime + 10);
+                  break;
+              }
+            } catch (e) { console.log('[PIP_CONTROL] error', e && e.message); }
+          })();
+          true;
+        `;
+        webViewRef.current?.injectJavaScript(script);
       },
     );
 
@@ -198,10 +249,13 @@ export default function BrowserScreen() {
             url={activeUrl}
             proxyEnabled={uiPrefs.proxyEnabled}
             castMode={uiPrefs.castMode}
+            allowedHosts={allowedHosts}
+            storageSnapshot={storageSnapshot}
             onNavigationStateChange={onNavigationStateChange}
             onError={onWebViewError}
             onLoadEnd={onWebViewLoadEnd}
             onMediaPlayback={onMediaPlayback}
+            onStorageSnapshot={onStorageSnapshot}
           />
         </View>
       )}

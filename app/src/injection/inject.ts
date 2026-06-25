@@ -3,6 +3,7 @@ import { buildAndroidPipShim } from './android-pip-shim';
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
 import { buildMediaSession } from './media-session';
+import { buildStorageCaptureScript, buildStorageRestoreScript } from './site-storage-sync';
 import { USERSCRIPT_SOURCE } from './userscript-source';
 
 export interface InjectOptions {
@@ -23,12 +24,20 @@ export interface InjectOptions {
    * relais pour router vers Chromecast.
    */
   castMode?: 'airplay' | 'chromecast';
+  /**
+   * Instantané localStorage du précédent domaine actif (cf. site-storage-sync) —
+   * réinjecté si le domaine en cours n'a pas déjà sa propre session, pour
+   * survivre aux changements de domaine miroir sans déconnexion.
+   */
+  storageSnapshot?: Record<string, string> | null;
 }
 
 export function buildInjectedJavaScript(options: InjectOptions = {}): string {
-  const { proxyEnabled = true, castMode = 'airplay' } = options;
+  const { proxyEnabled = true, castMode = 'airplay', storageSnapshot } = options;
   const bridge = buildBridgeRuntime();
   const mediaSession = buildMediaSession();
+  const storageRestore = buildStorageRestoreScript(storageSnapshot);
+  const storageCapture = buildStorageCaptureScript();
 
   const userscript = proxyEnabled
     ? `// --- Userscript Movix ---\n${USERSCRIPT_SOURCE}`
@@ -44,10 +53,14 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const androidPipShim =
     Platform.OS === 'android' ? buildAndroidPipShim() : '// PiP shim natif iOS (WebKit)';
 
-  // Cast shim FIRST — must be on window before any page JS runs.
+  // Restauration de session AVANT tout : doit écrire dans localStorage avant
+  // que le moindre script du site n'y lise quoi que ce soit.
+  // Cast shim ensuite — must be on window before any page JS runs.
   // Media Session : toujours injecté (jaquette notif + contrôles écran
   // verrouillé + auto-PiP), indépendant du proxy.
   return `
+${storageRestore}
+
 ${castShimBlock}
 
 ${androidPipShim}
@@ -55,6 +68,8 @@ ${androidPipShim}
 ${bridge}
 
 ${mediaSession}
+
+${storageCapture}
 
 ${userscript}
 

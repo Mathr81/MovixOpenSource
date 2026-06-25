@@ -26,6 +26,7 @@ interface InjectableRef {
 
 export interface BridgeMessageOptions {
   onMediaPlayback?: (playing: boolean) => void;
+  onStorageSnapshot?: (data: Record<string, string>) => void;
 }
 
 type CastShimRequest =
@@ -399,6 +400,19 @@ export async function handleBridgeMessage(
         } catch {
           // Module absent (vieux build) — ignore silencieusement.
         }
+      }
+      return;
+    }
+    // Instantané localStorage du site (cf. site-storage-sync) — persisté
+    // côté natif pour survivre aux changements de domaine miroir.
+    if (p.type === 'SITE_STORAGE_SNAPSHOT') {
+      const data = p.data;
+      if (data && typeof data === 'object') {
+        const clean: Record<string, string> = {};
+        for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+          if (typeof value === 'string') clean[key] = value;
+        }
+        options?.onStorageSnapshot?.(clean);
       }
       return;
     }

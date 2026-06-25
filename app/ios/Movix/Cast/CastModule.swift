@@ -19,8 +19,6 @@ import GoogleCast
 @objc(CastModule)
 class CastModule: RCTEventEmitter {
 
-  private var hasListeners = false
-
   // Requête de lecture mémorisée tant qu'aucune session n'est active : jouée
   // dès qu'un appareil est sélectionné (didStart). Mirroir du pendingLoad Android.
   private var pendingURL: String?
@@ -39,26 +37,18 @@ class CastModule: RCTEventEmitter {
     ]
   }
 
-  override func startObserving() {
-    hasListeners = true
-#if canImport(GoogleCast)
-    DispatchQueue.main.async {
-      GCKCastContext.sharedInstance().sessionManager.add(self)
-    }
-#endif
-  }
-
-  override func stopObserving() {
-    hasListeners = false
-#if canImport(GoogleCast)
-    DispatchQueue.main.async {
-      GCKCastContext.sharedInstance().sessionManager.remove(self)
-    }
-#endif
-  }
+  // startObserving()/stopObserving() ne sont déclenchés par RN que si le JS
+  // s'abonne via NativeEventEmitter(NativeModules.CastModule) — or cast.ts
+  // utilise le DeviceEventEmitter global, qui ne déclenche jamais ces hooks.
+  // L'enregistrement du listener GCKSessionManager se fait donc indépendamment
+  // (ensureSessionListenerRegistered, appelé depuis isSupported/showPicker/
+  // loadMedia), à l'image du CastModule Android qui l'enregistre dans
+  // initialize() sans dépendre du cycle de vie RN.
+  override func startObserving() {}
+  override func stopObserving() {}
 
   private func emit(_ name: String, _ body: [String: Any]?) {
-    if hasListeners { sendEvent(withName: name, body: body) }
+    sendEvent(withName: name, body: body)
   }
 
   // MARK: - Méthodes exposées à JS
@@ -198,6 +188,16 @@ class CastModule: RCTEventEmitter {
   }
 
 #if canImport(GoogleCast)
+  private var sessionListenerRegistered = false
+
+  /// Enregistre le listener de session Cast une seule fois, indépendamment du
+  /// cycle de vie RCTEventEmitter (voir commentaire sur startObserving plus haut).
+  private func ensureSessionListenerRegistered() {
+    if sessionListenerRegistered { return }
+    sessionListenerRegistered = true
+    GCKCastContext.sharedInstance().sessionManager.add(self)
+  }
+
   /// Démarre le scan réseau Bonjour si nécessaire.
   ///
   /// Le SDK Google Cast ne lance la découverte automatiquement que lorsqu'un
@@ -211,6 +211,7 @@ class CastModule: RCTEventEmitter {
   /// apparaître la popup de permission iOS et permet de trouver les Chromecast.
   /// Idempotent : ne relance pas si déjà en cours.
   private func startDiscoveryIfNeeded() {
+    ensureSessionListenerRegistered()
     let dm = GCKCastContext.sharedInstance().discoveryManager
     dm.passiveScan = false
     if dm.discoveryState != .running {
