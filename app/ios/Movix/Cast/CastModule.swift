@@ -246,13 +246,17 @@ class CastModule: RCTEventEmitter {
     presentExpandedControlsWithRetry(0)
   }
 
-  /// Présente les contrôles Cast natifs plein écran. `presentDefaultExpanded…`
-  /// renvoie `false` tant que le média n'a pas démarré sur le récepteur (ou si
-  /// le picker est encore en cours de fermeture) : on réessaie quelques fois.
+  /// Présente les contrôles Cast natifs plein écran. La présentation n'aboutit
+  /// que lorsque le récepteur a un média actif (`mediaStatus != nil`) : on
+  /// attend donc que le média ait démarré sur la TV avant de présenter, en
+  /// réessayant quelques fois (le `loadMedia` étant asynchrone côté Chromecast).
   private func presentExpandedControlsWithRetry(_ attempt: Int) {
     DispatchQueue.main.async {
-      let ok = GCKCastContext.sharedInstance().presentDefaultExpandedMediaControls()
-      if !ok && attempt < 6 {
+      let client = GCKCastContext.sharedInstance()
+        .sessionManager.currentCastSession?.remoteMediaClient
+      if client?.mediaStatus != nil {
+        GCKCastContext.sharedInstance().presentDefaultExpandedMediaControls()
+      } else if attempt < 8 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
           self.presentExpandedControlsWithRetry(attempt + 1)
         }
