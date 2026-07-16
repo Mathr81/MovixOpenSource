@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.7
+// @version      1.4.8
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -24,6 +24,8 @@
 // @match        https://*.movix.golf/*
 // @match        https://movix.date/*
 // @match        https://*.movix.date/*
+// @match        https://movix.show/*
+// @match        https://*.movix.show/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -41,7 +43,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-    version: "1.4.7",
+    version: "1.4.8",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -1039,7 +1041,7 @@
    */
 
   // ===== Configuration =====
-  const PROXY_BASE = "https://proxiesembed.movix.date";
+  const PROXY_BASE = "https://proxiesembed.movix.show";
 
   // AES constants for SeekStreaming (embed4me)
   const SEEKSTREAMING_AES_KEY_HEX =
@@ -2408,7 +2410,7 @@
     typeof location !== "undefined" &&
     (location.hostname === "localhost" || location.hostname === "127.0.0.1")
       ? "http://localhost:25565"
-      : "https://api.movix.date";
+      : "https://api.movix.show";
   const STREAM_PROXY_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -2433,7 +2435,6 @@
       seekstreaming: true,
     },
     livetv: {
-      linkzy: true,
       wiflix: true,
       sosplay: true,
       livetv: true,
@@ -2564,6 +2565,7 @@
             "movix.golf",
             "movix.chat",
             "movix.date",
+            "movix.show",
           ],
           resourceTypes: [
             "xmlhttprequest",
@@ -2590,7 +2592,6 @@
    */
   function getLiveTvSourceKey(catalogId) {
     if (!catalogId || typeof catalogId !== "string") return null;
-    if (catalogId.startsWith("linkzy_")) return "linkzy";
     if (catalogId.startsWith("wiflix_")) return "wiflix";
     if (catalogId.startsWith("sosplay_")) return "sosplay";
     if (catalogId.startsWith("livetv_")) return "livetv";
@@ -2977,13 +2978,15 @@
         currentHostname.endsWith(".movix.chat") ||
         currentHostname === "movix.date" ||
         currentHostname.endsWith(".movix.date") ||
+        currentHostname === "movix.show" ||
+        currentHostname.endsWith(".movix.show") ||
         currentHostname.endsWith(".movix.golf")
       ) {
-        return (currentOrigin || "https://movix.date").replace(/\/$/, "");
+        return (currentOrigin || "https://movix.show").replace(/\/$/, "");
       }
     } catch {}
 
-    return "https://movix.date";
+    return "https://movix.show";
   }
 
   function buildBackendApiHeaders(accessKey, extraHeaders = {}) {

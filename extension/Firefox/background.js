@@ -13,7 +13,7 @@ const LIVETV_EMBED_REFERER = LIVETV_BASE_URL;
 // Dev override: when the requesting page is localhost (Vite dev on :3000),
 // talk to the local backend (:25565) instead of prod. Set per-message from
 // the sender origin (see maybeUseLocalApi in the onMessage listener below).
-const PROD_API_BASE_URL = "https://api.movix.date";
+const PROD_API_BASE_URL = "https://api.movix.show";
 const LOCAL_API_BASE_URL = "http://localhost:25565";
 let API_BASE_URL = PROD_API_BASE_URL;
 
@@ -49,7 +49,7 @@ const DEFAULT_EXTRACTION_PREFS = {
     sibnet: true, uqload: true, doodstream: true, seekstreaming: true,
   },
   livetv: {
-    linkzy: true, wiflix: true, sosplay: true, livetv: true, matches: true,
+    wiflix: true, sosplay: true, livetv: true, matches: true,
   },
 };
 let extractionPrefs = DEFAULT_EXTRACTION_PREFS;
@@ -142,6 +142,7 @@ async function setupRules() {
           "movix.chat",
           "movix.golf",
           "movix.date",
+          "movix.show",
         ],
         resourceTypes: [
           "xmlhttprequest",
@@ -168,7 +169,6 @@ async function setupRules() {
  */
 function getLiveTvSourceKey(catalogId) {
   if (!catalogId || typeof catalogId !== 'string') return null;
-  if (catalogId.startsWith('linkzy_')) return 'linkzy';
   if (catalogId.startsWith('wiflix_')) return 'wiflix';
   if (catalogId.startsWith('sosplay_')) return 'sosplay';
   if (catalogId.startsWith('livetv_')) return 'livetv';
@@ -502,8 +502,8 @@ function handleDetectEmbeds(payload) {
 function buildBackendApiHeaders(accessKey, extraHeaders = {}) {
   const headers = {
     Accept: "application/json",
-    Origin: "https://movix.date",
-    Referer: "https://movix.date/",
+    Origin: "https://movix.show",
+    Referer: "https://movix.show/",
     ...extraHeaders,
   };
 
