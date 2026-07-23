@@ -96,7 +96,7 @@ movix-main/
 ## Démarrage rapide
 
 <p align="center">
-  <strong>⚠️ L'utilisation de ce code implique le maintien des crédits et l'interdiction stricte de le monétiser (Zéro pub). Voir la License complète </strong>
+  <strong>⚠️ L'utilisation de ce code implique le maintien des crédits et l'interdiction stricte de le monétiser (Zéro pub et abonnements). Voir la License complète </strong>
 </p>
 
 ### Prérequis
