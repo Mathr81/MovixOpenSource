@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.8
+// @version      1.4.9
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -43,7 +43,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-    version: "1.4.8",
+    version: "1.4.9",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -1093,6 +1093,70 @@
 
   // Dean Edwards packer signature — split to avoid Chrome Web Store code scanner false positives
   const PACKER_MARKER = "ev" + "al(func" + "tion(p,a,c,k,e,";
+  const PACKER_SIGNATURE_PATTERN = new RegExp(
+    "ev" +
+      "al\\s*\\(\\s*function\\s*\\(\\s*p\\s*,\\s*a\\s*,\\s*c\\s*,\\s*k\\s*,\\s*e\\s*,\\s*d\\s*\\)",
+  );
+
+  const UQLOAD_ROOT_DOMAINS = Object.freeze([
+    "uqload.is",
+    "uqload.bz",
+    "uqload.cx",
+    "uqload.com",
+    "uqload.net",
+    "uqload.org",
+    "uqload.to",
+    "uqload.io",
+    "uqload.co",
+  ]);
+
+  function getUqloadRootDomain(hostname) {
+    const host = String(hostname || "")
+      .toLowerCase()
+      .replace(/\.$/, "");
+    return (
+      UQLOAD_ROOT_DOMAINS.find(
+        (root) => host === root || host.endsWith(`.${root}`),
+      ) || null
+    );
+  }
+
+  function parseAllowedUqloadUrl(rawUrl) {
+    let parsed;
+    try {
+      parsed = new URL(String(rawUrl || "").trim());
+    } catch {
+      throw new Error("Invalid Uqload URL");
+    }
+
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      (parsed.port && parsed.port !== "443") ||
+      !getUqloadRootDomain(parsed.hostname)
+    ) {
+      throw new Error("Invalid Uqload URL");
+    }
+    return parsed;
+  }
+
+  function normalizeUqloadEmbedUrl(rawUrl) {
+    const parsed = parseAllowedUqloadUrl(rawUrl);
+    const lastPart = parsed.pathname.split("/").filter(Boolean).pop() || "";
+    const videoId = lastPart
+      .replace(/^embed-/i, "")
+      .replace(/\.html$/i, "");
+    if (!/^[a-z0-9_-]+$/i.test(videoId)) {
+      throw new Error("Invalid Uqload URL");
+    }
+    return `${parsed.origin}/embed-${videoId}.html`;
+  }
+
+  function getUqloadSiteOrigin(rawUrl) {
+    const parsed = parseAllowedUqloadUrl(rawUrl);
+    return `https://${getUqloadRootDomain(parsed.hostname)}`;
+  }
 
   function md5Hash(str) {
     // Simple hash for cache keys (not cryptographic, just for dedup)
@@ -1256,10 +1320,10 @@
    *                        packed block was found
    */
   function decodePackedScriptFromHtml(html) {
-    // Step 1: Locate the packed script marker in the HTML
-    const packerMarker = PACKER_MARKER;
-    const markerIndex = html.indexOf(packerMarker);
-    if (markerIndex === -1) return null;
+    // Step 1: Locate the packed script marker while tolerating formatter whitespace.
+    const markerMatch = PACKER_SIGNATURE_PATTERN.exec(html);
+    if (!markerMatch) return null;
+    const markerIndex = markerMatch.index;
 
     // Step 2: Find the .split('|') call that marks the end of the keyword
     // list — this tells us where the packed block ends
@@ -1289,6 +1353,15 @@
     const radix = parseInt(match[2]);
     const keywordCount = parseInt(match[3]);
     const keywords = match[4].split("|");
+    if (
+      radix < 2 ||
+      radix > 62 ||
+      keywordCount < 0 ||
+      keywordCount > 10000 ||
+      keywordCount > keywords.length
+    ) {
+      return null;
+    }
 
     // Step 6: Decode and return the original script
     return decodeDeanEdwardsPacker(
@@ -1296,6 +1369,33 @@
       radix,
       keywordCount,
       keywords,
+    );
+  }
+
+  function extractUqloadMediaUrl(html) {
+    const candidates = [];
+    const collect = (value) => {
+      const normalized = String(value || "").replace(/\\\//g, "/");
+      for (const match of normalized.matchAll(/https:\/\/[^\s"'\\<>]+/gi)) {
+        const candidate = match[0].replace(/[),;]+$/, "");
+        try {
+          parseAllowedUqloadUrl(candidate);
+          candidates.push(candidate);
+        } catch {
+          // Ignore URLs outside the Uqload domain allowlist.
+        }
+      }
+    };
+
+    collect(html);
+    const decoded = decodePackedScriptFromHtml(html);
+    if (decoded) collect(decoded);
+
+    return (
+      candidates.find((url) => /\/master\.m3u8(?:[?#]|$)/i.test(url)) ||
+      candidates.find((url) => /\.m3u8(?:[?#]|$)/i.test(url)) ||
+      candidates.find((url) => /\/v\.mp4(?:[?#]|$)/i.test(url)) ||
+      null
     );
   }
 
@@ -1847,7 +1947,7 @@
   }
 
   /**
-   * Extract MP4 from Uqload embed
+   * Extract HLS or MP4 from Uqload embed
    */
   async function extractUqload(uqloadUrl) {
     console.log(`[EXT-UQLOAD] Extracting from: ${uqloadUrl}`);
@@ -1856,32 +1956,21 @@
     const cached = caches.uqload.get(cacheKey);
     if (cached) return { ...cached, fromCache: true };
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-
-      // Normalize URL
-      let normalized = uqloadUrl.replace(
-        /uqload\.(cx|com|net|co)/gi,
-        "uqload.bz",
-      );
-
-      // Validate and format
-      const parts = normalized.split("/");
-      const base = parts.slice(0, -1).join("/") || "https://uqload.bz";
-      let videoId = parts[parts.length - 1];
-
-      if (!videoId.includes(".html")) videoId += ".html";
-      if (!videoId.includes("embed-")) videoId = "embed-" + videoId;
-      const fullUrl = `${base}/${videoId}`;
-
+      const fullUrl = normalizeUqloadEmbedUrl(uqloadUrl);
+      const siteOrigin = getUqloadSiteOrigin(fullUrl);
       const headers = {
         "User-Agent": "Mozilla/5.0 Chrome/91.0.0.0",
         Accept: "text/html,*/*",
+        Referer: `${siteOrigin}/`,
+        Origin: siteOrigin,
       };
 
-      // Try embed and non-embed versions
-      const urls = [fullUrl, fullUrl.replace("embed-", "")];
+      // Try embed and non-embed versions without leaving the validated host.
+      const urls = [fullUrl, fullUrl.replace("/embed-", "/")];
       let html = null;
 
       for (const url of urls) {
@@ -1896,23 +1985,12 @@
         }
       }
 
-      clearTimeout(timer);
       if (!html)
         return { success: false, error: "Uqload: Could not fetch page" };
       if (html.includes("File was deleted"))
         return { success: false, error: "Uqload: File was deleted" };
 
-      // Préférer le HLS master.m3u8 (multi-bitrate) au mp4 single-quality
-      const m3u8Matches =
-        html.match(/https?:\/\/[^"'\s]+\/master\.m3u8/g) ||
-        html.match(/https?:\/\/[^"'\s]+\.m3u8/g);
-      let videoUrl = m3u8Matches?.[0];
-
-      if (!videoUrl) {
-        const mp4Matches = html.match(/https?:\/\/.+\/v\.mp4/g);
-        videoUrl = mp4Matches?.[0];
-      }
-
+      const videoUrl = extractUqloadMediaUrl(html);
       if (!videoUrl)
         return { success: false, error: "Uqload: video URL not found" };
 
@@ -1922,6 +2000,8 @@
     } catch (e) {
       console.error("[EXT-UQLOAD] Error:", e);
       return { success: false, error: e.message || "Uqload extraction failed" };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -2136,7 +2216,7 @@
     vidzy: (url) => url.toLowerCase().includes("vidzy"),
     vidmoly: (url) => url.toLowerCase().includes("vidmoly"),
     sibnet: (url) => url.toLowerCase().includes("sibnet.ru"),
-    uqload: (url) => /uqload\.(cx|com|bz|net|org|to|io|co)/i.test(url),
+    uqload: (url) => /uqload\.(is|cx|com|bz|net|org|to|io|co)/i.test(url),
     doodstream: (url) => {
       const lower = url.toLowerCase();
       return (
@@ -2282,6 +2362,7 @@
     // - Embed page (fsvid.lol/embed-xxx) → fs13.lol (required by fsvid to serve content)
     // - CDN/M3U8 (s1.fsvid.lol, s2.fsvid.lol, etc.) → fsvid.lol (required by CDN)
     let fsvidHeaders;
+    let uqloadHeaders;
     if (type === "fsvid" && url) {
       try {
         const hostname = new URL(url).hostname;
@@ -2305,6 +2386,14 @@
         };
       }
     }
+    if (type === "uqload" && url) {
+      try {
+        const origin = getUqloadSiteOrigin(url);
+        uqloadHeaders = { Referer: `${origin}/`, Origin: origin };
+      } catch {
+        return null;
+      }
+    }
 
     const headerMap = {
       voe: { Referer: "https://voe.sx/", Origin: "https://voe.sx" },
@@ -2321,7 +2410,7 @@
         Referer: "https://video.sibnet.ru/",
         Origin: "https://video.sibnet.ru",
       },
-      uqload: { Referer: "https://uqload.bz/", Origin: "https://uqload.bz" },
+      uqload: uqloadHeaders,
       doodstream: {
         Referer: referer || "https://d0000d.com/",
         Origin: referer ? new URL(referer).origin : "https://d0000d.com",

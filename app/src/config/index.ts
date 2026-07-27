@@ -1,5 +1,5 @@
 export const CONFIG = {
-  SITE_URL: 'https://movix.cash',
+  SITE_URL: 'https://movix.tax',
   DNS_PRIMARY: '1.1.1.1',
   DNS_SECONDARY: '1.0.0.1',
   DNS_DOH_URL: 'https://cloudflare-dns.com/dns-query',
@@ -19,7 +19,7 @@ export const UPDATE_CHECK = {
 };
 
 export const FALLBACK_CONFIG = {
-  PRIMARY_URL: 'https://movix.cash',
-  GITHUB_URL: 'https://github.com/movixcorp/MovixOpenSource',
+  PRIMARY_URL: 'https://movix.tax',
+  GITHUB_URL: 'https://github.com/Movix-STMG/MovixOpenSource',
   TELEGRAM_URL: 'https://t.me/movix_site',
 };

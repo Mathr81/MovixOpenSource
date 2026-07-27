@@ -7,6 +7,7 @@
  */
 
 import { type RefObject } from 'react';
+import { NativeModules } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   getCurrentDeviceName,
@@ -177,7 +178,12 @@ async function handleCastShimMessage(
 
 export interface BridgeRequest {
   id: string;
-  type: 'GM_FETCH' | 'GM_GET_VALUE' | 'GM_SET_VALUE' | 'GM_DELETE_VALUE';
+  type:
+    | 'GM_FETCH'
+    | 'GM_OPEN_MEDIA_PROXY'
+    | 'GM_GET_VALUE'
+    | 'GM_SET_VALUE'
+    | 'GM_DELETE_VALUE';
   url?: string;
   method?: string;
   headers?: Record<string, string>;
@@ -204,10 +210,76 @@ const storage = new Map<string, any>();
 
 function parseResponseHeaders(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
-  headers.forEach((value, key) => {
+  headers.forEach((value: string, key: string) => {
     result[key.toLowerCase()] = value;
   });
   return result;
+}
+
+interface MediaProxyNativeModule {
+  open: (
+    url: string,
+    method: string,
+    headers: Record<string, string>,
+  ) => Promise<string>;
+}
+
+async function handleGMOpenMediaProxy(
+  req: BridgeRequest,
+): Promise<BridgeResponse> {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (
+    !req.url ||
+    !/^https:\/\//i.test(req.url) ||
+    (method !== 'GET' && method !== 'HEAD')
+  ) {
+    return {
+      id: req.id,
+      success: false,
+      error: 'Invalid local media proxy request',
+    };
+  }
+
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(req.headers || {}).slice(0, 32)) {
+    if (
+      key.length <= 128 &&
+      value.length <= 8192 &&
+      !/[\r\n]/.test(key) &&
+      !/[\r\n]/.test(value)
+    ) {
+      headers[key] = value;
+    }
+  }
+
+  const mediaProxy = NativeModules.MediaProxy as
+    | MediaProxyNativeModule
+    | undefined;
+  if (!mediaProxy?.open) {
+    return {
+      id: req.id,
+      success: false,
+      error: 'Local media proxy unavailable',
+    };
+  }
+
+  try {
+    const localUrl = await mediaProxy.open(req.url, method, headers);
+    if (!/^http:\/\/127\.0\.0\.1:\d+\/p\//i.test(localUrl)) {
+      throw new Error('Invalid loopback response');
+    }
+    return {
+      id: req.id,
+      success: true,
+      value: localUrl,
+    };
+  } catch {
+    return {
+      id: req.id,
+      success: false,
+      error: 'Local media proxy unavailable',
+    };
+  }
 }
 
 const HEADER_RULES: Array<{ match: RegExp; headers: Record<string, string> }> = [
@@ -381,6 +453,9 @@ export async function handleBridgeMessage(
   let response: BridgeResponse;
 
   switch (req.type) {
+    case 'GM_OPEN_MEDIA_PROXY':
+      response = await handleGMOpenMediaProxy(req);
+      break;
     case 'GM_FETCH':
       response = await handleGMFetch(req);
       break;

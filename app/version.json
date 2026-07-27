@@ -1,13 +1,13 @@
 {
-  "version": "2.5.3",
-  "buildNumber": 12,
+  "version": "2.5.4",
+  "buildNumber": 13,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72023883,
-  "apkSha256": "6e63593a1c47cee9cf60414219e4e05ef11c7a72e77256ebaffb65af1cc8e977",
-  "mandatory": false,
-  "releasedAt": "2026-05-10T09:47:30.589Z",
+  "apkSizeBytes": 72100426,
+  "apkSha256": "c87f2580fd55e136859f3171bdc6b4cd7bb1f5fffeecf8b60eef791665c8d3ff",
+  "mandatory": true,
+  "releasedAt": "2026-07-27T12:41:10.712Z",
   "releaseNotes": {
-    "fr": "Correction extraction du lecteur Uqload\nL'écran se s'etteint plus lors de l'utilisation de l'app",
-    "en": ""
+    "fr": "Correction des lecteurs Nexus et Bravo.\nCorrection de l'extraction Uqload.\nCorrection de la mise à jour automatique.\nL'écran ne s'éteint plus pendant l'utilisation de l'application.\nCorrection des proxys locaux Vidzy, Fsvid, Bravo et des autres sources protégées.",
+    "en": "Fixed Nexus and Bravo players.\nFixed Uqload extraction.\nFixed automatic update installation.\nThe screen now stays awake while the app is in use.\nFixed local proxies for Vidzy, Fsvid, Bravo, and other protected media sources."
   }
 }

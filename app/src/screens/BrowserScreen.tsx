@@ -7,8 +7,7 @@ import {
   Platform,
   Modal,
   TouchableOpacity,
-  Image,
-  Animated,
+  ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -45,8 +44,6 @@ export default function BrowserScreen() {
   const [currentUrl, setCurrentUrl] = useState('');
   const [dnsEnabled, setDnsEnabled] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
-  const [webViewReady, setWebViewReady] = useState(false);
-  const splashFade = useRef(new Animated.Value(1)).current;
 
   const activeUrl = urlChain[mirrorIndex] ?? '';
 
@@ -98,15 +95,6 @@ export default function BrowserScreen() {
     [activeUrl, mirrorIndex, urlChain.length],
   );
 
-  const onWebViewLoadEnd = useCallback(() => {
-    if (webViewReady) return;
-    Animated.timing(splashFade, {
-      toValue: 0,
-      duration: 400,
-      useNativeDriver: true,
-    }).start(() => setWebViewReady(true));
-  }, [webViewReady, splashFade]);
-
   const closeSettings = useCallback(() => {
     setSettingsVisible(false);
     AsyncStorage.getItem('dns_enabled').then(val => {
@@ -117,34 +105,36 @@ export default function BrowserScreen() {
   const onRetry = useCallback(async () => {
     setAllMirrorsFailed(false);
     setMirrorIndex(0);
-    setWebViewReady(false);
-    splashFade.setValue(1);
     await refresh();
-  }, [refresh, splashFade]);
+  }, [refresh]);
 
-  const showWebView = !isLoading && !!config && !allMirrorsFailed;
-  const showSplash = (!webViewReady || isLoading || !config) && !allMirrorsFailed;
+  if (isLoading || !config) {
+    return (
+      <View style={[styles.container, styles.centered, { paddingTop: insets.top }]}>
+        <ActivityIndicator size="large" color="#8b5cf6" />
+      </View>
+    );
+  }
+
+  if (allMirrorsFailed) {
+    return (
+      <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
+    );
+  }
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      {showWebView && (
-        <View style={styles.webViewContainer}>
-          <WebViewBrowser
-            key={activeUrl}
-            ref={webViewRef}
-            url={activeUrl}
-            onNavigationStateChange={onNavigationStateChange}
-            onError={onWebViewError}
-            onLoadEnd={onWebViewLoadEnd}
-          />
-        </View>
-      )}
+      <View style={styles.webViewContainer}>
+        <WebViewBrowser
+          key={activeUrl}
+          ref={webViewRef}
+          url={activeUrl}
+          onNavigationStateChange={onNavigationStateChange}
+          onError={onWebViewError}
+        />
+      </View>
 
-      {allMirrorsFailed && config && (
-        <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
-      )}
-
-      {!toolbarHidden && showWebView && (
+      {!toolbarHidden && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -163,39 +153,23 @@ export default function BrowserScreen() {
         </View>
       )}
 
-      {showWebView && (
-        <Modal
-          visible={settingsVisible}
-          animationType="slide"
-          onRequestClose={closeSettings}>
-          <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
-            <View style={styles.modalHeader}>
-              <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
-                <Text style={styles.closeText}>Fermer</Text>
-              </TouchableOpacity>
-              <Text style={styles.modalTitle}>Paramètres</Text>
-              <View style={styles.closeButton} />
-            </View>
-            <SettingsScreen />
+      <Modal
+        visible={settingsVisible}
+        animationType="slide"
+        onRequestClose={closeSettings}>
+        <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
+          <View style={styles.modalHeader}>
+            <TouchableOpacity onPress={closeSettings} style={styles.closeButton}>
+              <Text style={styles.closeText}>Fermer</Text>
+            </TouchableOpacity>
+            <Text style={styles.modalTitle}>Paramètres</Text>
+            <View style={styles.closeButton} />
           </View>
-        </Modal>
-      )}
+          <SettingsScreen />
+        </View>
+      </Modal>
 
-      {navBarHidden && showWebView && (
-        <MiniPill onPress={() => setSettingsVisible(true)} />
-      )}
-
-      {showSplash && (
-        <Animated.View
-          style={[StyleSheet.absoluteFillObject, styles.splash, { opacity: splashFade }]}
-          pointerEvents="none">
-          <Image
-            source={require('../../assets/movix512.png')}
-            style={styles.splashLogo}
-            resizeMode="contain"
-          />
-        </Animated.View>
-      )}
+      {navBarHidden && <MiniPill onPress={() => setSettingsVisible(true)} />}
     </View>
   );
 }
@@ -204,6 +178,10 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0a0a0a',
+  },
+  centered: {
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   webViewContainer: {
     flex: 1,
@@ -234,14 +212,5 @@ const styles = StyleSheet.create({
     color: '#8b5cf6',
     fontSize: 15,
     fontWeight: '500',
-  },
-  splash: {
-    backgroundColor: '#B5302C',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  splashLogo: {
-    width: 150,
-    height: 150,
   },
 });
