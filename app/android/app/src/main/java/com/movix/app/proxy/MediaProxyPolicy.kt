@@ -4,6 +4,8 @@ import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URI
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 
 object MediaProxyPolicy {
@@ -12,6 +14,10 @@ object MediaProxyPolicy {
     private val tokenPattern = Regex("^[A-Za-z0-9_-]{8,128}$")
     private val numericIpv4Pattern = Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")
     private val uriAttributePattern = Regex("""URI=(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
+    private val subtitleMediaPattern = Regex(
+        """(?:^|[:,])\s*TYPE\s*=\s*SUBTITLES(?:\s*,|$)""",
+        RegexOption.IGNORE_CASE,
+    )
     private val allowedRequestHeaders = mapOf(
         "accept" to "Accept",
         "accept-language" to "Accept-Language",
@@ -133,18 +139,44 @@ object MediaProxyPolicy {
         val baseUri = runCatching { URI(baseUrl) }
             .getOrElse { throw IllegalArgumentException("Invalid playlist base URL") }
 
-        fun rewrite(rawValue: String): String {
+        fun resolve(rawValue: String): String? {
             val value = rawValue.trim()
             if (
                 value.isEmpty() ||
                 value.startsWith("data:", ignoreCase = true) ||
                 value.startsWith("blob:", ignoreCase = true)
             ) {
-                return rawValue
+                return null
             }
-            val absolute = runCatching { baseUri.resolve(value).toString() }
-                .getOrElse { return rawValue }
+            return runCatching { baseUri.resolve(value).toString() }.getOrNull()
+        }
+
+        fun rewrite(rawValue: String): String {
+            val absolute = resolve(rawValue) ?: return rawValue
             return localize(absolute)
+        }
+
+        fun wrapDirectSubtitle(rawValue: String): String? {
+            val absolute = resolve(rawValue) ?: return null
+            val path = runCatching {
+                URI(absolute).path.lowercase(Locale.US)
+            }.getOrDefault("")
+            if (!path.endsWith(".vtt") && !path.endsWith(".srt")) return null
+
+            val wrapper = buildString {
+                append("#EXTM3U\n")
+                append("#EXT-X-VERSION:3\n")
+                append("#EXT-X-TARGETDURATION:999999\n")
+                append("#EXT-X-MEDIA-SEQUENCE:0\n")
+                append("#EXTINF:999999.0,\n")
+                append(localize(absolute))
+                append("\n#EXT-X-ENDLIST\n")
+            }
+            val encoded = URLEncoder.encode(
+                wrapper,
+                StandardCharsets.UTF_8.name(),
+            ).replace("+", "%20")
+            return "data:application/vnd.apple.mpegurl,$encoded"
         }
 
         return playlist.lineSequence().joinToString("\n") { line ->
@@ -155,10 +187,18 @@ object MediaProxyPolicy {
                 val trailing = line.takeLastWhile(Char::isWhitespace)
                 leading + rewrite(line.trim()) + trailing
             } else {
+                val directSubtitle =
+                    line.trimStart().startsWith("#EXT-X-MEDIA:", ignoreCase = true) &&
+                        subtitleMediaPattern.containsMatchIn(line)
                 uriAttributePattern.replace(line) { match ->
                     val quote = match.groupValues[1]
                     val value = match.groupValues[2]
-                    "URI=$quote${rewrite(value)}$quote"
+                    val rewritten = if (directSubtitle) {
+                        wrapDirectSubtitle(value) ?: rewrite(value)
+                    } else {
+                        rewrite(value)
+                    }
+                    "URI=$quote$rewritten$quote"
                 }
             }
         }

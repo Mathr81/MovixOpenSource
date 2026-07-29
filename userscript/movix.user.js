@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.9
+// @version      1.4.10
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -24,6 +24,8 @@
 // @match        https://*.movix.golf/*
 // @match        https://movix.date/*
 // @match        https://*.movix.date/*
+// @match        https://movix.fun/*
+// @match        https://*.movix.fun/*
 // @match        https://movix.show/*
 // @match        https://*.movix.show/*
 // @grant        GM_xmlhttpRequest
@@ -43,7 +45,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-    version: "1.4.9",
+    version: "1.4.10",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -1041,7 +1043,7 @@
    */
 
   // ===== Configuration =====
-  const PROXY_BASE = "https://proxiesembed.movix.show";
+  const PROXY_BASE = "https://proxiesembed.movix.fun";
 
   // AES constants for SeekStreaming (embed4me)
   const SEEKSTREAMING_AES_KEY_HEX =
@@ -1370,6 +1372,110 @@
       keywordCount,
       keywords,
     );
+  }
+
+  function extractM3u8UrlFromDecodedScript(script, embedUrl) {
+    const MAX_MEDIA_URL_LENGTH = 16384;
+    const MAX_XOR_PAYLOAD_LENGTH = 32768;
+
+    const normalizeCandidate = (rawCandidate) => {
+      const candidate = String(rawCandidate || "")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/gi, "&")
+        .trim()
+        .replace(/\\+$/, "");
+      if (
+        !candidate ||
+        candidate.length > MAX_MEDIA_URL_LENGTH ||
+        !candidate.toLowerCase().includes(".m3u8")
+      ) {
+        return null;
+      }
+
+      let parsed;
+      try {
+        if (/^https:\/\//i.test(candidate)) {
+          parsed = new URL(candidate);
+        } else if (
+          (candidate.startsWith("/") && !candidate.startsWith("//")) ||
+          candidate.startsWith("./") ||
+          candidate.startsWith("../")
+        ) {
+          parsed = new URL(candidate, embedUrl);
+        } else {
+          return null;
+        }
+      } catch {
+        return null;
+      }
+
+      if (
+        parsed.protocol !== "https:" ||
+        !parsed.hostname ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        !parsed.pathname.toLowerCase().includes(".m3u8") ||
+        parsed.href.length > MAX_MEDIA_URL_LENGTH
+      ) {
+        return null;
+      }
+      return parsed.href;
+    };
+
+    const xorPattern =
+      /var\s+[A-Za-z_$][\w$]*\s*=\s*\[([0-9,\s]+)\]\s*,\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,2000}?\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    for (const match of String(script || "").matchAll(xorPattern)) {
+      const key = match[1].split(",").map((value) => Number(value.trim()));
+      if (
+        key.length < 1 ||
+        key.length > 64 ||
+        key.some(
+          (value) => !Number.isInteger(value) || value < 0 || value > 255,
+        )
+      ) {
+        continue;
+      }
+
+      const payload = match[2];
+      if (payload.length > MAX_XOR_PAYLOAD_LENGTH) continue;
+      const normalizedPayload = payload.replace(/-/g, "+").replace(/_/g, "/");
+      if (normalizedPayload.length % 4 === 1) continue;
+      const paddedPayload = normalizedPayload.padEnd(
+        normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+        "=",
+      );
+
+      try {
+        const encrypted = atob(paddedPayload);
+        const decodedBytes = Uint8Array.from(
+          encrypted,
+          (character, index) =>
+            character.charCodeAt(0) ^ key[index % key.length],
+        );
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+          decodedBytes,
+        );
+        const candidate = normalizeCandidate(decoded);
+        if (candidate) return candidate;
+      } catch {
+        // Try the legacy formats below.
+      }
+    }
+
+    const legacyPatterns = [
+      /sources:\s*\[\s*\{[^}]*?src:\s*["']([^"']+\.m3u8[^"']*)["']/,
+      /src:\s*["']([^"']+\.m3u8[^"']*)["']/,
+      /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
+      /sources:\s*\[\s*\{[^}]*?["']([^"']+\.m3u8[^"']*)["']/,
+      /["']([^"']*\.m3u8[^"']*)["']/,
+    ];
+    for (const pattern of legacyPatterns) {
+      const match = String(script || "").match(pattern);
+      const candidate = match ? normalizeCandidate(match[1]) : null;
+      if (candidate) return candidate;
+    }
+    return null;
   }
 
   function extractUqloadMediaUrl(html) {
@@ -1716,22 +1822,10 @@
         deobfuscated.substring(0, 300),
       );
 
-      let m3u8Url = null;
-      const patterns = [
-        /sources:\s*\[\s*\{[^}]*?src:\s*["']([^"']+\.m3u8[^"']*)["']/,
-        /src:\s*["']([^"']+\.m3u8[^"']*)["']/,
-        /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
-        /["'](https?:\/\/[^"']*\.m3u8[^"']*)["']/,
-      ];
-
-      for (const pat of patterns) {
-        const m = deobfuscated.match(pat);
-        if (m) {
-          m3u8Url = m[1];
-          console.log(`[EXT-FSVID] M3U8 found with pattern ${pat}: ${m3u8Url}`);
-          break;
-        }
-      }
+      const m3u8Url = extractM3u8UrlFromDecodedScript(
+        deobfuscated,
+        fsvidUrl,
+      );
 
       if (!m3u8Url) {
         console.error("[EXT-FSVID] No M3U8 URL found in deobfuscated script");
@@ -1739,7 +1833,6 @@
         return { success: false, error: "Fsvid: M3U8 not found in script" };
       }
 
-      m3u8Url = m3u8Url.replace(/\\\//g, "/");
       console.log(`[EXT-FSVID] Final M3U8 URL: ${m3u8Url}`);
       const result = { m3u8Url, success: true, source: "fsvid" };
       caches.fsvid.set(cacheKey, result);
@@ -1788,21 +1881,10 @@
       if (!deobfuscated)
         return { success: false, error: "Vidzy: Deobfuscation failed" };
 
-      // Try multiple M3U8 patterns
-      const patterns = [
-        /file:\s*["']([^"']+\.m3u8[^"']*)['"]/,
-        /sources:\s*\[["']([^"']+\.m3u8[^"']*)['"]/,
-        /["']([^"']*\.m3u8[^"']*)['"]/,
-      ];
-
-      let m3u8Url = null;
-      for (const pat of patterns) {
-        const m = deobfuscated.match(pat);
-        if (m) {
-          m3u8Url = m[1];
-          break;
-        }
-      }
+      const m3u8Url = extractM3u8UrlFromDecodedScript(
+        deobfuscated,
+        vidzyUrl,
+      );
 
       if (!m3u8Url)
         return { success: false, error: "Vidzy: M3U8 not found in script" };
@@ -2499,7 +2581,7 @@
     typeof location !== "undefined" &&
     (location.hostname === "localhost" || location.hostname === "127.0.0.1")
       ? "http://localhost:25565"
-      : "https://api.movix.show";
+      : "https://api.movix.fun";
   const STREAM_PROXY_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -2654,6 +2736,7 @@
             "movix.golf",
             "movix.chat",
             "movix.date",
+            "movix.fun",
             "movix.show",
           ],
           resourceTypes: [
@@ -3067,15 +3150,17 @@
         currentHostname.endsWith(".movix.chat") ||
         currentHostname === "movix.date" ||
         currentHostname.endsWith(".movix.date") ||
+        currentHostname === "movix.fun" ||
+        currentHostname.endsWith(".movix.fun") ||
         currentHostname === "movix.show" ||
         currentHostname.endsWith(".movix.show") ||
         currentHostname.endsWith(".movix.golf")
       ) {
-        return (currentOrigin || "https://movix.show").replace(/\/$/, "");
+        return (currentOrigin || "https://movix.fun").replace(/\/$/, "");
       }
     } catch {}
 
-    return "https://movix.show";
+    return "https://movix.fun";
   }
 
   function buildBackendApiHeaders(accessKey, extraHeaders = {}) {

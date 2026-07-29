@@ -5,7 +5,7 @@
  */
 
 // ===== Configuration =====
-const PROXY_BASE = 'https://proxiesembed.movix.show';
+const PROXY_BASE = 'https://proxiesembed.movix.fun';
 
 // AES constants for SeekStreaming (embed4me)
 const SEEKSTREAMING_AES_KEY_HEX = '6b69656d7469656e6d7561393131636131323334353637383930';
@@ -298,6 +298,105 @@ function decodePackedScriptFromHtml(html) {
     return decodeDeanEdwardsPacker(packedTemplate, radix, keywordCount, keywords);
 }
 
+function extractM3u8UrlFromDecodedScript(script, embedUrl) {
+    const MAX_MEDIA_URL_LENGTH = 16384;
+    const MAX_XOR_PAYLOAD_LENGTH = 32768;
+
+    const normalizeCandidate = rawCandidate => {
+        const candidate = String(rawCandidate || '')
+            .replace(/\\\//g, '/')
+            .replace(/&amp;/gi, '&')
+            .trim()
+            .replace(/\\+$/, '');
+        if (
+            !candidate ||
+            candidate.length > MAX_MEDIA_URL_LENGTH ||
+            !candidate.toLowerCase().includes('.m3u8')
+        ) {
+            return null;
+        }
+
+        let parsed;
+        try {
+            if (/^https:\/\//i.test(candidate)) {
+                parsed = new URL(candidate);
+            } else if (
+                (candidate.startsWith('/') && !candidate.startsWith('//')) ||
+                candidate.startsWith('./') ||
+                candidate.startsWith('../')
+            ) {
+                parsed = new URL(candidate, embedUrl);
+            } else {
+                return null;
+            }
+        } catch {
+            return null;
+        }
+
+        if (
+            parsed.protocol !== 'https:' ||
+            !parsed.hostname ||
+            parsed.username ||
+            parsed.password ||
+            (parsed.port && parsed.port !== '443') ||
+            !parsed.pathname.toLowerCase().includes('.m3u8') ||
+            parsed.href.length > MAX_MEDIA_URL_LENGTH
+        ) {
+            return null;
+        }
+        return parsed.href;
+    };
+
+    const xorPattern =
+        /var\s+[A-Za-z_$][\w$]*\s*=\s*\[([0-9,\s]+)\]\s*,\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,2000}?\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    for (const match of String(script || '').matchAll(xorPattern)) {
+        const key = match[1].split(',').map(value => Number(value.trim()));
+        if (
+            key.length < 1 ||
+            key.length > 64 ||
+            key.some(value => !Number.isInteger(value) || value < 0 || value > 255)
+        ) {
+            continue;
+        }
+
+        const payload = match[2];
+        if (payload.length > MAX_XOR_PAYLOAD_LENGTH) continue;
+        const normalizedPayload = payload.replace(/-/g, '+').replace(/_/g, '/');
+        if (normalizedPayload.length % 4 === 1) continue;
+        const paddedPayload = normalizedPayload.padEnd(
+            normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+            '=',
+        );
+
+        try {
+            const encrypted = atob(paddedPayload);
+            const decodedBytes = Uint8Array.from(
+                encrypted,
+                (character, index) => character.charCodeAt(0) ^ key[index % key.length],
+            );
+            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
+            const candidate = normalizeCandidate(decoded);
+            if (candidate) return candidate;
+        } catch {
+            // Try the legacy formats below.
+        }
+    }
+
+    const legacyPatterns = [
+        /sources:\s*\[\s*\{[^}]*?src:\s*["']([^"']+\.m3u8[^"']*)["']/,
+        /src:\s*["']([^"']+\.m3u8[^"']*)["']/,
+        /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
+        /sources:\s*\[\s*\{[^}]*?["']([^"']+\.m3u8[^"']*)["']/,
+        /["']([^"']*\.m3u8[^"']*)["']/,
+    ];
+    for (const pattern of legacyPatterns) {
+        const match = String(script || '').match(pattern);
+        const candidate = match ? normalizeCandidate(match[1]) : null;
+        if (candidate) return candidate;
+    }
+    return null;
+}
+
 function extractUqloadMediaUrl(html) {
     const candidates = [];
     const collect = value => {
@@ -588,22 +687,7 @@ async function extractFsvid(fsvidUrl) {
         console.log(`[EXT-FSVID] Deobfuscated length: ${deobfuscated.length}`);
         console.log('[EXT-FSVID] Deobfuscated snippet:', deobfuscated.substring(0, 300));
 
-        let m3u8Url = null;
-        const patterns = [
-            /sources:\s*\[\s*\{[^}]*?src:\s*["']([^"']+\.m3u8[^"']*)["']/,
-            /src:\s*["']([^"']+\.m3u8[^"']*)["']/,
-            /file:\s*["']([^"']+\.m3u8[^"']*)["']/,
-            /["'](https?:\/\/[^"']*\.m3u8[^"']*)["']/,
-        ];
-
-        for (const pat of patterns) {
-            const m = deobfuscated.match(pat);
-            if (m) {
-                m3u8Url = m[1];
-                console.log(`[EXT-FSVID] M3U8 found with pattern ${pat}: ${m3u8Url}`);
-                break;
-            }
-        }
+        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, fsvidUrl);
 
         if (!m3u8Url) {
             console.error('[EXT-FSVID] No M3U8 URL found in deobfuscated script');
@@ -611,7 +695,6 @@ async function extractFsvid(fsvidUrl) {
             return { success: false, error: 'Fsvid: M3U8 not found in script' };
         }
 
-        m3u8Url = m3u8Url.replace(/\\\//g, '/');
         console.log(`[EXT-FSVID] Final M3U8 URL: ${m3u8Url}`);
         const result = { m3u8Url, success: true, source: 'fsvid' };
         caches.fsvid.set(cacheKey, result);
@@ -656,18 +739,7 @@ async function extractVidzy(vidzyUrl) {
         const deobfuscated = decodePackedScriptFromHtml(html);
         if (!deobfuscated) return { success: false, error: 'Vidzy: Deobfuscation failed' };
 
-        // Try multiple M3U8 patterns
-        const patterns = [
-            /file:\s*["']([^"']+\.m3u8[^"']*)['"]/,
-            /sources:\s*\[["']([^"']+\.m3u8[^"']*)['"]/,
-            /["']([^"']*\.m3u8[^"']*)['"]/
-        ];
-
-        let m3u8Url = null;
-        for (const pat of patterns) {
-            const m = deobfuscated.match(pat);
-            if (m) { m3u8Url = m[1]; break; }
-        }
+        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, vidzyUrl);
 
         if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in script' };
 

@@ -1,6 +1,8 @@
 package com.movix.app.proxy
 
 import java.net.InetAddress
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -15,7 +17,7 @@ class MediaProxyPolicyTest {
             video/720.m3u8
             https://media.example/absolute.ts
             #EXT-X-KEY:METHOD=AES-128,URI="key.bin"
-            #EXT-X-MEDIA:TYPE=SUBTITLES,URI='subs/fr.vtt'
+            #EXT-X-MEDIA:TYPE=SUBTITLES,URI='subs/fr.m3u8'
             #EXT-X-MAP:URI="data:application/octet-stream;base64,AA=="
         """.trimIndent()
 
@@ -27,8 +29,36 @@ class MediaProxyPolicyTest {
         assertTrue(output.contains("LOCAL:https://cdn.example/root/video/720.m3u8"))
         assertTrue(output.contains("LOCAL:https://media.example/absolute.ts"))
         assertTrue(output.contains("URI=\"LOCAL:https://cdn.example/root/key.bin\""))
-        assertTrue(output.contains("URI='LOCAL:https://cdn.example/root/subs/fr.vtt'"))
+        assertTrue(output.contains("URI='LOCAL:https://cdn.example/root/subs/fr.m3u8'"))
         assertTrue(output.contains("URI=\"data:application/octet-stream;base64,AA==\""))
+    }
+
+    @Test
+    fun wrapsDirectSubtitleFilesInAnInlinePlaylist() {
+        val input = """
+            #EXTM3U
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",URI="subs/fr.vtt"
+            video/1080.m3u8
+        """.trimIndent()
+
+        val output = MediaProxyPolicy.rewritePlaylist(
+            input,
+            "https://cdn.example/root/master.m3u8",
+        ) { "LOCAL:$it" }
+
+        val dataUriMatch = Regex(
+            """URI="(data:application/vnd\.apple\.mpegurl,[^"]+)"""",
+        ).find(output)
+        assertTrue("Le sous-titre direct doit devenir une playlist data:", dataUriMatch != null)
+
+        val wrapper = URLDecoder.decode(
+            dataUriMatch!!.groupValues[1].substringAfter(','),
+            StandardCharsets.UTF_8.name(),
+        )
+        assertTrue(wrapper.startsWith("#EXTM3U\n"))
+        assertTrue(wrapper.contains("LOCAL:https://cdn.example/root/subs/fr.vtt"))
+        assertTrue(output.contains("LOCAL:https://cdn.example/root/video/1080.m3u8"))
+        assertFalse(output.contains("URI=\"LOCAL:https://cdn.example/root/subs/fr.vtt\""))
     }
 
     @Test

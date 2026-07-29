@@ -39,6 +39,12 @@ import builtins
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+from uqload_utils import (
+    extract_uqload_media_url,
+    get_uqload_site_origin,
+    normalize_uqload_embed_url,
+    parse_allowed_uqload_url,
+)
 
 # Load local .env from proxiesembed folder
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -1011,8 +1017,8 @@ class ProxyServer:
     RE_FAMILYRESTREAM = re.compile(r'familyrestream\.com', re.IGNORECASE)
     RE_SOSPLAY = re.compile(r'srvagu|6522236688\.shop|vuunov|1396168994\.live', re.IGNORECASE)
     RE_WITV = re.compile(r'lansdrud\.space', re.IGNORECASE)
-    RE_UQLOAD_EMBED = re.compile(r'uqload\.(cx|com|net|bz)/(embed-)?[^/]+\.html', re.IGNORECASE)
-    RE_UQLOAD = re.compile(r'uqload\.(cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
+    RE_UQLOAD_EMBED = re.compile(r'uqload\.(is|cx|com|net|bz|org|to|io|co)/(embed-)?[^/]+\.html', re.IGNORECASE)
+    RE_UQLOAD = re.compile(r'uqload\.(is|cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
     RE_NIGGAFLIX = re.compile(r'cdn\.niggaflix\.xyz', re.IGNORECASE)
     RE_DROPCDN = re.compile(r'dropcdn', re.IGNORECASE)
     RE_SERVERSICURO = re.compile(r'serversicuro', re.IGNORECASE)
@@ -2471,33 +2477,39 @@ class ProxyServer:
     async def _handle_uqload_embed(self, request: Request, target_url: str,
                                     headers: Dict, timeout: ClientTimeout,
                                     range_header: Optional[str], session: aiohttp.ClientSession) -> Response:
-        """Handle UQLOAD embed URLs by extracting and streaming MP4"""
+        """Handle UQLOAD embed URLs by extracting HLS or streaming MP4."""
         try:
             cache_key = hashlib.md5(target_url.encode()).hexdigest()
-            mp4_url = self.uqload_mp4_cache.get(cache_key)
+            media_url = self.uqload_mp4_cache.get(cache_key)
             
-            if not mp4_url:
-                mp4_url = await self._extract_uqload_mp4_url(target_url)
-                self.uqload_mp4_cache.set(cache_key, mp4_url)
+            if not media_url:
+                media_url = await self._extract_uqload_media_url(target_url)
+                self.uqload_mp4_cache.set(cache_key, media_url)
+
+            if '.m3u8' in urlparse(media_url).path.lower():
+                location = f"/uqload-proxy?url={urllib.parse.quote(media_url)}"
+                return web.HTTPFound(location=location, headers=CORS_HEADERS)
+
+            uqload_origin = get_uqload_site_origin(media_url)
             
-            mp4_headers = self._prepare_headers(mp4_url, request)
+            mp4_headers = self._prepare_headers(media_url, request)
             mp4_headers.update({
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity;q=1, *;q=0',
-                'Referer': 'https://uqload.bz/',
-                'Origin': 'https://uqload.bz'
+                'Referer': f'{uqload_origin}/',
+                'Origin': uqload_origin,
             })
             
             if not range_header:
                 # HEAD request for metadata
-                async with session.request('HEAD', mp4_url, headers=mp4_headers,
+                async with session.request('HEAD', media_url, headers=mp4_headers,
                                            timeout=ClientTimeout(total=10)) as resp:
                     resp_headers = self._prepare_stream_headers(resp.headers, 'video/mp4')
                     resp_headers['Accept-Ranges'] = 'bytes'
                     return _safe_response(b'', 200, resp_headers)
             else:
                 mp4_headers['Range'] = range_header
-                async with session.request('GET', mp4_url, headers=mp4_headers,
+                async with session.request('GET', media_url, headers=mp4_headers,
                                            timeout=ClientTimeout(total=None, connect=10, sock_read=30)) as resp:
                     resp_headers = self._prepare_stream_headers(resp.headers, 'video/mp4')
                     resp_headers['Accept-Ranges'] = 'bytes'
@@ -2627,11 +2639,16 @@ class ProxyServer:
             return {'Accept': '*/*'}
         
         if self.RE_UQLOAD.search(target_url):
+            try:
+                uqload_origin = get_uqload_site_origin(target_url)
+            except ValueError:
+                uqload_origin = 'https://uqload.bz'
             return {
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity;q=1, *;q=0',
                 'Host': target_host,
-                'Referer': 'https://uqload.bz/',
+                'Origin': uqload_origin,
+                'Referer': f'{uqload_origin}/',
                 'User-Agent': 'Mozilla/5.0 Chrome/142.0.0.0'
             }
         
@@ -3067,24 +3084,13 @@ class ProxyServer:
                     return web.json_response({'error': 'Script not found'}, status=404)
                 
                 deobfuscated = self._deobfuscate_fsvid_script(script_match.group(0))
-                
-                # Try multiple patterns â€” videojs uses sources:[{src:"..."}]
-                m3u8_match = None
-                for pattern in [
-                    r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'sources:\s*\[\s*\{[^}]*?["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'["\']([^"\']*\.m3u8[^"\']*)["\']',
-                ]:
-                    m3u8_match = re.search(pattern, deobfuscated)
-                    if m3u8_match:
-                        break
-                
-                if not m3u8_match:
+
+                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/fsvid-proxy?url={urllib.parse.quote(m3u8_match.group(1))}",
+                    'm3u8Url': f"{PROXY_BASE}/fsvid-proxy?url={urllib.parse.quote(m3u8_url)}",
                     'source': 'fsvid'
                 }
                 
@@ -3122,6 +3128,67 @@ class ProxyServer:
                 result = re.sub(r'\b' + re.escape(to_base(c, a)) + r'\b', k[c], result)
         
         return result
+
+    def _extract_m3u8_url(self, script: str, embed_url: str) -> Optional[str]:
+        """Extract a plain or Base64/XOR-obfuscated M3U8 URL."""
+        script = script.replace(r"\'", "'").replace(r'\"', '"')
+
+        def normalize(candidate: str) -> Optional[str]:
+            candidate = candidate.replace(r'\/', '/').replace('&amp;', '&').strip().rstrip('\\')
+            if '.m3u8' not in candidate.lower():
+                return None
+
+            parsed = urlparse(candidate)
+            if parsed.scheme in ('http', 'https') and parsed.netloc:
+                return candidate
+
+            if candidate.startswith(('/', './', '../')):
+                return urljoin(embed_url, candidate)
+
+            return None
+
+        # New fsvid/vidzy player format:
+        # (function(s){var k=[...],b=atob(s),r=""; ... XOR ...})("...")
+        xor_pattern = re.compile(
+            r'var\s+[A-Za-z_$][\w$]*\s*=\s*\[(?P<key>[0-9,\s]+)\]\s*,'
+            r'\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)'
+            r'.{0,2000}?\}\)\s*\(\s*["\'](?P<payload>[A-Za-z0-9+/_=-]+)["\']\s*\)',
+            re.DOTALL
+        )
+        for match in xor_pattern.finditer(script):
+            try:
+                key_values = [int(value.strip()) for value in match.group('key').split(',')]
+                if not key_values or len(key_values) > 64 or any(value < 0 or value > 255 for value in key_values):
+                    continue
+
+                payload = match.group('payload')
+                payload += '=' * (-len(payload) % 4)
+                encrypted = base64.b64decode(payload, altchars=b'-_', validate=True)
+                decoded = bytes(
+                    value ^ key_values[index % len(key_values)]
+                    for index, value in enumerate(encrypted)
+                ).decode('utf-8')
+
+                candidate = normalize(decoded)
+                if candidate:
+                    return candidate
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                continue
+
+        # Legacy formats with a directly embedded URL.
+        for pattern in [
+            r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'sources:\s*\[\s*\{[^}]*?["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'["\']([^"\']*\.m3u8[^"\']*)["\']',
+        ]:
+            match = re.search(pattern, script)
+            if match:
+                candidate = normalize(match.group(1))
+                if candidate:
+                    return candidate
+
+        return None
     
     async def vidzy_extract_handler(self, request: Request) -> Response:
         """VIDZY M3U8 extraction"""
@@ -3161,22 +3228,13 @@ class ProxyServer:
                     return web.json_response({'error': 'Script not found'}, status=404)
                 
                 deobfuscated = self._deobfuscate_fsvid_script(script.string)
-                
-                # Try multiple M3U8 patterns
-                for pattern in [
-                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'sources:\s*\[["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'["\']([^"\']*\.m3u8[^"\']*)["\']'
-                ]:
-                    m3u8_match = re.search(pattern, deobfuscated)
-                    if m3u8_match:
-                        break
-                
-                if not m3u8_match:
+
+                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/vidzy-proxy?url={urllib.parse.quote(m3u8_match.group(1))}",
+                    'm3u8Url': f"{PROXY_BASE}/vidzy-proxy?url={urllib.parse.quote(m3u8_url)}",
                     'source': 'vidzy'
                 }
                 
@@ -3323,32 +3381,19 @@ class ProxyServer:
     
     def _validate_uqload_url(self, url: str) -> str:
         """Validate and format UQLOAD URL"""
-        if not url or len(url) < 12:
-            raise ValueError('Invalid URL')
-        
-        parts = url.split('/')
-        base = '/'.join(parts[:-1]) or 'https://uqload.bz'
-        video_id = parts[-1]
-        
-        if '.html' not in video_id:
-            video_id += '.html'
-        if 'embed-' not in video_id:
-            video_id = 'embed-' + video_id
-        
-        full_url = f'{base}/{video_id}'
-        if 'uqload' not in full_url:
-            raise ValueError('Invalid UQLOAD URL')
-        
-        return full_url
+        return normalize_uqload_embed_url(url)
     
-    async def _extract_uqload_mp4_url(self, embed_url: str) -> str:
-        """Extract MP4 URL from UQLOAD embed"""
+    async def _extract_uqload_media_url(self, embed_url: str) -> str:
+        """Extract an HLS or MP4 URL from a UQLOAD embed without executing it."""
         validated = self._validate_uqload_url(embed_url)
-        urls = [validated, validated.replace('embed-', '')]
+        site_origin = get_uqload_site_origin(validated)
+        urls = [validated, validated.replace('/embed-', '/')]
         
         headers = {
             'User-Agent': 'Mozilla/5.0 Chrome/91.0.0.0',
-            'Accept': 'text/html,*/*'
+            'Accept': 'text/html,*/*',
+            'Referer': f'{site_origin}/',
+            'Origin': site_origin,
         }
         
         html = None
@@ -3360,7 +3405,7 @@ class ProxyServer:
                     if resp.status == 200:
                         html = await resp.text()
                         break
-            except:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
         
         if not html:
@@ -3369,11 +3414,11 @@ class ProxyServer:
         if 'File was deleted' in html:
             raise ValueError('Video deleted')
         
-        matches = re.findall(r'https?://.+/v\.mp4', html)
-        if not matches:
-            raise ValueError('MP4 URL not found')
+        media_url = extract_uqload_media_url(html)
+        if not media_url:
+            raise ValueError('Uqload media URL not found')
         
-        return matches[0]
+        return media_url
     
     async def uqload_extract_handler(self, request: Request) -> Response:
         """UQLOAD extraction"""
@@ -3392,13 +3437,13 @@ class ProxyServer:
                 return resp
             
             validated = self._validate_uqload_url(url)
-            mp4_url = await self._extract_uqload_mp4_url(validated)
+            media_url = await self._extract_uqload_media_url(validated)
             
-            if not mp4_url:
+            if not media_url:
                 return web.json_response({'error': 'Extraction failed'}, status=404)
             
             result = {
-                'url': f"{PROXY_BASE}/uqload-proxy?url={urllib.parse.quote(mp4_url)}",
+                'url': f"{PROXY_BASE}/uqload-proxy?url={urllib.parse.quote(media_url)}",
                 'source': 'uqload'
             }
             
@@ -3407,6 +3452,8 @@ class ProxyServer:
             resp.headers['X-Cache'] = 'MISS'
             return resp
             
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
     
@@ -4012,10 +4059,22 @@ class ProxyServer:
     
     async def uqload_proxy_handler(self, request: Request) -> Response:
         """Uqload proxy"""
+        target_url = request.query.get('url')
+        try:
+            parse_allowed_uqload_url(target_url)
+            uqload_origin = get_uqload_site_origin(target_url)
+        except ValueError as exc:
+            return web.json_response(
+                {'error': str(exc)},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+
         return await self._service_proxy(request, 'uqload', {
             'Accept': '*/*',
             'Accept-Encoding': 'identity;q=1, *;q=0',
-            'Referer': 'https://uqload.bz/',
+            'Origin': uqload_origin,
+            'Referer': f'{uqload_origin}/',
             'User-Agent': 'Mozilla/5.0 Chrome/142.0.0.0'
         })
     

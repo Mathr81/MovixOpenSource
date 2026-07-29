@@ -13,7 +13,7 @@ const LIVETV_EMBED_REFERER = LIVETV_BASE_URL;
 // Dev override: when the requesting page is localhost (Vite dev on :3000),
 // talk to the local backend (:25565) instead of prod. Set per-message from
 // the sender origin (see maybeUseLocalApi in the onMessage listener below).
-const PROD_API_BASE_URL = "https://api.movix.show";
+const PROD_API_BASE_URL = "https://api.movix.fun";
 const LOCAL_API_BASE_URL = "http://localhost:25565";
 let API_BASE_URL = PROD_API_BASE_URL;
 
@@ -142,6 +142,7 @@ async function setupRules() {
           "movix.chat",
           "movix.golf",
           "movix.date",
+          "movix.fun",
           "movix.show",
         ],
         resourceTypes: [
@@ -502,8 +503,8 @@ function handleDetectEmbeds(payload) {
 function buildBackendApiHeaders(accessKey, extraHeaders = {}) {
   const headers = {
     Accept: "application/json",
-    Origin: "https://movix.show",
-    Referer: "https://movix.show/",
+    Origin: "https://movix.fun",
+    Referer: "https://movix.fun/",
     ...extraHeaders,
   };
 

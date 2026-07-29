@@ -1,13 +1,13 @@
 {
-  "version": "2.5.4",
-  "buildNumber": 13,
+  "version": "2.5.5",
+  "buildNumber": 14,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72100426,
-  "apkSha256": "c87f2580fd55e136859f3171bdc6b4cd7bb1f5fffeecf8b60eef791665c8d3ff",
+  "apkSizeBytes": 72101334,
+  "apkSha256": "9f719ef70f0dbd5e0842c8648633ae4b2681be9b0ba4eeeea97eb02ce13b82b5",
   "mandatory": true,
-  "releasedAt": "2026-07-27T12:41:10.712Z",
+  "releasedAt": "2026-07-29T11:55:28.799Z",
   "releaseNotes": {
-    "fr": "Correction des lecteurs Nexus et Bravo.\nCorrection de l'extraction Uqload.\nCorrection de la mise à jour automatique.\nL'écran ne s'éteint plus pendant l'utilisation de l'application.\nCorrection des proxys locaux Vidzy, Fsvid, Bravo et des autres sources protégées.",
-    "en": "Fixed Nexus and Bravo players.\nFixed Uqload extraction.\nFixed automatic update installation.\nThe screen now stays awake while the app is in use.\nFixed local proxies for Vidzy, Fsvid, Bravo, and other protected media sources."
+    "fr": "Correction du proxy Bravo sur Android pour les sous-titres VTT/SRT.\nCorrection de l'extraction Fsvid et Vidzy pour le nouveau format Base64/XOR.",
+    "en": "Fixed the Bravo proxy on Android for VTT/SRT subtitles.\nFixed Fsvid and Vidzy extraction for the new Base64/XOR format."
   }
 }

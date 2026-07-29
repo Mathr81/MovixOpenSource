@@ -57,8 +57,8 @@ class MediaProxyServerTest {
                 upstreamUrl = "https://media.example/root/master.m3u8",
                 method = "GET",
                 headers = mapOf(
-                    "Origin" to "https://vidzy.org",
-                    "Referer" to "https://vidzy.org/",
+                    "Origin" to "https://purstream.mx",
+                    "Referer" to "https://purstream.mx/",
                 ),
             )
             val playlistConnection = URL(localMaster).openConnection()
@@ -80,11 +80,11 @@ class MediaProxyServerTest {
             assertEquals("bytes 0-3/4", segmentConnection.getHeaderField("Content-Range"))
             assertEquals(2, requests.size)
             assertEquals(
-                "https://vidzy.org/",
+                "https://purstream.mx/",
                 requests[1].first.headers["Referer"],
             )
             assertEquals(
-                "https://vidzy.org",
+                "https://purstream.mx",
                 requests[1].first.headers["Origin"],
             )
             assertEquals("bytes=0-3", requests[1].second["Range"])
