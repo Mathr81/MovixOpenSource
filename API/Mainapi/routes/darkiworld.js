@@ -1,9 +1,17 @@
 /**
  * DarkiWorld routes module.
- * Extracted from server.js -- handles DarkiWorld download links, decoding,
+ * Extracted from server.js — handles DarkiWorld download links, decoding,
  * seasons and episodes retrieval.
  *
  * Mounted at /api/darkiworld  (paths below are relative to that prefix).
+ *
+ * Under the hydracker freeze (2026-05-15), the list of links and the decode
+ * step come exclusively from the local sqlite snapshots under
+ * `Mainapi/darkino-backups/`. No outbound calls to hydracker.com are made
+ * from this file; the only upstream surface that remains is the seasons
+ * metadata endpoints in `/seasons/:titleId` and `/episodes/:titleId/:seasonNumber`.
+ *
+ * See: docs/superpowers/specs/2026-05-15-hydracker-freeze-sqlite-source-design.md
  */
 
 const express = require('express');
@@ -13,13 +21,106 @@ const fsp = require('fs').promises;
 const { generateCacheKey } = require('../utils/cacheManager');
 const { getAuthIfValid } = require('../middleware/auth');
 const { getPool: getMovixPool } = require('../mysqlPool');
-const hydrackerQueue = require('../utils/hydrackerQueue');
+const darkiworldSqlite = require('../utils/darkiworldSqlite');
+const hydrackerLiveModule = require('../utils/hydrackerLive');
+const { redis: redisClient } = require('../config/redis');
+const axios = require('axios');
 
-// TTL pour les échecs de /decode (ex. "Lien d'embed invalide" persistant côté
-// upstream). On stocke un marker `{ failed: true, failedAt }` au lieu du
-// cachedData habituel, pour servir directement un 404 pendant ce délai sans
-// re-taper hydracker.com à chaque clic.
-const DECODE_FAILED_TTL_MS = 2 * 60 * 60 * 1000;
+// IDs to watch — any decode hit on these fires a Discord alert.
+const SCRAPER_WATCHLIST = new Set(['17084892']);
+
+// Comma-separated IPs in SCRAPER_BLOCKED_IPS env var get poison 200 on /decode.
+// Reload needs restart; use CIDR not supported (exact match only).
+function getRequestIp(req) {
+  return (
+    req.headers['cf-connecting-ip'] ||
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    ''
+  );
+}
+
+function isBlockedScraper(req) {
+  const raw = process.env.SCRAPER_BLOCKED_IPS || '';
+  if (!raw) return false;
+  const ip = getRequestIp(req);
+  return raw.split(',').map(s => s.trim()).includes(ip);
+}
+
+function poisonDecodeResponse(id) {
+  return {
+    success: true,
+    id: String(id),
+    provider: 'direct',
+    embed_url: {
+      lien: 'https://t.me/movix_site',
+      taille: null,
+      created_at: null,
+    },
+    metadata: { size: null, upload_date: null },
+    source: 'mirror',
+  };
+}
+
+async function fireScraperWebhook(req, id) {
+  const webhookUrl = process.env.DISCORD_SCRAPER_WEBHOOK;
+  if (!webhookUrl) return;
+  const ip =
+    req.headers['cf-connecting-ip'] ||
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    'unknown';
+  const fields = [
+    { name: 'ID', value: String(id), inline: true },
+    { name: 'title_id', value: String(req.query.title_id || '-'), inline: true },
+    { name: 'IP', value: ip, inline: true },
+    { name: 'User-Agent', value: String(req.headers['user-agent'] || '-'), inline: false },
+    { name: 'Origin', value: String(req.headers['origin'] || '-'), inline: true },
+    { name: 'Referer', value: String(req.headers['referer'] || '-'), inline: true },
+    { name: 'Sec-Fetch-Site', value: String(req.headers['sec-fetch-site'] || '-'), inline: true },
+    { name: 'Sec-Fetch-Mode', value: String(req.headers['sec-fetch-mode'] || '-'), inline: true },
+    { name: 'Accept-Language', value: String(req.headers['accept-language'] || '-'), inline: true },
+    { name: 'CF-IPCountry', value: String(req.headers['cf-ipcountry'] || '-'), inline: true },
+    { name: 'X-Forwarded-For (full)', value: String(req.headers['x-forwarded-for'] || '-'), inline: false },
+  ];
+  const embed = {
+    title: `🔍 Scraper Watch — decode/${id}`,
+    color: 0xff4444,
+    fields,
+    timestamp: new Date().toISOString(),
+  };
+  try {
+    await axios.post(webhookUrl, { embeds: [embed] }, { timeout: 5000 });
+  } catch (e) {
+    console.warn('[scraperWatch] webhook failed:', e.message);
+  }
+}
+
+// One-shot boot log: surface live-fallback configuration so operators can
+// confirm at process start whether the live path will engage on sqlite miss.
+//
+// HYDRACKER_LIVE_ENABLED is the master kill-switch for outbound lien fetches.
+//   true  → cache+sqlite miss falls through to hydracker.com /api/v1/content/liens
+//           (decode) and /api/v1/titles/.../content/liens (list). hydracker
+//           returns the raw host link (raw_url/directDL) directly.
+//   false → cache+sqlite are the only sources. Every miss returns sqlite_miss
+//           without any outbound HTTP. No new liens are discovered.
+(() => {
+  const enabled = process.env.HYDRACKER_LIVE_ENABLED === 'true';
+  const cookiesLen = (process.env.DARKIWORLD_COOKIES || '').length;
+  const xsrfLen = (process.env.DARKIWORLD_XSRF_TOKEN || '').length;
+  const concurrency = parseInt(process.env.HYDRACKER_LIVE_CONCURRENCY, 10) || 6;
+  const timeoutMs = parseInt(process.env.HYDRACKER_LIVE_TIMEOUT_MS, 10) || 20000;
+  console.log(
+    `[hydrackerLive][boot] enabled=${enabled} ` +
+      `mode=${enabled ? 'cache+sqlite+hydracker_live' : 'cache+sqlite_only'} ` +
+      `concurrency=${concurrency} timeout=${timeoutMs}ms ` +
+      `cookies_len=${cookiesLen} xsrf_len=${xsrfLen} pid=${process.pid}`,
+  );
+  if (enabled && cookiesLen === 0) {
+    console.warn('[hydrackerLive][boot] DARKIWORLD_COOKIES is empty — every hydracker fetch will return live_hydracker_error');
+  }
+})();
 
 const HOST_ICON_MAP = {
   '1fichier': '/hosts/1fichier.svg',
@@ -30,8 +131,29 @@ const HOST_ICON_MAP = {
   'Dropbox': '/hosts/dropbox.svg',
 };
 
-// Hydracker uploaders to filter out (unreliable / spam). Hardcoded; not env-driven.
-const BLOCKED_DARKIWORLD_USERS = new Set(['Guest']);
+// Master kill-switch for outbound lien discovery.
+// Returns a configured live instance only when HYDRACKER_LIVE_ENABLED=true.
+// When null, both `decode` (resolveLien) and `download` (listLiensForTitle)
+// fall back to cache+sqlite only — no new liens are fetched from hydracker.com.
+let _hydrackerLive = null;
+function getHydrackerLive() {
+  if (process.env.HYDRACKER_LIVE_ENABLED !== 'true') return null;
+  if (_hydrackerLive) return _hydrackerLive;
+  console.log(`[hydrackerLive][init] building live instance on first decode request (pid=${process.pid})`);
+  _hydrackerLive = hydrackerLiveModule.createHydrackerLive({
+    redis: redisClient,
+    axios,
+    cookies: process.env.DARKIWORLD_COOKIES || '',
+    xsrf: process.env.DARKIWORLD_XSRF_TOKEN || '',
+    concurrency: parseInt(process.env.HYDRACKER_LIVE_CONCURRENCY, 10) || 6,
+    timeoutMs: parseInt(process.env.HYDRACKER_LIVE_TIMEOUT_MS, 10) || 20000,
+    cacheDir: DOWNLOAD_CACHE_DIR,
+    cacheGet: (dir, key) => getFromCacheNoExpiration(dir, key),
+    cacheSet: (dir, key, val) => saveToCache(dir, key, val),
+    cacheKeyFor: (id) => generateCacheKey(`darkiworld_decode_v2_${id}`),
+  });
+  return _hydrackerLive;
+}
 
 async function resolveMovixUsername(userId, authType) {
   try {
@@ -105,15 +227,12 @@ async function fetchMovixDownloadLinks(type, id, season, episode) {
 // ---------------------------------------------------------------------------
 let DARKINO_MAINTENANCE;
 let DOWNLOAD_CACHE_DIR;
-let darkiHeaders;
-let axiosDarkinoRequest;
 let getFromCacheNoExpiration;
 let saveToCache;
 let shouldUpdateCache;
-let shouldUpdateCache24h;
+// Seasons routes still use axiosDarkinoRequest + refreshDarkinoSessionIfNeeded.
+let axiosDarkinoRequest;
 let refreshDarkinoSessionIfNeeded;
-let redis;
-let shouldUpdateCache48h;
 
 /**
  * Inject runtime dependencies that still live in server.js.
@@ -121,15 +240,11 @@ let shouldUpdateCache48h;
 function configure(deps) {
   if (deps.DARKINO_MAINTENANCE !== undefined) DARKINO_MAINTENANCE = deps.DARKINO_MAINTENANCE;
   if (deps.DOWNLOAD_CACHE_DIR) DOWNLOAD_CACHE_DIR = deps.DOWNLOAD_CACHE_DIR;
-  if (deps.darkiHeaders) darkiHeaders = deps.darkiHeaders;
-  if (deps.axiosDarkinoRequest) axiosDarkinoRequest = deps.axiosDarkinoRequest;
   if (deps.getFromCacheNoExpiration) getFromCacheNoExpiration = deps.getFromCacheNoExpiration;
   if (deps.saveToCache) saveToCache = deps.saveToCache;
   if (deps.shouldUpdateCache) shouldUpdateCache = deps.shouldUpdateCache;
-  if (deps.shouldUpdateCache24h) shouldUpdateCache24h = deps.shouldUpdateCache24h;
+  if (deps.axiosDarkinoRequest) axiosDarkinoRequest = deps.axiosDarkinoRequest;
   if (deps.refreshDarkinoSessionIfNeeded) refreshDarkinoSessionIfNeeded = deps.refreshDarkinoSessionIfNeeded;
-  if (deps.redis) redis = deps.redis;
-  if (deps.shouldUpdateCache48h) shouldUpdateCache48h = deps.shouldUpdateCache48h;
 }
 
 function parsePositiveInt(value, fallback) {
@@ -254,91 +369,6 @@ async function fetchSeasonsCountResponse(titleId, page, perPage) {
 }
 
 // ---------------------------------------------------------------------------
-// findAllEntriesForEpisode -- paginate DarkiWorld API to find all entries
-// Utilise le nouvel endpoint authentifié `/api/v1/titles/{X}/content/liens`.
-// Auth = cookies + XSRF token injectés par buildDarkinoRequestHeaders depuis
-// les env DARKIWORLD_COOKIES / DARKIWORLD_XSRF_TOKEN (voir app.js darkiHeaders).
-// ---------------------------------------------------------------------------
-async function findAllEntriesForEpisode({ titleId, seasonId, episodeId, perPage = 100, maxPages = 10 }) {
-  // Rafraîchir les cookies avant de commencer la pagination
-  try {
-    await refreshDarkinoSessionIfNeeded();
-  } catch (_) { /* session refresh non-fatal */ }
-
-  let page = 1;
-  let foundEntries = [];
-  let shouldContinue = true;
-
-  while (shouldContinue && page <= maxPages) {
-    const url = `/api/v1/titles/${titleId}/content/liens?perPage=${perPage}&page=${page}&loader=linksdl&season=${seasonId}&filters=&paginate=preferLengthAware`;
-    try {
-      const resp = await axiosDarkinoRequest({
-        method: 'get',
-        url: url,
-        headers: darkiHeaders
-      });
-
-      const data = resp.data?.pagination?.data || [];
-
-      // Chercher toutes les entrées correspondant à l'épisode ET les liens de saison complète
-      const matching = data.filter(entry =>
-        entry.host &&
-        (
-          // Liens d'épisode spécifique
-          (entry.episode_id == episodeId || entry.episode == episodeId || entry.episode_number == episodeId) ||
-          // Liens de saison complète (full_saison = 1)
-          entry.full_saison == 1
-        )
-      );
-
-      if (matching.length > 0) {
-        foundEntries = [...foundEntries, ...matching];
-      }
-
-      // Pagination intelligente
-      const nextPage = resp.data?.pagination?.next_page;
-      if (!nextPage) {
-        shouldContinue = false;
-      } else {
-        page = nextPage;
-      }
-    } catch (_) {
-      shouldContinue = false;
-    }
-  }
-
-  return foundEntries;
-}
-
-// ---------------------------------------------------------------------------
-// partitionLinksByDecodeCache — orders darkiworld links so that entries with
-// a successful decode cache file on disk appear first. Cache file presence is
-// verified via getFromCacheNoExpiration; only `success === true` payloads
-// count (failed markers and missing files do NOT count as "cached").
-// Movix links are passed through untouched (caller prepends them).
-// ---------------------------------------------------------------------------
-async function partitionLinksByDecodeCache(links) {
-  if (!Array.isArray(links) || links.length === 0) return links || [];
-  const probes = await Promise.all(links.map(async (link) => {
-    if (link?.id == null) return { link, available: false };
-    try {
-      const cacheKey = generateCacheKey(`darkiworld_decode_v2_${link.id}`);
-      const payload = await getFromCacheNoExpiration(DOWNLOAD_CACHE_DIR, cacheKey);
-      return { link, available: payload?.success === true };
-    } catch (_) {
-      return { link, available: false };
-    }
-  }));
-  const available = [];
-  const rest = [];
-  for (const { link, available: ok } of probes) {
-    if (ok) available.push(link);
-    else rest.push(link);
-  }
-  return [...available, ...rest];
-}
-
-// ---------------------------------------------------------------------------
 // GET /download/:type/:id
 // Récupérer tous les liens d'amélioration DarkiWorld pour un film ou un épisode
 // Params: type (movie/tv), id (TMDB ID)
@@ -349,253 +379,87 @@ router.get('/download/:type/:id', async (req, res) => {
     const { type, id } = req.params;
     const { season, episode, tmdbId } = req.query;
 
-    // Validation
     if (!['movie', 'tv'].includes(type)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Type invalide. Utilisez "movie" ou "tv"'
-      });
+      return res.status(400).json({ success: false, error: 'Type invalide. Utilisez "movie" ou "tv"' });
     }
-
     if (type === 'tv' && (!season || !episode)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Pour les séries, les paramètres season et episode sont requis'
-      });
+      return res.status(400).json({ success: false, error: 'Pour les séries, les paramètres season et episode sont requis' });
     }
 
-    // Generate cache key — v2 invalide les caches sans champ `lien` direct.
-    const cacheKey = generateCacheKey(`darkiworld_download_v2_${type}_${id}${type === 'tv' ? `_${season}_${episode}` : ''}`);
+    const cacheKey = generateCacheKey(
+      `darkiworld_download_v2_${type}_${id}${type === 'tv' ? `_${season}_${episode}` : ''}`
+    );
 
-    // Movix admin links are stored by TMDB id, while the path :id is the
-    // DarkiWorld title id used for the upstream DarkiWorld API call. Use the
-    // tmdbId query param when provided; fall back to the path id (legacy
-    // clients without tmdbId will still work but won't get Movix links).
     const movixLookupId = tmdbId ? String(tmdbId) : id;
-
-    // Fetch Movix admin links (always, regardless of DarkiWorld cache state)
     const movixLinks = await fetchMovixDownloadLinks(type, movixLookupId, season, episode);
 
-    // Check if results are in cache without expiration (stale-while-revalidate)
+    // Disk cache holds the sqlite-derived rows only (sqlite is static so
+    // caching forever is safe). Live rows come from a separate Redis-cached
+    // layer (titleListCacheTtl ~5min) so they refresh as hydracker keeps
+    // adding new liens past the sqlite freeze cutoff.
+    let darkiList;
     const cachedData = await getFromCacheNoExpiration(DOWNLOAD_CACHE_DIR, cacheKey);
-    let dataReturned = false;
-
-    if (cachedData) {
-      // Re-sort by disk decode cache presence on every read so previously
-      // decoded entries (from past clicks / past prewarms) bubble to the top
-      // even though the list cache itself is frozen between writes.
-      const cachedAll = Array.isArray(cachedData?.all) ? cachedData.all.map(r => ({ ...r, source: r.source || 'darkiworld' })) : [];
-      const sortedCachedAll = await partitionLinksByDecodeCache(cachedAll);
-      res.status(200).json({ ...cachedData, all: [...movixLinks, ...sortedCachedAll], movixCount: movixLinks.length });
-      dataReturned = true;
-    }
-
-    // Determine refresh staleness once and reuse below. shouldUpdateCache
-    // returns true if the file is missing OR older than 40 min.
-    const cacheNeedsUpdate = await shouldUpdateCache(DOWNLOAD_CACHE_DIR, cacheKey);
-
-    // Vérifier si l'utilisateur a accès premium (optionnel)
-    const auth = await getAuthIfValid(req);
-    const darkiworld_premium = auth && auth.userType === 'premium';
-
-    // Pre-warm decode cache via hydracker's new /download endpoint. Fires on
-    // cache miss AND on stale cache (>40min) — the new /download endpoint is
-    // separate from the /decode endpoint that gets rate-limited, so prewarm
-    // can keep the decode cache hot for the curated subset even during a
-    // rate-limit window. Best-effort: a failure here is a no-op for the
-    // response — the queue still handles uncached ids on click.
-    const prewarmPromise = cacheNeedsUpdate
-      ? hydrackerQueue.prewarmDecodeCache({
-          type, id, season, episode,
-          deps: {
-            axiosDarkinoRequest,
-            refreshDarkinoSessionIfNeeded,
-            cacheDir: DOWNLOAD_CACHE_DIR,
-            generateCacheKey,
-            saveToCache,
-            blockedUsers: BLOCKED_DARKIWORLD_USERS
-          }
-        }).catch((e) => {
-          console.warn(`[hydracker] prewarm launcher caught: ${e?.message || e}`);
-          return { warmed: 0, warmedIds: new Set() };
-        })
-      : Promise.resolve({ warmed: 0, warmedIds: new Set() });
-
-    let allEnhancementLinks = [];
-
-    if (type === 'movie') {
-      // Pour les films
-      try {
-        await refreshDarkinoSessionIfNeeded();
-        // 1. Récupérer tous les liens pour le film via le nouvel endpoint
-        // authentifié /api/v1/titles/{id}/content/liens. Auth (cookies + XSRF
-        // token) injectée par buildDarkinoRequestHeaders depuis les env
-        // DARKIWORLD_COOKIES / DARKIWORLD_XSRF_TOKEN.
-        const liensResp = await axiosDarkinoRequest({
-          method: 'get',
-          url: `/api/v1/titles/${id}/content/liens?perPage=100&loader=linksdl&filters=&paginate=preferLengthAware`
-        });
-
-        const rawEntries = liensResp.data?.pagination?.data || [];
-        const allEntries = rawEntries.filter(e => !BLOCKED_DARKIWORLD_USERS.has(e?.id_user));
-
-        // Traiter directement les entrées sans faire de requête de décodage
-        const enhancementSources = allEntries.map(entry => {
-          if (!entry) return null;
-
-          const hostInfo = entry.host;
-          const provider = hostInfo?.name || 'unknown';
-
-          return {
-            id: entry.id,
-            language: (entry?.langues_compact && entry.langues_compact.length > 0)
-              ? entry.langues_compact.map(l => l.name).join(', ')
-              : undefined,
-            quality: entry?.qual?.qual,
-            sub: (entry?.subs_compact && entry.subs_compact.length > 0)
-              ? entry.subs_compact.map(s => s.name).join(', ')
-              : undefined,
-            provider: provider,
-            host_id: hostInfo?.id_host,
-            host_name: hostInfo?.name,
-            size: entry?.taille,
-            upload_date: entry?.created_at,
-            host_icon: hostInfo?.icon,
-            view: entry?.view
-          };
-        });
-
-        allEnhancementLinks = enhancementSources.filter(Boolean);
-      } catch (_) { /* upstream failure leaves allEnhancementLinks empty */ }
-
+    if (cachedData && Array.isArray(cachedData.all)) {
+      darkiList = cachedData.all.map((r) => ({ ...r, source: r.source || 'darkiworld' }));
     } else {
-      // Pour les séries (épisodes)
+      const sqliteList = darkiworldSqlite.listByTitle({
+        type,
+        titleId: id,
+        season: type === 'tv' ? Number(season) : undefined,
+        episode: type === 'tv' ? Number(episode) : undefined,
+      });
+      darkiList = sqliteList.map((r) => ({ ...r, source: 'darkiworld' }));
+      // Background disk-cache the sqlite portion. Live portion is NOT
+      // persisted to disk — Redis 5min cache + freshness on every request.
+      (async () => {
+        try {
+          if (sqliteList.length > 0) {
+            await saveToCache(DOWNLOAD_CACHE_DIR, cacheKey, {
+              success: true,
+              all: sqliteList.map((r) => ({ ...r, source: 'darkiworld' })),
+            });
+          }
+        } catch (_) { /* silent */ }
+      })();
+    }
+
+    // Live supplement: hydracker keeps adding liens past the sqlite freeze
+    // date. Fetch the live listing (Redis-cached 5min) and merge any rows
+    // that aren't already in the sqlite result set (dedup by lien id).
+    let liveLinks = [];
+    const live = getHydrackerLive();
+    if (live && typeof live.listLiensForTitle === 'function') {
       try {
-        // 1. Paginer intelligemment pour trouver l'épisode
-        const rawEntries = await findAllEntriesForEpisode({
-          titleId: id,
-          seasonId: parseInt(season),
-          episodeId: parseInt(episode),
-          perPage: 100,
-          maxPages: 10
+        const live0 = Date.now();
+        const liveRows = await live.listLiensForTitle(id, {
+          type,
+          season: type === 'tv' ? Number(season) : undefined,
+          episode: type === 'tv' ? Number(episode) : undefined,
         });
-
-        const allEntries = rawEntries.filter(e => !BLOCKED_DARKIWORLD_USERS.has(e?.id_user));
-
-        // Traiter directement les entrées sans faire de requête de décodage
-        const enhancementSources = allEntries.map(entry => {
-          if (!entry) return null;
-
-          const hostInfo = entry.host;
-          const provider = hostInfo?.name || 'unknown';
-
-          return {
-            id: entry.id,
-            language: (entry?.langues_compact && entry.langues_compact.length > 0)
-              ? entry.langues_compact.map(l => l.name).join(', ')
-              : undefined,
-            quality: entry?.qual?.qual,
-            sub: (entry?.subs_compact && entry.subs_compact.length > 0)
-              ? entry.subs_compact.map(s => s.name).join(', ')
-              : undefined,
-            provider: provider,
-            host_id: hostInfo?.id_host,
-            host_name: hostInfo?.name,
-            size: entry?.taille,
-            upload_date: entry?.created_at,
-            episode_id: entry?.episode_id,
-            episode_number: entry?.episode_number,
-            host_icon: hostInfo?.icon,
-            view: entry?.view,
-            saison: entry?.saison,
-            episode: entry?.episode,
-            full_saison: entry?.full_saison
-          };
-        });
-
-        allEnhancementLinks = enhancementSources.filter(Boolean);
-      } catch (_) { /* upstream failure leaves allEnhancementLinks empty */ }
-    }
-
-    // Wait for the prewarm to settle so the disk decode cache is hot before
-    // we respond — without this await the client could click a link before
-    // the pre-warmed entry was written and would needlessly hit the queue.
-    const prewarmResult = await prewarmPromise;
-    if (prewarmResult?.warmed) {
-      console.log(`[hydracker] prewarm ${type}/${id} warmed=${prewarmResult.warmed}`);
-    }
-
-    // Sort by disk decode cache presence: anything with an existing
-    // success-shaped payload at darkiworld_decode_v2_{id} (whether from a
-    // prior queue decode, a prior decodeRequestSync, or this request's
-    // prewarm) bubbles to the top. The prewarm just completed above so its
-    // writes are already on disk and counted here.
-    const orderedEnhancementLinks = await partitionLinksByDecodeCache(allEnhancementLinks);
-
-    const taggedDarkiLinks = orderedEnhancementLinks.map(r => ({ ...r, source: 'darkiworld' }));
-    const responseData = {
-      success: true,
-      all: [...movixLinks, ...taggedDarkiLinks],
-      movixCount: movixLinks.length
-    };
-
-    // Si on n'a pas encore retourné de données, retourner maintenant
-    if (!dataReturned) {
-      res.json(responseData);
-    }
-
-    // Background update du cache — reuses cacheNeedsUpdate computed above
-    // so we don't restat the file twice per request.
-    (async () => {
-      try {
-        if (!cacheNeedsUpdate) {
-          return; // Cache encore frais (<40 min), pas de réécriture.
-        }
-
-        // Si on a des données, sauvegarder dans le cache
-        if (orderedEnhancementLinks && orderedEnhancementLinks.length > 0) {
-          // Store only DarkiWorld entries in cache — Movix links are fetched fresh each request
-          const darkiOnlyData = {
-            success: true,
-            all: orderedEnhancementLinks.map(r => ({ ...r, source: 'darkiworld' }))
-          };
-          await saveToCache(DOWNLOAD_CACHE_DIR, cacheKey, darkiOnlyData);
-        }
-      } catch (cacheError) {
-        // Silent fail on cache save
+        const darkiIds = new Set(darkiList.map((r) => r.id));
+        liveLinks = liveRows
+          .filter((r) => !darkiIds.has(r.id))
+          .map((r) => ({ ...r, source: 'hydracker-live' }));
+        console.log(
+          `[download] id=${id} type=${type} sqlite=${darkiList.length} ` +
+            `live=${liveRows.length} new_from_live=${liveLinks.length} dt=${Date.now() - live0}ms`,
+        );
+      } catch (e) {
+        console.warn(`[download] live listLiensForTitle threw id=${id}: ${e?.message}`);
       }
-    })();
+    }
+
+    return res.status(200).json({
+      success: true,
+      all: [...movixLinks, ...darkiList, ...liveLinks],
+      movixCount: movixLinks.length,
+    });
 
   } catch (error) {
-    // Si Darkino retourne 500, ne pas créer/mettre à jour le cache et renvoyer le cache existant si présent
-    if (error.response && error.response.status >= 500) {
-      try {
-        const fallbackCache = await getFromCacheNoExpiration(DOWNLOAD_CACHE_DIR, cacheKey);
-        if (fallbackCache) {
-          const fbAll = Array.isArray(fallbackCache?.all) ? fallbackCache.all.map(r => ({ ...r, source: r.source || 'darkiworld' })) : [];
-          return res.status(200).json({ ...fallbackCache, all: [...movixLinks, ...fbAll], movixCount: movixLinks.length });
-        }
-      } catch (_) { }
-    }
-
     if (!res.headersSent) {
-      // If Movix links exist, still return them with a warning
-      let movixFallback = [];
-      try {
-        const fallbackLookupId = req.query.tmdbId ? String(req.query.tmdbId) : req.params.id;
-        movixFallback = await fetchMovixDownloadLinks(type, fallbackLookupId, req.query.season, req.query.episode);
-      } catch (_) { /* ignore */ }
-      if (movixFallback.length > 0) {
-        return res.status(200).json({
-          success: true,
-          all: movixFallback,
-          movixCount: movixFallback.length,
-          warning: 'DarkiWorld unavailable'
-        });
-      }
       res.status(500).json({
         success: false,
-        error: 'Erreur lors de la récupération des liens d\'amélioration DarkiWorld',
+        error: 'Erreur lors de la récupération des liens DarkiWorld',
         message: error.message
       });
     }
@@ -608,64 +472,81 @@ router.get('/download/:type/:id', async (req, res) => {
 // Params: id (ID du lien DarkiWorld)
 // ---------------------------------------------------------------------------
 router.get('/decode/:id', async (req, res) => {
+  const t0 = Date.now();
+  const { id } = req.params;
+  const { title_id, debug: debugQuery } = req.query;
+  const debugMode = debugQuery === '1' || debugQuery === 'true';
+  const live = getHydrackerLive();
+  console.log(
+    `[decode] start id=${id} title_id=${title_id || '-'} live_wired=${!!live} ` +
+      `pid=${process.pid}`,
+  );
   try {
-    const { id } = req.params;
     if (!id) return res.status(400).json({ success: false, error: 'ID du lien requis' });
 
+    if (SCRAPER_WATCHLIST.has(String(id))) {
+      fireScraperWebhook(req, id).catch(() => {});
+    }
+
+    if (isBlockedScraper(req)) {
+      console.log(`[decode] poison id=${id} ip=${getRequestIp(req)}`);
+      return res.status(200).json(poisonDecodeResponse(id));
+    }
+
     if (DARKINO_MAINTENANCE) {
+      console.log(`[decode] short-circuit maintenance id=${id}`);
       return res.status(200).json({ error: 'Service Darkino temporairement indisponible (maintenance)' });
     }
 
-    const result = hydrackerQueue.BATCHING_ENABLED
-      ? await hydrackerQueue.decodeRequest(id, {
-          redis,
-          cacheDir: DOWNLOAD_CACHE_DIR,
-          generateCacheKey,
-          getFromCacheNoExpiration
-        })
-      : await hydrackerQueue.decodeRequestSync(id, {
-          cacheDir: DOWNLOAD_CACHE_DIR,
-          generateCacheKey,
-          getFromCacheNoExpiration,
-          saveToCache,
-          axiosDarkinoRequest,
-          refreshDarkinoSessionIfNeeded
-        });
+    const result = await darkiworldSqlite.decodeLink(id, {
+      cacheDir: DOWNLOAD_CACHE_DIR,
+      generateCacheKey,
+      getFromCacheNoExpiration,
+      saveToCache,
+      hydrackerLive: live,
+    });
 
-    if (result.payload) return res.status(200).json(result.payload);
+    const dt = Date.now() - t0;
+    if (result.payload) {
+      console.log(
+        `[decode] ok id=${id} provider=${result.payload.provider || '?'} ` +
+          `source=${result.payload.source || '?'} host=${result.payload?.metadata?.host || '?'} dt=${dt}ms`,
+      );
+      if (debugMode) {
+        return res.status(200).json({
+          ...result.payload,
+          _debug: { id, title_id: title_id || null, live_wired: !!live, dt_ms: dt, env_enabled: process.env.HYDRACKER_LIVE_ENABLED === 'true' },
+        });
+      }
+      return res.status(200).json(result.payload);
+    }
     if (result.failed) {
-      return res.status(404).json({
+      console.log(
+        `[decode] failed id=${id} debug=${result.failed.debug || '?'} ` +
+          `status=${result.failed.status ?? '-'} dt=${dt}ms`,
+      );
+      const body = {
         success: false,
         error: result.failed.error || 'Lien non trouvé ou inaccessible',
         id: result.failed.id || id,
-        debug: result.failed.debug || ''
-      });
+        debug: result.failed.debug || '',
+      };
+      if (debugMode) {
+        body._debug = {
+          title_id: title_id || null,
+          live_wired: !!live,
+          dt_ms: dt,
+          env_enabled: process.env.HYDRACKER_LIVE_ENABLED === 'true',
+          marker_status: result.failed.status ?? null,
+          marker_failedAt: result.failed.failedAt ?? null,
+        };
+      }
+      return res.status(404).json(body);
     }
-    if (result.queued) {
-      return res.status(202).json({
-        status: 'queued',
-        queue_size: result.queue_size,
-        id
-      });
-    }
-    if (result.rateLimited) {
-      return res.status(503).json({
-        success: false,
-        error: 'rate_limited',
-        retry_at: result.retryAt
-      });
-    }
-    if (result.unavailable) {
-      return res.status(503).json({
-        success: false,
-        error: 'queue_unavailable',
-        message: 'Infrastructure indisponible, réessaie plus tard'
-      });
-    }
-
     return res.status(500).json({ success: false, error: 'Unknown decode result' });
 
   } catch (error) {
+    console.error(`[decode] throw id=${id} msg=${error?.message} stack=${error?.stack?.split('\n')[1]?.trim() || '-'}`);
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
@@ -863,4 +744,3 @@ router.get('/episodes/:titleId/:seasonNumber', async (req, res) => {
 
 module.exports = router;
 module.exports.configure = configure;
-module.exports.findAllEntriesForEpisode = findAllEntriesForEpisode;

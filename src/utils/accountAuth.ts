@@ -49,6 +49,10 @@ export interface ResolvedAuthResponse {
   user?: StoredUserProfile | null;
   account?: ResolvedAccountPayload | null;
   authData?: AuthDataPayload | null;
+  // Vrai si le pseudo provider stocké viole la policy (trop long, contient
+  // caractères de contrôle/zero-width). Le frontend affiche une modale
+  // bloquante qui force l'user à choisir un nouveau pseudo via POST /api/auth/username.
+  requiresUsernameChange?: boolean;
 }
 
 interface PersistResolvedSessionOptions {
@@ -92,6 +96,7 @@ const AUTH_KEYS = [
   'resolved_user_type',
   'resolved_user_id',
   'user_id',
+  'requires_username_change',
 ] as const;
 
 function isAuthMethod(value: string | null): value is AuthMethod {
@@ -455,4 +460,13 @@ export function persistResolvedSession(
       };
 
   localStorage.setItem('auth', JSON.stringify(authData));
+
+  // Persiste le flag : si vrai, la modale `RequireUsernameChange` se déclenche
+  // au prochain render de l'App. Sinon on nettoie pour éviter qu'un flag
+  // périmé d'une session précédente reste actif.
+  if (payload.requiresUsernameChange) {
+    localStorage.setItem('requires_username_change', '1');
+  } else {
+    localStorage.removeItem('requires_username_change');
+  }
 }

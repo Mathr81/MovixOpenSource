@@ -118,7 +118,7 @@ const LazyImage: React.FC<LazyImageProps> = ({
         height={513}
         loading={priority ? 'eager' : 'lazy'}
         decoding="async"
-        fetchPriority={priority ? 'high' : 'auto'}
+        {...{ fetchpriority: priority ? 'high' : 'auto' }}
         onLoad={handleLoad}
         onError={handleError}
         draggable={draggable}

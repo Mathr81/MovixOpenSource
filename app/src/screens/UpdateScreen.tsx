@@ -48,7 +48,7 @@ function errorLabel(error: UpdateError | null): string {
     case 'disk':
       return 'Espace insuffisant sur l\'appareil';
     case 'install_denied':
-      return 'Installation refusée ou bloquée';
+      return 'Installation annulée ou bloquée. Tu peux réessayer sans retélécharger.';
     case 'unknown':
     default:
       return 'Erreur inattendue';

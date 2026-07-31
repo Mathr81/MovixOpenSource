@@ -183,6 +183,7 @@ const WatchPartyJoin: React.FC = () => {
                   onChange={(e) => setNickname(e.target.value)}
                   placeholder={t('watchParty.enterPseudo')}
                   className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500 text-white placeholder-white/30 transition-all"
+                  maxLength={32}
                 />
               </div>
 

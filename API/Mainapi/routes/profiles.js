@@ -15,7 +15,9 @@ const {
   ensureSafeProfileId,
   getOwnedProfile,
   getProfileFilePath,
-  sanitizeProfileData
+  sanitizeProfileData,
+  SyncPolicyError,
+  validateProfileName
 } = require('../utils/syncPolicy');
 
 // Lazy imports from sync module to avoid circular dependencies
@@ -59,6 +61,13 @@ router.post('/', async (req, res) => {
     if (avatar && !avatar.startsWith('/avatars/') && avatar !== '') {
       return res.status(400).json({ error: 'Invalid avatar URL. Must be a local path starting with /avatars/' });
     }
+    let safeName;
+    try {
+      safeName = validateProfileName(name);
+    } catch (e) {
+      if (e instanceof SyncPolicyError) return res.status(e.status).json({ error: e.message, code: e.code });
+      throw e;
+    }
     const validAgeRestrictions = [0, 7, 12, 16, 18];
     const ageRestrictionValue = validAgeRestrictions.includes(Number(ageRestriction)) ? Number(ageRestriction) : 0;
 
@@ -71,7 +80,7 @@ router.post('/', async (req, res) => {
     const profileId = uuidv4();
     const newProfile = {
       id: profileId,
-      name: name.trim(),
+      name: safeName,
       avatar,
       ageRestriction: ageRestrictionValue,
       createdAt: new Date().toISOString(),
@@ -113,7 +122,14 @@ router.put('/:profileId', async (req, res) => {
     const profileIndex = profiles.findIndex(p => p.id === profileId);
     if (profileIndex === -1) return res.status(404).json({ error: 'Profile not found' });
 
-    if (name) profiles[profileIndex].name = name.trim();
+    if (name) {
+      try {
+        profiles[profileIndex].name = validateProfileName(name);
+      } catch (e) {
+        if (e instanceof SyncPolicyError) return res.status(e.status).json({ error: e.message, code: e.code });
+        throw e;
+      }
+    }
     if (avatar) profiles[profileIndex].avatar = avatar;
     if (ageRestriction !== undefined) {
       const validAgeRestrictions = [0, 7, 12, 16, 18];

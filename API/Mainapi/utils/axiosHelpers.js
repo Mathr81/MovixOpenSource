@@ -20,7 +20,6 @@ const {
   ENABLE_FSTREAM_PROXY,
   ENABLE_ANIME_PROXY,
   ENABLE_WIFLIX_PROXY,
-  DARKINO_403_COOLDOWN_MS,
   DARKINO_PROXIES,
   PROXIES,
   HTTP_PROXIES,
@@ -56,7 +55,7 @@ let deps = {
   incrementFstreamRequestCounter: () => {}
 };
 
-const WIFLIX_BASE_URL = 'https://flemmix.farm';
+const WIFLIX_BASE_URL = 'https://flemmix.golf';
 
 const truncateForLog = (value, maxLength = 300) => {
   if (typeof value !== 'string') return value;
@@ -92,8 +91,7 @@ function configure(injected) {
   Object.assign(deps, injected);
 }
 
-// === Proxy manager re-exports for convenience (used by axiosDarkinoRequest) ===
-// We need mutable access to darkino403CooldownUntil via the proxyManager module
+// === Proxy manager handle for Redis-backed Darkino cooldowns ===
 const proxyManager = require('./proxyManager');
 
 // Fonction utilitaire pour g\u00e9n\u00e9rer le referer dynamiquement
@@ -241,13 +239,46 @@ async function buildDarkinoRequestHeaders(config) {
 
 // Fonction utilitaire pour requ\u00eates Darkino avec proxies (SOCKS5h)
 async function axiosDarkinoRequest(config) {
-  // V\u00e9rifier si on est en cooldown apr\u00e8s une erreur 403
-  if (Date.now() < proxyManager.darkino403CooldownUntil) {
-    const remainingMs = proxyManager.darkino403CooldownUntil - Date.now();
-    const remainingMin = Math.ceil(remainingMs / 60000);
+  // V\u00e9rifier si on est en cooldown apr\u00e8s une erreur 403 (cluster-wide via Redis)
+  const cd403Ms = await proxyManager.getDarkinoCooldownRemainingMs('403');
+  if (cd403Ms > 0) {
+    const remainingMin = Math.ceil(cd403Ms / 60000);
     const error = new Error(`Darkino en cooldown (403 Cloudflare). R\u00e9essayez dans ${remainingMin} minute(s).`);
     error.isDarkinoCooldown = true;
     error.response = { status: 403 };
+    throw error;
+  }
+
+  // V\u00e9rifier si on est en cooldown apr\u00e8s une erreur 429 (rate limit / Cloudflare Workers daily limit)
+  const cd429Ms = await proxyManager.getDarkinoCooldownRemainingMs('429');
+  if (cd429Ms > 0) {
+    const remainingMin = Math.ceil(cd429Ms / 60000);
+    const error = new Error(`Darkino en cooldown (rate limit 429). R\u00e9essayez dans ${remainingMin} minute(s).`);
+    error.isDarkinoCooldown = true;
+    error.response = { status: 429 };
+    throw error;
+  }
+
+  // V\u00e9rifier si on est en cooldown apr\u00e8s une erreur serveur (5xx)
+  const cd5xxMs = await proxyManager.getDarkinoCooldownRemainingMs('5xx');
+  if (cd5xxMs > 0) {
+    const remainingMin = Math.ceil(cd5xxMs / 60000);
+    const error = new Error(`Darkino en cooldown (erreur serveur). R\u00e9essayez dans ${remainingMin} minute(s).`);
+    error.isDarkinoCooldown = true;
+    error.response = { status: 503 };
+    throw error;
+  }
+
+  // Cooldown apres trop de timeouts / erreurs reseau consecutifs (cluster-wide).
+  // Les cooldowns 403/429/5xx ne se declenchent que sur une reponse HTTP : un
+  // timeout (ECONNABORTED) n'a pas de error.response donc rien ne s'armait,
+  // l'upstream mort etait martele en boucle (RSS qui monte sans redescendre).
+  const cdNeterrMs = await proxyManager.getDarkinoCooldownRemainingMs('neterr');
+  if (cdNeterrMs > 0) {
+    const remainingMin = Math.ceil(cdNeterrMs / 60000);
+    const error = new Error(`Darkino en cooldown (trop de timeouts). Réessayez dans ${remainingMin} minute(s).`);
+    error.isDarkinoCooldown = true;
+    error.response = { status: 504 };
     throw error;
   }
 
@@ -287,10 +318,17 @@ async function axiosDarkinoRequest(config) {
         const setCookieHeader = error.response.headers['set-cookie'];
         await Promise.all(setCookieHeader.map(cookie => deps.cookieJar.setCookie(cookie, DARKIWORLD_BASE_URL)));
       }
-      // En cas d'erreur 403, activer le cooldown
-      if (error.response?.status === 403) {
-        proxyManager.darkino403CooldownUntil = Date.now() + DARKINO_403_COOLDOWN_MS;
-        console.log(`[DARKINO] Erreur 403 d\u00e9tect\u00e9e (direct) - Cooldown activ\u00e9 pour 5 minutes`);
+      // En cas d'erreur 403, 429 ou 5xx, activer le cooldown (cluster-wide)
+      const directStatus = error.response?.status;
+      if (directStatus === 403) {
+        await proxyManager.armDarkinoCooldown('403');
+        console.log(`[DARKINO] Erreur 403 d\u00e9tect\u00e9e (direct) - Cooldown activ\u00e9`);
+      } else if (directStatus === 429) {
+        await proxyManager.armDarkinoCooldown('429');
+        console.log(`[DARKINO] Erreur 429 d\u00e9tect\u00e9e (direct) - Cooldown activ\u00e9`);
+      } else if (directStatus >= 500 && directStatus < 600) {
+        await proxyManager.armDarkinoCooldown('5xx');
+        console.log(`[DARKINO] Erreur ${directStatus} d\u00e9tect\u00e9e (direct) - Cooldown activ\u00e9`);
       }
       throw error;
     }
@@ -330,9 +368,16 @@ async function axiosDarkinoRequest(config) {
         const setCookieHeader = error.response.headers['set-cookie'];
         await Promise.all(setCookieHeader.map(cookie => deps.cookieJar.setCookie(cookie, DARKIWORLD_BASE_URL)));
       }
-      if (error.response?.status === 403) {
-        proxyManager.darkino403CooldownUntil = Date.now() + DARKINO_403_COOLDOWN_MS;
-        console.log(`[DARKINO] Erreur 403 d\u00e9tect\u00e9e (direct sans proxy) - Cooldown activ\u00e9 pour 5 minutes`);
+      const noProxyStatus = error.response?.status;
+      if (noProxyStatus === 403) {
+        await proxyManager.armDarkinoCooldown('403');
+        console.log(`[DARKINO] Erreur 403 d\u00e9tect\u00e9e (direct sans proxy) - Cooldown activ\u00e9`);
+      } else if (noProxyStatus === 429) {
+        await proxyManager.armDarkinoCooldown('429');
+        console.log(`[DARKINO] Erreur 429 d\u00e9tect\u00e9e (direct sans proxy) - Cooldown activ\u00e9`);
+      } else if (noProxyStatus >= 500 && noProxyStatus < 600) {
+        await proxyManager.armDarkinoCooldown('5xx');
+        console.log(`[DARKINO] Erreur ${noProxyStatus} d\u00e9tect\u00e9e (direct sans proxy) - Cooldown activ\u00e9`);
       }
       throw error;
     }
@@ -364,6 +409,8 @@ async function axiosDarkinoRequest(config) {
       if (setCookieHeader && deps.cookieJar) {
         await Promise.all(setCookieHeader.map(cookie => deps.cookieJar.setCookie(cookie, DARKIWORLD_BASE_URL)));
       }
+      // Requete reussie : on n'est plus en serie d'echecs reseau.
+      proxyManager.resetDarkinoNetFailures();
       return response;
     } catch (error) {
       lastError = error;
@@ -381,21 +428,37 @@ async function axiosDarkinoRequest(config) {
         await Promise.all(setCookieHeader.map(cookie => deps.cookieJar.setCookie(cookie, DARKIWORLD_BASE_URL)));
       }
 
-      // En cas d'erreur 429 (Too Many Requests), essayer avec le prochain proxy si disponible
-      if (statusCode === 429) {
-        continue;
-      }
-
-      // En cas d'erreur 403 (Cloudflare challenge), activer le cooldown de 5 minutes
+      // En cas d'erreur 403 (Cloudflare challenge), activer le cooldown (cluster-wide)
       if (statusCode === 403) {
-        proxyManager.darkino403CooldownUntil = Date.now() + DARKINO_403_COOLDOWN_MS;
+        await proxyManager.armDarkinoCooldown('403');
         throw error;
       }
 
-      // Pour les autres erreurs (400, 500, etc.), arr\u00eater imm\u00e9diatement
-      if (statusCode && statusCode !== 429) {
+      // En cas d'erreur 429 (Too Many Requests / Cloudflare Workers daily limit),
+      // activer le cooldown 429 (cluster-wide) \u2014 inutile de spammer un autre proxy
+      // si l'upstream hydracker lui-m\u00eame rate-limit globalement.
+      if (statusCode === 429) {
+        await proxyManager.armDarkinoCooldown('429');
+        console.log(`[DARKINO] Erreur 429 d\u00e9tect\u00e9e (proxy) - Cooldown activ\u00e9`);
         throw error;
       }
+
+      // En cas d'erreur serveur (5xx), activer le cooldown 5xx (cluster-wide)
+      if (statusCode >= 500 && statusCode < 600) {
+        await proxyManager.armDarkinoCooldown('5xx');
+        console.log(`[DARKINO] Erreur ${statusCode} d\u00e9tect\u00e9e (proxy) - Cooldown activ\u00e9`);
+        throw error;
+      }
+
+      // Pour les autres erreurs (400, etc.), arr\u00eater imm\u00e9diatement
+      if (statusCode) {
+        throw error;
+      }
+
+      // Pas de statusCode = erreur reseau sans reponse HTTP (timeout
+      // ECONNABORTED, ECONNRESET, ...). Compte l'echec pour le circuit
+      // breaker cluster-wide : au seuil, le cooldown 'neterr' est arme.
+      await proxyManager.recordDarkinoNetFailure();
     }
   }
 

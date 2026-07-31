@@ -51,7 +51,7 @@ const MOVIX_CONSOLE_SAFETY_WARNING_LINES: MovixConsoleWarningLine[] = [
     ].join('; '),
   },
   {
-    text: 'Coller quelque chose ici peut donner a un attaquant acces a ton compte Movix.',
+    text: 'Coller quelque chose ici peut donner à un attaquant accès à ton compte Movix.',
     style: [
       'font-size: 22px',
       'font-weight: 900',
@@ -76,6 +76,18 @@ const MOVIX_CONSOLE_SAFETY_WARNING_LINES: MovixConsoleWarningLine[] = [
       'border-radius: 12px',
       'text-shadow: 0 2px 12px rgba(0,0,0,0.35)',
       'box-shadow: 0 0 0 3px #22c55e inset'
+    ].join('; '),
+  },
+  {
+    text: "Fuck les sites qui bloquent le devtool et qui mettent des screamers quand on l'ouvre — et merci à LibreWolf pour bypass les détections.",
+    style: [
+      'font-size: 10px',
+      'font-weight: 600',
+      'line-height: 1.4',
+      'color: #94a3b8',
+      'background: transparent',
+      'padding: 2px 4px',
+      'text-shadow: none'
     ].join('; '),
   },
 ];
@@ -125,6 +137,62 @@ startMovixConsoleSafetyWarning();
 // since instances created via axios.create() don't inherit from the default.
 registerBlockDetection(axios)
 registerBlockDetection(api)
+
+// ---------------------------------------------------------------------------
+// Resilience patches — run before the app mounts.
+// ---------------------------------------------------------------------------
+
+// 1. Stale dynamic-import chunks after a deploy. Vite dispatches
+//    `vite:preloadError` when a chunk preload (the helper behind every lazy
+//    route and hover-prefetch) fails — e.g. the previous build's hashed chunk
+//    now 404s on the production domain.
+//
+//    We must NOT call `event.preventDefault()` here. Vite's preload helper only
+//    rethrows the failure when the event is left un-prevented:
+//        return baseModule().catch(handlePreloadError)
+//        function handlePreloadError(err){ …dispatch…; if (!e.defaultPrevented) throw err }
+//    Calling preventDefault() makes the failed `import()` RESOLVE TO `undefined`
+//    instead of rejecting. React.lazy then reads `.default` off that `undefined`
+//    and crashes the whole app with "Cannot read properties of undefined
+//    (reading 'default')" — the exact opposite of recovery, and it bypasses every
+//    handler below (a resolved promise has no error to catch).
+//
+//    So we let the rejection propagate to where the import was triggered:
+//    lazyWithRetry retries + does a budgeted reload for interactive route loads,
+//    PrefetchLink's `.catch` swallows background prefetches, and ErrorBoundary
+//    shows a soft "new version available" screen once the reload budget is spent.
+//    (lazyWithRetry also defensively treats a nullish resolved module as a chunk
+//    failure, so re-introducing preventDefault here can never silently crash again.)
+
+// 2. Guard against the React + browser-translation (Google Translate, Edge,
+//    Samsung Internet, …) crash: the translation engine swaps text nodes
+//    underneath React, so React's reconciler later calls removeChild /
+//    insertBefore on a node whose parent has since changed →
+//    "Failed to execute 'removeChild' on 'Node': The node to be removed is not
+//    a child of this node." Making these DOM ops no-ops when the parent no
+//    longer matches lets React recover instead of tearing down the whole tree.
+//    https://github.com/facebook/react/issues/11538#issuecomment-417504600
+if (typeof Node === 'function' && Node.prototype) {
+  const originalRemoveChild = Node.prototype.removeChild;
+  Node.prototype.removeChild = function <T extends Node>(this: Node, child: T): T {
+    if (child.parentNode !== this) {
+      return child;
+    }
+    return originalRemoveChild.call(this, child) as T;
+  };
+
+  const originalInsertBefore = Node.prototype.insertBefore;
+  Node.prototype.insertBefore = function <T extends Node>(
+    this: Node,
+    newNode: T,
+    referenceNode: Node | null
+  ): T {
+    if (referenceNode && referenceNode.parentNode !== this) {
+      return newNode;
+    }
+    return originalInsertBefore.call(this, newNode, referenceNode) as T;
+  };
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

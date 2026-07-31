@@ -91,7 +91,7 @@ const PROXY_SERVER_URL = process.env.PROXY_SERVER_URL;
 const TVMIO_CATEGORIES = {};
 
 // URL de base pour Wiflix (Witv)
-const WITV_BASE_URL = "https://witv.team";
+const WITV_BASE_URL = "https://witv.football";
 // Cloudflare proxy for 403 bypass (livehdtv)
 const CF_PROXY_403 = process.env.CF_PROXY_403_URL;
 
@@ -276,7 +276,7 @@ const BOLALOCA_CHANNELS = [
   },
 ];
 
-const LIVETV_BASE_URL = "https://livetv876.me";
+const LIVETV_BASE_URL = "https://livetv901.me";
 const LIVETV_EMBED_REFERER = `${LIVETV_BASE_URL}/`;
 const LIVETV_ALLUPCOMING_PATHS = ["/frx/allupcoming/", "/frx/ads/"];
 const LIVETV_CATEGORIES = {
@@ -419,7 +419,7 @@ const FCTV_DEFAULT_SITE_TYPE = 2001;
 // (${BYPASS403_SERVER_URL}/proxy), with a hardcoded fallback.
 const FCTV_IMAGE_PROXY = process.env.BYPASS403_SERVER_URL
   ? `${process.env.BYPASS403_SERVER_URL.replace(/\/+$/, "")}/proxy`
-  : "https://proxy.movix.chat/proxy";
+  : "https://proxy.movix.date/proxy";
 
 function proxifyFctvImage(url) {
   if (!url) return "";
@@ -2763,7 +2763,7 @@ function shouldIgnoreLiveTvIframeUrl(rawUrl) {
     const combined = `${hostname}${pathname}${search}`;
 
     if (
-      hostname === "ads.livetv876.me" ||
+      hostname === "ads.livetv901.me" ||
       hostname.startsWith("ads.") ||
       hostname.startsWith("ad.")
     ) {

@@ -11,7 +11,7 @@ export const M3U8_EXTRACTOR_KEYS = [
 ] as const;
 
 export const LIVETV_SOURCE_KEYS = [
-  'linkzy', 'wiflix', 'sosplay', 'livetv', 'matches',
+  'linkzy', 'wiflix', 'sosplay', 'livetv', 'matches', 'daddylive',
 ] as const;
 
 export const EXTRACTION_METHOD_KEYS = [

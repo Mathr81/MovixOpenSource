@@ -56,6 +56,13 @@ interface TVShow {
   genres: { id: number; name: string }[];
   number_of_seasons?: number;
   number_of_episodes?: number;
+  seasons?: Array<{
+    season_number: number;
+    name: string;
+    poster_path: string | null;
+    air_date: string | null;
+    episode_count: number;
+  }>;
   status?: string;
   type?: string;
   episode_run_time?: number[];
@@ -920,6 +927,28 @@ const groupCrewMembers = (crew: CrewMember[]): GroupedCrewMember[] => {
   }, new Map<number, GroupedCrewMember>());
 
   return Array.from(groupedMap.values());
+};
+
+// Sur certains réseaux (proxy FAI / cache CloudFront), la réponse fr-FR d'une
+// saison arrive corrompue : le corps n'est ni du JSON ni du gzip valide, donc
+// `episodes` est absent (symptôme : "Pas d'épisodes" sur PC, OK sur mobile).
+// On bascule alors sur l'objet en-US — clé de cache CDN différente, donc
+// généralement saine. Numéros d'épisode et dates sont indépendants de la langue.
+const fetchSeasonDetails = async (
+  showId: string | number | null | undefined,
+  season: number
+): Promise<any | null> => {
+  const base = `https://api.themoviedb.org/3/tv/${showId}/season/${season}?api_key=${TMDB_API_KEY}`;
+  const langs = [...new Set([getTmdbLanguage(), 'en-US'])];
+  for (const lang of langs) {
+    try {
+      const { data } = await axios.get(`${base}&language=${lang}`);
+      if (data && Array.isArray(data.episodes)) return data;
+    } catch {
+      // erreur réseau / décodage : on tente la langue suivante
+    }
+  }
+  return null;
 };
 
 const checkEpisodeAvailability = async (showId: string, seasonNumber: number, episodeNumber: number) => {
@@ -2747,21 +2776,19 @@ const TVDetails: React.FC = () => {
         seasonPromises.push(
           (async () => {
             try {
-              // Fetch season details
-              const seasonResponse = await axios.get(
-                `https://api.themoviedb.org/3/tv/${id}/season/${season}?api_key=${TMDB_API_KEY}&language=${getTmdbLanguage()}`
-              );
-              const seasonData = seasonResponse.data;
-              newSeasonsDetails[season] = seasonData;
-              const episodesData = seasonData.episodes;
-              for (const episodeData of episodesData) {
-                const airDate = episodeData.air_date ? new Date(episodeData.air_date) : null;
-                if (airDate) airDate.setHours(0, 0, 0, 0);
-                if (!airDate || airDate <= today) {
-                  allEpisodes.push({
-                    sa: season,
-                    epi: episodeData.episode_number
-                  });
+              // Fetch season details (bascule sur en-US si la réponse fr-FR est corrompue)
+              const seasonData = await fetchSeasonDetails(id, season);
+              if (seasonData) {
+                newSeasonsDetails[season] = seasonData;
+                for (const episodeData of seasonData.episodes) {
+                  const airDate = episodeData.air_date ? new Date(episodeData.air_date) : null;
+                  if (airDate) airDate.setHours(0, 0, 0, 0);
+                  if (!airDate || airDate <= today) {
+                    allEpisodes.push({
+                      sa: season,
+                      epi: episodeData.episode_number
+                    });
+                  }
                 }
               }
 
@@ -5099,8 +5126,12 @@ const TVDetails: React.FC = () => {
                           })
                         ) : (
                           /* Affichage standard des saisons pour les séries non-anime */
-                          availableSeasons.map((season) => {
-                            const details = seasonsDetails[season];
+                          [...(tvShow.seasons ?? [])]
+                            .filter((sm) => !(String(id) === '71446' && sm.season_number === 1))
+                            .sort((a, b) => a.season_number - b.season_number)
+                            .map((seasonMeta) => {
+                            const season = seasonMeta.season_number;
+                            const details = seasonsDetails[season] || seasonMeta;
                             const imageUrl = details?.poster_path ? `https://image.tmdb.org/t/p/original${details.poster_path}` : getSeasonFallbackSvg(t('details.season').toUpperCase());
                             const imageKey = `season-${season}-poster`;
                             const hasFailed = failedImages[imageKey];
@@ -5146,7 +5177,7 @@ const TVDetails: React.FC = () => {
                                     </h3>
                                     <div className="flex items-center gap-2 mt-1">
                                       <span className="text-xs text-gray-300">{details?.air_date ? new Date(details.air_date).getFullYear() : ''}</span>
-                                      <span className="text-xs text-gray-400 ml-auto">{details?.episodes?.length || 0} {t('details.episodes')}</span>
+                                      <span className="text-xs text-gray-400 ml-auto">{details?.episodes?.length ?? details?.episode_count ?? 0} {t('details.episodes')}</span>
                                     </div>
                                   </div>
                                   {selectedSeason === season && (

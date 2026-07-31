@@ -1,4 +1,5 @@
 import React from 'react';
+import { isChunkLoadError, reloadForChunkFailure } from '../routing/lazyWithRetry';
 
 interface ErrorBoundaryState {
   hasError: boolean;
@@ -7,10 +8,32 @@ interface ErrorBoundaryState {
   sending: boolean;
   sent: boolean;
   sendError: boolean;
+  recoverable: boolean;
+  reloadScheduled: boolean;
 }
 
+/**
+ * Recoverable = not a code bug, fixable by a reload:
+ *  - stale dynamic-import chunks after a deploy (isChunkLoadError)
+ *  - React + browser auto-translate DOM race (removeChild/insertBefore)
+ *  - React #306: a lazy element resolved to `undefined` (failed/stale chunk)
+ *  - the raw TypeError React.lazy throws when a chunk resolved to `undefined`
+ *    and it reads `.default` off it ("Cannot read properties of undefined
+ *    (reading 'default')" / "e._result is undefined") — same stale-chunk cause,
+ *    fires before #306. lazyWithRetry now prevents this upstream, but keep it as
+ *    a net for any lazy element that resolves undefined by another path.
+ * These get a friendly "updating" screen + guarded auto-reload instead of the
+ * crash report UI, so they no longer flood the crash channel.
+ */
+const isRecoverableError = (error: Error | null | undefined): boolean => {
+  if (!error) return false;
+  if (isChunkLoadError(error)) return true;
+  const msg = String(error.message || '');
+  return /removeChild|insertBefore|not a child of this node|Minified React error #306|invariant=306|_result|reading 'default'|reading "default"/i.test(msg);
+};
+
 const DISCORD_WEBHOOK_URL =
-  'https://discord.com/api/webhooks/1490734049004621964/NMycfXMQixIT9j5uGU-RU7krLmbgdFqQUqkQPpeTSJ_3BGpVOTcSZR3W7V31lO-kTrRf';
+  'https://discord.com/api/webhooks/1514627721916055654/hRzr4oYG8-D44WR0UDpHfwtrE7D1uomP0NcVazRjB2DKOEfxuhK2g6DQD52qrYOuMYVJ';
 
 function getDeviceInfo() {
   const ua = navigator.userAgent;
@@ -61,15 +84,24 @@ function getDeviceInfo() {
 class ErrorBoundary extends React.Component<React.PropsWithChildren, ErrorBoundaryState> {
   constructor(props: React.PropsWithChildren) {
     super(props);
-    this.state = { hasError: false, error: null, errorInfo: null, sending: false, sent: false, sendError: false };
+    this.state = { hasError: false, error: null, errorInfo: null, sending: false, sent: false, sendError: false, recoverable: false, reloadScheduled: true };
   }
 
   static getDerivedStateFromError(error: Error): Partial<ErrorBoundaryState> {
-    return { hasError: true, error };
+    // Decide recoverability synchronously so the soft screen renders on the
+    // first frame — no flash of the crash UI before componentDidCatch runs.
+    return { hasError: true, error, recoverable: isRecoverableError(error) };
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
     this.setState({ errorInfo });
+    if (isRecoverableError(error)) {
+      // Not a code bug — recover quietly with a guarded reload (the budget in
+      // reloadForChunkFailure caps attempts so this can never loop).
+      const reloadScheduled = reloadForChunkFailure();
+      this.setState({ recoverable: true, reloadScheduled });
+      return;
+    }
     console.error('[ErrorBoundary]', error, errorInfo);
   }
 
@@ -130,6 +162,36 @@ class ErrorBoundary extends React.Component<React.PropsWithChildren, ErrorBounda
 
   render() {
     if (!this.state.hasError) return this.props.children;
+
+    // Recoverable errors (stale chunk after deploy, translate DOM race, #306):
+    // friendly "updating" screen + guarded auto-reload — no crash report.
+    if (this.state.recoverable) {
+      const { error, reloadScheduled } = this.state;
+      const isChunk = isChunkLoadError(error);
+      const title = isChunk ? 'Mise à jour de Movix' : 'Rechargement';
+      const body = reloadScheduled
+        ? isChunk
+          ? 'Une nouvelle version est disponible. Rechargement en cours…'
+          : 'Un souci d’affichage temporaire est survenu. Rechargement en cours…'
+        : 'Le rechargement automatique a échoué. Réessaie manuellement.';
+      return (
+        <div style={{ minHeight: '100vh', backgroundColor: '#000', color: '#f3f4f6', fontFamily: 'ui-sans-serif, system-ui, sans-serif', padding: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ maxWidth: 420, width: '100%', textAlign: 'center' }}>
+            <div style={{ fontSize: 32, fontWeight: 900, color: '#dc2626', letterSpacing: '0.1em', marginBottom: 24 }}>MOVIX</div>
+            {reloadScheduled && (
+              <div style={{ width: 40, height: 40, margin: '0 auto 24px', border: '3px solid rgba(255,255,255,0.1)', borderTopColor: '#dc2626', borderRadius: '50%', animation: 'movix-eb-spin 0.8s linear infinite' }} />
+            )}
+            <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: '#fff' }}>{title}</h1>
+            <p style={{ margin: '12px 0 0', fontSize: 14, color: '#9ca3af', lineHeight: 1.5 }}>{body}</p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'center', marginTop: 24 }}>
+              <button onClick={this.handleReload} style={{ padding: '10px 20px', borderRadius: 8, border: 'none', fontWeight: 600, fontSize: 14, cursor: 'pointer', backgroundColor: '#dc2626', color: '#fff' }}>Recharger</button>
+              <button onClick={this.handleGoHome} style={{ padding: '10px 20px', borderRadius: 8, border: '1px solid #333', fontWeight: 600, fontSize: 14, cursor: 'pointer', backgroundColor: 'transparent', color: '#9ca3af' }}>Accueil</button>
+            </div>
+          </div>
+          <style>{`@keyframes movix-eb-spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      );
+    }
 
     const { error, errorInfo, sending, sent, sendError } = this.state;
     const info = getDeviceInfo();

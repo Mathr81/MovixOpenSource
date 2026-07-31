@@ -22,30 +22,24 @@ let deps = {
   CPASMAL_BASE_URL: '',
   TMDB_API_URL: '',
   TMDB_API_KEY: '',
-  axiosCpasmalRequest: async () => { throw new Error('cpasmal not configured'); },
-  DARKINO_PROXIES: [],
-  getDarkinoHttpProxyAgent: () => null,
+  makeCpasmalRequest: async () => { throw new Error('cpasmal not configured'); },
   getFromCacheNoExpiration: async () => null,
   shouldUpdateCache: async () => true
 };
 
 /**
- * Crée une fonction de requête scopée qui utilise toujours le même proxy HTTP (DARKINO_PROXIES).
- * Garantit que tout le scraping d'un même film/série passe par la même IP.
- * Un proxy est obligatoire — si aucun n'est disponible, une erreur est levée.
+ * Toutes les requêtes Cpasmal passent par CycleTLS (JA3 Chrome) : Cloudflare
+ * bot-challenge les requêtes axios + proxies datacenter avec un 403 (GET comme
+ * POST). makeCpasmalRequest tourne un vrai JA3 Chrome sur le pool ProxyScrape.
+ * Adapte la config axios-style { method, url, data, headers } du routeur vers
+ * la signature de makeCpasmalRequest et renvoie un objet axios-like { data }.
  */
 function _createScopedRequest() {
-  const proxies = deps.DARKINO_PROXIES;
-  if (!proxies || proxies.length === 0) {
-    throw new Error('Cpasmal: aucun proxy HTTP configuré (DARKINO_PROXIES vide)');
-  }
-  const proxy = proxies[Math.floor(Math.random() * proxies.length)];
-  const agents = deps.getDarkinoHttpProxyAgent(proxy);
-  if (!agents) {
-    throw new Error(`Cpasmal: impossible de créer l'agent proxy pour ${proxy.host}:${proxy.port}`);
-  }
-  agents._label = `${proxy.host}:${proxy.port}`;
-  return (config) => deps.axiosCpasmalRequest({ ...config, _cpasmalAgents: agents });
+  return (config) => deps.makeCpasmalRequest(config.url, {
+    method: config.method || 'get',
+    body: config.data || '',
+    headers: config.headers || {},
+  });
 }
 
 function configure(injected) {
@@ -189,15 +183,30 @@ function _scoreCpasmalResults($, items, title, year, type, normalize) {
 
 // Run a single cpasmal search query across multiple pages, return { bestMatch, bestScore }
 async function _runCpasmalSearch(searchQuery, title, year, type, normalize, maxPages, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   let bestMatch = null;
   let bestScore = -1;
   let page = 1;
 
   while (page <= maxPages) {
     try {
-      const searchUrl = `${deps.CPASMAL_BASE_URL}/index.php?do=search&subaction=search&search_start=${page}&full_search=0&story=${encodeURIComponent(searchQuery)}`;
-      const response = await doRequest({ method: 'get', url: searchUrl });
+      // POST form (DLE classic): Cloudflare WAF 403s the GET ?do=search querystring, POST body passes.
+      const params = new URLSearchParams();
+      params.append('do', 'search');
+      params.append('subaction', 'search');
+      params.append('search_start', String(page));
+      params.append('full_search', '0');
+      params.append('story', searchQuery);
+      const response = await doRequest({
+        method: 'post',
+        url: `${deps.CPASMAL_BASE_URL}/index.php`,
+        data: params.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': deps.CPASMAL_BASE_URL,
+          'Referer': `${deps.CPASMAL_BASE_URL}/`
+        }
+      });
       const $ = cheerio.load(response.data);
 
       const items = $('div.thumb');
@@ -223,7 +232,7 @@ async function _runCpasmalSearch(searchQuery, title, year, type, normalize, maxP
 }
 
 async function searchCpasmal(title, year, type, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   // Prepare search query: normalize spaces and keep colons
   let searchQuery = title.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -246,8 +255,22 @@ async function searchCpasmal(title, year, type, requestFn) {
   // === Strategy 3: If still no good match, try full_search=1 ===
   if (bestScore < 20) {
     try {
-      const fullSearchUrl = `${deps.CPASMAL_BASE_URL}/index.php?do=search&subaction=search&search_start=1&full_search=1&story=${encodeURIComponent(searchQuery)}`;
-      const response = await doRequest({ method: 'get', url: fullSearchUrl });
+      const params = new URLSearchParams();
+      params.append('do', 'search');
+      params.append('subaction', 'search');
+      params.append('search_start', '1');
+      params.append('full_search', '1');
+      params.append('story', searchQuery);
+      const response = await doRequest({
+        method: 'post',
+        url: `${deps.CPASMAL_BASE_URL}/index.php`,
+        data: params.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': deps.CPASMAL_BASE_URL,
+          'Referer': `${deps.CPASMAL_BASE_URL}/`
+        }
+      });
       const $ = cheerio.load(response.data);
       const items = $('div.thumb');
       if (items.length > 0) {
@@ -267,7 +290,7 @@ async function searchCpasmal(title, year, type, requestFn) {
 
 // Helper to extract links from a movie page
 async function extractMovieLinks(url, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   if (process.env.DEBUG_CPASMAL) console.time(`[Cpasmal] ExtractMovieLinks ${url}`);
   try {
     const response = await doRequest({ method: 'get', url: url });
@@ -353,7 +376,7 @@ async function extractMovieLinks(url, requestFn) {
 
 // Helper to extract links from a series episode
 async function extractSeriesLinks(seriesUrl, seasonNumber, episodeNumber, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   if (process.env.DEBUG_CPASMAL) console.time(`[Cpasmal] ExtractSeriesLinks ${seriesUrl}`);
   try {
     const response = await doRequest({ method: 'get', url: seriesUrl });

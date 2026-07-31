@@ -430,6 +430,63 @@ router.get('/episodes', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// fetchSeasonEpisodesViaDeepPage -- récupère TOUS les épisodes d'une saison
+// via l'API JSON publique deep-page (celle du bouton "Afficher plus").
+// La page programme n'embarque côté serveur qu'UNE carte par saison ; le
+// reste est chargé côté client via ce même endpoint.
+// seasonPath: "/france-4/sous-les-mers/saison-4" -> slug "france-4_sous-les-mers_saison-4"
+// ---------------------------------------------------------------------------
+async function fetchSeasonEpisodesViaDeepPage(seasonPath, seasonNum) {
+  const slug = seasonPath.replace(/^\/+|\/+$/g, '').split('/').join('_');
+  const episodes = [];
+  const seen = new Set();
+  let page = 0;
+
+  for (let i = 0; i < 20; i++) { // garde-fou : 20 pages x 100 = 2000 épisodes max
+    const apiUrl = `${FTV_BASE}/api/deep-page/?slug=${encodeURIComponent(slug)}&type=season&page=${page}`
+      + '&filter=only-visible&filter=with-no-vod&filter=only-replay&size=100&sort=episode%3Aasc';
+    const { data } = await axios.get(apiUrl, {
+      headers: { ...FTV_BROWSER_HEADERS, 'Accept': 'application/json' },
+      proxy: false,
+      timeout: 15000,
+    });
+
+    const items = Array.isArray(data?.result) ? data.result : [];
+    for (const item of items) {
+      const c = item?.content || {};
+      const t = item?.tracking || {};
+      if (c.type !== 'video' || !c.url) continue;
+      if (seen.has(c.url)) continue;
+      seen.add(c.url);
+
+      const title = c.title || '';
+      const epNumMatch = title.match(/E(\d+)/);
+
+      episodes.push({
+        title,
+        program: '',
+        description: c.description || '',
+        url: `${FTV_BASE}${c.url}`,
+        thumbnail: c.images?.base?.x2 || c.images?.base?.x1 || null,
+        contentId: c.id || t.content_id || null,
+        videoId: t.video_factory_id || null,
+        season: seasonNum,
+        episode: epNumMatch ? parseInt(epNumMatch[1]) : null,
+        csa: c.csa || null,
+        duration: c.duration || null,
+      });
+    }
+
+    const next = data?.cursor?.next;
+    if (next === null || next === undefined || next === page) break;
+    page = next;
+  }
+
+  episodes.sort((a, b) => (a.episode || 0) - (b.episode || 0));
+  return episodes;
+}
+
+// ---------------------------------------------------------------------------
 // GET /info?url=https://www.france.tv/france-5/le-monde-de-jamy/...
 // Récupère les informations d'une page film (player) ou série (programme).
 // Détecte automatiquement le type de page et retourne les données structurées.
@@ -684,6 +741,26 @@ router.get('/info', async (req, res) => {
           });
         }
       }
+
+      // La page programme n'embarque qu'UNE carte par saison dans le payload
+      // RSC serveur (le reste est lazy-loadé). On complète chaque saison via
+      // l'API deep-page ; en cas d'échec on garde les épisodes extraits du RSC.
+      await Promise.all(seasons.map(async (s) => {
+        const firstEp = s.episodes[0];
+        if (!firstEp || !firstEp.url) return;
+        try {
+          const epPath = new URL(firstEp.url).pathname;       // /france-4/.../saison-4/123-x.html
+          const seasonPath = epPath.replace(/\/[^/]*$/, '');  // /france-4/.../saison-4
+          if (!seasonPath) return;
+          const fullEpisodes = await fetchSeasonEpisodesViaDeepPage(seasonPath, s.number);
+          if (fullEpisodes.length > s.episodes.length) {
+            s.episodes = fullEpisodes;
+            s.episodeCount = fullEpisodes.length;
+          }
+        } catch (e) {
+          console.warn(`[FTV] deep-page failed for ${s.name}: ${e.message}`);
+        }
+      }));
 
       // If no seasons found with the split approach, try the card-based approach from /episodes
       if (seasons.length === 0) {

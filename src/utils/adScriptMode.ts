@@ -12,7 +12,7 @@
 export const SCRIPT_AD_MODE_ENABLED = false;
 
 // Ad-network script src, protocol-relative as delivered by the network.
-export const AD_SCRIPT_SRC = '//vf.amildarrobomb.com/r7gP5R6D5YTruZr/142815';
+export const AD_SCRIPT_SRC = '//endedstrung.com/92/93/15/92931582a515c4ab9a953e76e3a6cadd.js';
 
 // Marker attribute used to keep injection idempotent.
 const AD_SCRIPT_MARKER = 'data-movix-ad-script';

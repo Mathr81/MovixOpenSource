@@ -23,18 +23,21 @@ type Phase = 'idle' | 'loading' | 'completing' | 'fading';
  */
 export const TopProgressBar = () => {
   const [phase, setPhase] = useState<Phase>('idle');
-  const [progress, setProgress] = useState(0);
   const startTimeRef = useRef<number>(0);
   const progressRef = useRef<number>(0);
+  const barRef = useRef<HTMLDivElement | null>(null);
   const showTimerRef = useRef<number | null>(null);
   const fillTimerRef = useRef<number | null>(null);
   const fadeTimerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
+    // Writes the bar fill directly on the DOM node (scaleX = compositor-only)
+    // instead of setState per rAF tick — no React re-render, no layout/paint.
     const updateProgress = (p: number) => {
       progressRef.current = p;
-      setProgress(p);
+      const bar = barRef.current;
+      if (bar) bar.style.transform = `scaleX(${p})`;
     };
 
     const startTick = () => {
@@ -164,11 +167,11 @@ export const TopProgressBar = () => {
   // During `completing`, use the full fill duration as the CSS transition so
   // the catch-up to 100% interpolates smoothly. During `loading`, use a short
   // transition so the rAF-driven micro-updates blend without lag.
-  const widthTransition = reduceMotion
+  const barTransition = reduceMotion
     ? 'none'
     : phase === 'completing'
-      ? `width ${COMPLETE_FILL_MS}ms ease-out`
-      : 'width 200ms ease-out';
+      ? `transform ${COMPLETE_FILL_MS}ms ease-out`
+      : 'transform 200ms ease-out';
 
   return (
     <div
@@ -186,13 +189,16 @@ export const TopProgressBar = () => {
       }}
     >
       <div
+        ref={barRef}
         style={{
           height: '100%',
-          width: `${progress * 100}%`,
+          width: '100%',
           background: COLOR,
           boxShadow: `0 0 6px ${COLOR}, 0 0 3px ${COLOR}`,
-          transition: widthTransition,
-          willChange: 'width, opacity',
+          transform: `scaleX(${progressRef.current})`,
+          transformOrigin: '0 50%',
+          transition: barTransition,
+          willChange: 'transform',
         }}
       />
     </div>

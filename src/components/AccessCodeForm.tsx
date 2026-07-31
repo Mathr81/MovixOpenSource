@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X } from 'lucide-react';
+import { X, Crown } from 'lucide-react';
 import { useVipModal } from '../context/VipModalContext';
 import { useTranslation } from 'react-i18next';
+import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 
 // Interface SellAuth supprimée car nous utilisons désormais Discord pour les tickets VIP
 
@@ -147,17 +148,25 @@ const AccessCodeForm: React.FC<AccessCodeFormProps> = ({ isModal = false, hideNo
                     <li>{t('vip.noAds')}</li>
                     <li>{t('vip.prioritySupport')}</li>
                   </ul>
-                  <p className="text-sm text-gray-400 mt-6">
-                    {t('vip.getAccessClicks')}
-                  </p>
                   <p className="text-center py-3 px-4 bg-gray-700/60 rounded-xl text-gray-200">
-                    {t('vip.joinTelegramForVip')}
+                    {t('vip.donateForKey')}
                   </p>
+                  <Link
+                    to="/vip"
+                    onClick={() => {
+                      handleCloseVipInfo();
+                      closeVipModal();
+                    }}
+                    className="flex items-center justify-center gap-2 bg-yellow-500 hover:bg-yellow-400 text-black py-3 px-4 rounded-xl font-medium transition-colors duration-200"
+                  >
+                    <Crown className="w-4 h-4" />
+                    {t('vip.donate')}
+                  </Link>
                   <a
                     href="https://t.me/movix_site"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="block text-center bg-[#0088cc] text-white py-3 px-4 rounded-xl font-medium hover:bg-[#006699] transition-colors duration-200 mt-2"
+                    className="block text-center bg-[#0088cc] text-white py-3 px-4 rounded-xl font-medium hover:bg-[#006699] transition-colors duration-200"
                   >
                     {t('telegram.joinTelegram')}
                   </a>
@@ -258,17 +267,22 @@ const AccessCodeForm: React.FC<AccessCodeFormProps> = ({ isModal = false, hideNo
                     <li>{t('vip.multiLangSubtitles')}</li>
                     <li>{t('vip.multipleLanguages')}</li>
                   </ul>
-                  <p className="text-sm text-gray-400 mt-6">
-                    {t('vip.getAccessClicks')}
-                  </p>
                   <p className="text-center py-3 px-4 bg-gray-700/60 rounded-xl text-gray-200">
-                    {t('vip.contactTelegramForVip')}
+                    {t('vip.donateForKey')}
                   </p>
+                  <Link
+                    to="/vip"
+                    onClick={handleCloseVipInfo}
+                    className="flex items-center justify-center gap-2 bg-yellow-500 hover:bg-yellow-400 text-black py-3 px-4 rounded-xl font-medium transition-colors duration-200"
+                  >
+                    <Crown className="w-4 h-4" />
+                    {t('vip.donate')}
+                  </Link>
                   <a
                     href="https://t.me/movix_site"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="block text-center bg-[#0088cc] text-white py-3 px-4 rounded-xl font-medium hover:bg-[#006699] transition-colors duration-200 mt-2"
+                    className="block text-center bg-[#0088cc] text-white py-3 px-4 rounded-xl font-medium hover:bg-[#006699] transition-colors duration-200"
                   >
                     {t('telegram.joinTelegram')}
                   </a>

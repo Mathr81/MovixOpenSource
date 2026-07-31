@@ -105,11 +105,11 @@ const darkiHeaders = {
 };
 
 // Coflix config
-const COFLIX_BASE_URL = "https://coflix.date";
+const COFLIX_BASE_URL = "https://coflix.trade";
 const coflixHeaders = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-  Referer: "https://coflix.date",
+  Referer: "https://coflix.trade",
 };
 
 // === Axios instances for each source ===
@@ -221,6 +221,11 @@ http.globalAgent.maxFreeSockets = 32;
 https.globalAgent.keepAlive = true;
 https.globalAgent.maxSockets = 128;
 https.globalAgent.maxFreeSockets = 32;
+// Retire each pooled socket after N requests so a long-lived worker rotates
+// its keep-alive sockets instead of pinning the same TLS sessions / native
+// socket objects for the whole process lifetime.
+http.globalAgent.maxRequestsPerSocket = 1000;
+https.globalAgent.maxRequestsPerSocket = 1000;
 
 // === Create Express app ===
 const app = express();
@@ -253,12 +258,16 @@ app.use(keepAliveHeaders);
 app.use(domainRestriction);
 
 // 6. Body parsing
-app.use(express.json({ limit: "30mb" })); // Reduced from 1000mb to prevent abuse
+// Largest legitimate JSON body is the localStorage sync payload, capped at
+// 5MB by SYNC_LIMITS.maxRequestBytes (utils/syncPolicy.js); OAuth icon uploads
+// cap at 256KB. 8MB leaves headroom while preventing a single request from
+// pinning tens of MB of buffer until the response completes.
+app.use(express.json({ limit: "8mb" }));
 
 // 7. JSON parse error handler (must come right after json parser)
 app.use(jsonParseErrorHandler);
 
-app.use(express.urlencoded({ extended: true, limit: "5mb" })); // Reduced from 1000mb to prevent abuse
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 // 8. Serve uploaded OAuth app icons (`public/oauth-icons/<filename>`).
 //    Le panel admin upload ici, OAuthAuthorizePage lit `/oauth-icons/<filename>`.
@@ -312,10 +321,7 @@ cpasmalRouter.configure({
   CPASMAL_BASE_URL,
   TMDB_API_URL,
   TMDB_API_KEY,
-  axiosCpasmalRequest: require("./utils/proxyManager").axiosCpasmalRequest,
-  DARKINO_PROXIES: require("./utils/proxyManager").DARKINO_PROXIES,
-  getDarkinoHttpProxyAgent: require("./utils/proxyManager")
-    .getDarkinoHttpProxyAgent,
+  makeCpasmalRequest: require("./utils/proxyManager").makeCpasmalRequest,
   getFromCacheNoExpiration,
   shouldUpdateCache,
 });
@@ -468,6 +474,7 @@ app.use('/', searchRouter);
 app.use('/api', downloadRouter);
 app.use('/api/fstream', require('./routes/fstream'));
 app.use('/api/wiflix', require('./routes/wiflix'));
+app.use('/api/j1f', require('./routes/j1f'));
 app.use('/api', require('./routes/sync'));
 app.use('/api/profiles', require('./routes/profiles'));
 app.use('/api/help', require('./routes/helpFeedback'));
@@ -476,7 +483,6 @@ app.use('/api/oauth', oauthRouter);
 app.use('/api/admin/oauth-apps', require('./routes/adminOauthApps'));
 app.use('/api/sessions', require('./routes/sessions'));
 app.use('/api', require('./routes/debrid'));
-app.use('/proxy', require('./routes/proxy'));
 app.use('/api', require('./routes/admin'));
 app.use('/api', vipDonationsRouter);
 app.use('/api', vipPayblisRouter);
@@ -556,6 +562,9 @@ const appReady = (async () => {
       await oauthClientsDb.ensureTables();
       await oauthClientsDb.migrateLegacyJsonIfNeeded();
       await oauthClientsDb.reloadCache();
+      // Cluster mode: subscribe so this worker reloads when any other worker
+      // mutates an OAuth client (see oauthClientsDb cross-worker invalidation).
+      oauthClientsDb.startClientsCacheSubscriber();
       console.log('OAuth client tables initialized successfully');
 
       // Initialize Wishboard routes
@@ -663,38 +672,21 @@ function getAppPool() {
   return getPool();
 }
 
-// === Hydracker queue drain timer ===
-// Every worker fires the tick. drainQueueOnce uses Redis worker_lock so only
-// one worker actually drains; the others get { drained: false, reason: 'lock_taken' }
-// and skip. This means the drain runs in a worker process which has full
-// darkiworld auth context (cookies, XSRF, darkiHeaders, axiosDarkinoRequest
-// configured via axiosHelpers.configure earlier in this file).
-const hydrackerQueue = require('./utils/hydrackerQueue');
-const DRAIN_INTERVAL_MS = 5000;
-if (hydrackerQueue.BATCHING_ENABLED) {
-  setInterval(async () => {
-    try {
-      const result = await hydrackerQueue.drainQueueOnce({
-        redis,
-        cacheDir: DOWNLOAD_CACHE_DIR,
-        generateCacheKey,
-        getFromCacheNoExpiration,
-        saveToCache,
-        axiosDarkinoRequest: axiosHelpers.axiosDarkinoRequest,
-        refreshDarkinoSessionIfNeeded
-      });
-      if (result.drained) {
-        console.log(`[hydracker] drained batch of ${result.batchSize}`);
-      } else if (result.error) {
-        console.warn(`[hydracker] drain error: ${result.error} (requeued ${result.requeued || 0})`);
-      }
-    } catch (e) {
-      console.warn(`[hydracker] drain tick threw:`, e?.message || e);
+// Hydracker freeze (2026-05-15): the queue, worker lock, and rate-limit key
+// from the old architecture are dead. Clear them once on boot so they don't
+// linger or confuse ops dashboards.
+(async () => {
+  try {
+    if (redis && typeof redis.del === 'function') {
+      await redis.del('hydracker:queue:pending',
+                      'hydracker:worker_lock',
+                      'hydracker:rate_limited_until');
+      console.log('[hydracker-freeze] cleared legacy redis keys');
     }
-  }, DRAIN_INTERVAL_MS);
-} else {
-  console.log('[hydracker] HYDRACKER_BATCHING_ENABLED=false → drain timer skipped, decode runs synchronously');
-}
+  } catch (e) {
+    console.warn('[hydracker-freeze] redis cleanup failed:', e?.message);
+  }
+})();
 
 // === Unified error handler ===
 app.use((err, req, res, next) => {

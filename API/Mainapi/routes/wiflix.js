@@ -18,17 +18,21 @@ const {
 } = require("../utils/cacheManager");
 const {
   makeWiflixRequest,
+  makeWiflixSearchRequest,
 } = require("../utils/proxyManager");
 const { acquireRedisLock } = require("../utils/redisLock");
 const {
   fetchTmdbDetails,
   fetchTmdbSeason,
-  fetchTmdbFrenchReleaseYear,
 } = require("../utils/tmdbCache");
+// Movies are scraped from cinestream.info (flemmix's bot-shield is painful for
+// films); TV stays on flemmix below. Same return shape, so the route + cache
+// here consume it unchanged.
+const { fetchCinestreamMovieData } = require("./cinestream");
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 const TMDB_API_URL = "https://api.themoviedb.org/3";
-const WIFLIX_BASE_URL = "https://flemmix.farm";
+const WIFLIX_BASE_URL = "https://flemmix.golf";
 
 // === Cache helpers (local, since getFromCacheNoExpiration is not yet in cacheManager) ===
 const getFromCacheNoExpiration = async (cacheDir, key) => {
@@ -143,8 +147,9 @@ async function searchWiflixMovie(title, baseUrl = WIFLIX_BASE_URL) {
     let responseBody = null;
 
     try {
-      const res = await makeWiflixRequest(searchUrl, {
-        method: 'POST',
+      // Cookie handshake: GET homepage to harvest the bot-shield session cookie,
+      // then POST the search with it + h_check=25 on the same proxy.
+      const res = await makeWiflixSearchRequest(baseUrl + "/", searchUrl, {
         data: payload,
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -165,7 +170,10 @@ async function searchWiflixMovie(title, baseUrl = WIFLIX_BASE_URL) {
     }
 
     const $ = cheerio.load(responseBody);
-    const movBlocks = $("#dle-content div.mov");
+    // Template has no #dle-content wrapper. Real results are div.mov; the
+    // "Populaires" reco block (#no-results-rec) is hidden when results exist —
+    // exclude it exactly like the site's own JS result counter does.
+    const movBlocks = $("div.mov").not("#no-results-rec .mov");
     if (movBlocks.length === 0) return { url: null, debugHtml: responseBody };
 
     let bestMatch = null;
@@ -352,9 +360,10 @@ async function extractWiflixPlayers(pageUrl) {
           $episodeDiv.find("a[onclick]").each((linkIndex, linkElement) => {
             const $link = $(linkElement);
             const onclick = $link.attr("onclick");
-            const $span = $link.find("span.clichost");
+            // Template dropped the .clichost class (like the movie page) — match any span.
+            const $span = $link.find("span");
             if (onclick && $span.length) {
-              const match = onclick.match(/loadVideo\('(.+?)'\)/);
+              const match = onclick.match(/loadVideo\('([^']+)'/);
               if (match && match[1]) {
                 let processedUrl = match[1];
                 const name = $span.text().trim();
@@ -395,7 +404,7 @@ async function extractWiflixPlayers(pageUrl) {
         const onclick = $link.attr("onclick");
         const $span = $link.find("span");
         if (onclick && $span.length) {
-          const match = onclick.match(/loadVideo\('(.+?)'\)/);
+          const match = onclick.match(/loadVideo\('([^']+)'/);
           if (match && match[1]) {
             let processedUrl = match[1];
             const name = $span.text().trim();
@@ -441,129 +450,9 @@ async function extractWiflixPlayers(pageUrl) {
   }
 }
 
-function categorizeWiflixPlayers(players) {
-  const vf = [];
-  const vostfr = [];
-  players.forEach((player) => {
-    if (player.type === "VOSTFR") vostfr.push(player);
-    else vf.push(player);
-  });
-  return { vf, vostfr };
-}
-
 // === Data Fetching ===
-async function fetchWiflixMovieData(tmdbId, cachedData = null) {
-  try {
-    const tmdbData = await fetchTmdbDetails(
-      TMDB_API_URL,
-      TMDB_API_KEY,
-      tmdbId,
-      "movie",
-      "fr-FR",
-    );
-
-    if (!tmdbData) {
-      if (cachedData) return cachedData;
-      return {
-        success: false,
-        error: "Film non trouve sur TMDB",
-        tmdb_id: tmdbId,
-      };
-    }
-
-    const originalData = tmdbData;
-    const titlesToTry = [
-      tmdbData.title,
-      originalData.original_title,
-      originalData.title,
-    ]
-      .filter(Boolean)
-      .filter((title, index, arr) => arr.indexOf(title) === index);
-
-    let movieUrl = null;
-    let searchDebugHtml = null;
-    for (const title of titlesToTry) {
-      const searchResult = await searchWiflixMovie(title);
-      if (searchResult.url) { movieUrl = searchResult.url; break; }
-      searchDebugHtml = searchResult.debugHtml;
-    }
-
-    if (!movieUrl)
-      return {
-        success: false,
-        error: "Film non trouve sur Wiflix",
-        tmdb_id: tmdbId,
-        titles_tried: titlesToTry,
-        debugHtml: searchDebugHtml,
-      };
-
-    const extractionResult = await extractWiflixPlayers(movieUrl);
-    const players = extractionResult.players;
-    const wiflixReleaseYear = extractionResult.releaseYear;
-
-    if (players.length === 0)
-      return {
-        success: false,
-        error: "Aucun lecteur video trouve",
-        tmdb_id: tmdbId,
-        wiflix_url: movieUrl,
-        debugHtml: extractionResult.debugHtml,
-      };
-
-    if (wiflixReleaseYear) {
-      const frReleaseYear = await fetchTmdbFrenchReleaseYear(
-        TMDB_API_URL,
-        TMDB_API_KEY,
-        tmdbId,
-      );
-      const tmdbReleaseYear =
-        frReleaseYear ||
-        (tmdbData.release_date
-          ? new Date(tmdbData.release_date).getFullYear()
-          : null);
-      if (tmdbReleaseYear && wiflixReleaseYear !== tmdbReleaseYear) {
-        console.log(
-          `[WIFLIX MOVIE] Date mismatch: TMDB ${tmdbReleaseYear}${frReleaseYear ? " (FR)" : ""} vs Wiflix ${wiflixReleaseYear} pour ${tmdbData.title}`,
-        );
-        return {
-          success: false,
-          error: "Film non disponible sur Wiflix (date de sortie differente)",
-          tmdb_id: tmdbId,
-          wiflix_url: movieUrl,
-          tmdb_release_year: tmdbReleaseYear,
-          wiflix_release_year: wiflixReleaseYear,
-        };
-      }
-    }
-
-    const categorizedPlayers = categorizeWiflixPlayers(players);
-    return {
-      success: true,
-      tmdb_id: tmdbId,
-      title: tmdbData.title,
-      original_title: originalData.original_title,
-      wiflix_url: movieUrl,
-      players: { vf: categorizedPlayers.vf, vostfr: categorizedPlayers.vostfr },
-      cache_timestamp: new Date().toISOString(),
-    };
-  } catch (error) {
-    console.error(
-      `[WIFLIX MOVIE] Erreur dans fetchWiflixMovieData: ${error.message}`,
-    );
-    if (cachedData) {
-      console.log(
-        `[WIFLIX] Cache preserve malgre l'erreur pour movie ${tmdbId}`,
-      );
-      return cachedData;
-    }
-    return {
-      success: false,
-      error: "Erreur lors de la recuperation des donnees Wiflix",
-      message: error.message,
-      tmdb_id: tmdbId,
-    };
-  }
-}
+// Movie data now comes from cinestream.info (see ./cinestream + updateWiflixCache).
+// flemmix is still scraped for TV below.
 
 async function fetchWiflixTvData(tmdbId, season, cachedData = null) {
   try {
@@ -701,7 +590,7 @@ const updateWiflixCache = async (
 
     let newData;
     if (type === "movie")
-      newData = await fetchWiflixMovieData(tmdbId, existingCache);
+      newData = await fetchCinestreamMovieData(tmdbId, existingCache);
     else if (type === "tv")
       newData = await fetchWiflixTvData(tmdbId, season, existingCache);
     else throw new Error(`Type non supporte: ${type}`);

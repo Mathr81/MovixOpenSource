@@ -946,12 +946,11 @@ function createWishboardRouter(mysqlPool, redis) {
                 }
             }
 
-            // Resolve user data (username, avatar) for each admin via the
-            // shared helper — prefers OAuth provider identity over the
-            // generic Movix profile, so we display "Maxou DM" instead of
-            // "Admin" / "Profil".
+            // Resolve user data (username, avatar) for each greenlighter via the
+            // shared helper. Greenlight uses the user's FIRST Movix profile
+            // (preferProfile) for pdp + username, not the OAuth/Discord identity.
             const leaderboard = await Promise.all(rows.map(async (row) => {
-                const identity = await resolveAdminIdentity(row.admin_id, row.admin_auth_type);
+                const identity = await resolveAdminIdentity(row.admin_id, row.admin_auth_type, { preferProfile: true });
                 return {
                     admin_id: row.admin_id,
                     admin_auth_type: row.admin_auth_type,

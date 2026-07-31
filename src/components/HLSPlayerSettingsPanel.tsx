@@ -31,6 +31,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   darkino_main: 'darkino',
   fstream_main: 'fstream',
   wiflix_main: 'wiflix',
+  j1f_main: 'j1f',
   omega_main: 'omega',
   multi_main: 'coflix', // multi = coflix (naming historique)
   viper_main: 'viper',
@@ -95,6 +96,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     showCoflixMenu,
     showFstreamMenu,
     showWiflixMenu,
+    showJ1fMenu,
     showNexusMenu,
     showRivestreamMenu,
     showBravoMenu,
@@ -105,6 +107,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     coflixSources,
     fstreamSources,
     wiflixSources,
+    j1fSources,
     rivestreamSources,
     rivestreamCaptions,
     getOriginalUrl,
@@ -559,12 +562,13 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                     {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                                   </div>
                                   <div className="ml-3 flex items-center gap-2">
-                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
+                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
                                       <ChevronRight className={`w-4 h-4 transition-transform ${(source.type === 'darkino_main' && showDarkinoMenu) ||
                                         (source.type === 'omega_main' && showOmegaMenu) ||
                                         (source.type === 'multi_main' && showCoflixMenu) ||
                                         (source.type === 'fstream_main' && showFstreamMenu) ||
                                         (source.type === 'wiflix_main' && showWiflixMenu) ||
+                                        (source.type === 'j1f_main' && showJ1fMenu) ||
                                         (source.type === 'nexus_main' && showNexusMenu) ||
                                         (source.type === 'rivestream_main' && showRivestreamMenu) ||
                                         (source.type === 'bravo_main' && showBravoMenu) ||
@@ -818,33 +822,61 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       transition={{ duration: 0.15 }}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
-                                      {fstreamSources && fstreamSources.length > 0 && fstreamSources.map((fstreamSource: any, index: number) => {
-                                        const isFstreamActive = embedType === 'fstream' && getOriginalUrl(embedUrl || '') === fstreamSource.decoded_url;
-                                        const hosterId = detectHosterFromUrl(fstreamSource.decoded_url, fstreamSource.label);
-                                        return (
-                                          <div key={`fstream_${index}`} className="mb-2 flex items-stretch gap-2">
-                                            <motion.button
-                                              initial={{ opacity: 0 }}
-                                              animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
-                                              onClick={() => handleSourceChange('fstream', `fstream_${index}`, fstreamSource.decoded_url || '')}
-                                              className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isFstreamActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
-                                            >
-                                              <span>
-                                                {fstreamSource.label}
-                                                {hosterId && pinnedHosterId === hosterId && (
-                                                  <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
-                                                )}
-                                              </span>
-                                              <div className="flex items-center gap-2">
-                                                <span className="text-xs text-gray-500">{fstreamSource.category}</span>
-                                                {isFstreamActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                      {fstreamSources && fstreamSources.length > 0 && (() => {
+                                        const sourcesByCategory = fstreamSources.reduce((acc: Record<string, any[]>, s: any) => {
+                                          const category = s.category || 'Default';
+                                          if (!acc[category]) acc[category] = [];
+                                          acc[category].push(s);
+                                          return acc;
+                                        }, {} as Record<string, any[]>);
+                                        const categoryOrder = [
+                                          { key: 'VFQ', label: t('watch.frenchQuality'), flagCode: 'FR' },
+                                          { key: 'VFF', label: t('watch.frenchFilm'), flagCode: 'FR' },
+                                          { key: 'VF', label: t('watch.french'), flagCode: 'FR' },
+                                          { key: 'VOSTFR', label: t('watch.voSubtitledFr'), flagCode: 'GB' },
+                                          { key: 'Default', label: t('watch.unknownLang'), emoji: '🌍' },
+                                        ];
+                                        return categoryOrder.map((cat) => {
+                                          const categorySources = sourcesByCategory[cat.key];
+                                          if (!categorySources || categorySources.length === 0) return null;
+                                          return (
+                                            <div key={`fstream_category_${cat.key}`} className="mb-3">
+                                              <div className="flex items-center gap-2 mb-2 px-2">
+                                                <span className="text-lg">{'flagCode' in cat && cat.flagCode ? <ReactCountryFlag countryCode={cat.flagCode as string} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /> : cat.emoji}</span>
+                                                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{cat.label} ({categorySources.length})</span>
                                               </div>
-                                            </motion.button>
-                                            {renderHosterPin(hosterId)}
-                                          </div>
-                                        );
-                                      })}
+                                              {categorySources.map((fstreamSource: any) => {
+                                                const index = fstreamSources.findIndex((s: any) => s === fstreamSource);
+                                                const isFstreamActive = embedType === 'fstream' && getOriginalUrl(embedUrl || '') === fstreamSource.decoded_url;
+                                                const hosterId = detectHosterFromUrl(fstreamSource.decoded_url, fstreamSource.label);
+                                                return (
+                                                  <div key={`fstream_${index}`} className="mb-2 ml-4 flex items-stretch gap-2">
+                                                    <motion.button
+                                                      initial={{ opacity: 0 }}
+                                                      animate={{ opacity: 1 }}
+                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      onClick={() => handleSourceChange('fstream', `fstream_${index}`, fstreamSource.decoded_url || '')}
+                                                      className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isFstreamActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
+                                                    >
+                                                      <span>
+                                                        {fstreamSource.label}
+                                                        {hosterId && pinnedHosterId === hosterId && (
+                                                          <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                                        )}
+                                                      </span>
+                                                      <div className="flex items-center gap-2">
+                                                        <span className="text-xs text-gray-500">{fstreamSource.category}</span>
+                                                        {isFstreamActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                                      </div>
+                                                    </motion.button>
+                                                    {renderHosterPin(hosterId)}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          );
+                                        }).filter(Boolean);
+                                      })()}
                                     </motion.div>
                                   )}
                                 </AnimatePresence>
@@ -860,33 +892,125 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       transition={{ duration: 0.15 }}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
-                                      {wiflixSources && wiflixSources.length > 0 && wiflixSources.map((wiflixSource: any, index: number) => {
-                                        const isWiflixActive = embedType === 'wiflix' && embedUrl === wiflixSource.url;
-                                        const hosterId = detectHosterFromUrl(wiflixSource.url, wiflixSource.label);
-                                        return (
-                                          <div key={`wiflix_${index}`} className="mb-2 flex items-stretch gap-2">
-                                            <motion.button
-                                              initial={{ opacity: 0 }}
-                                              animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
-                                              onClick={() => handleSourceChange('wiflix', `wiflix_${index}`, wiflixSource.url || '')}
-                                              className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isWiflixActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
-                                            >
-                                              <span>
-                                                {wiflixSource.label}
-                                                {hosterId && pinnedHosterId === hosterId && (
-                                                  <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
-                                                )}
-                                              </span>
-                                              <div className="flex items-center gap-2">
-                                                <span className="text-xs text-gray-500">{wiflixSource.category}</span>
-                                                {isWiflixActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                      {wiflixSources && wiflixSources.length > 0 && (() => {
+                                        const sourcesByCategory = wiflixSources.reduce((acc: Record<string, any[]>, s: any) => {
+                                          const category = s.category || 'Default';
+                                          if (!acc[category]) acc[category] = [];
+                                          acc[category].push(s);
+                                          return acc;
+                                        }, {} as Record<string, any[]>);
+                                        const categoryOrder = [
+                                          { key: 'VF', label: t('watch.french'), flagCode: 'FR' },
+                                          { key: 'VOSTFR', label: t('watch.voSubtitledFr'), flagCode: 'GB' },
+                                        ];
+                                        return categoryOrder.map((cat) => {
+                                          const categorySources = sourcesByCategory[cat.key];
+                                          if (!categorySources || categorySources.length === 0) return null;
+                                          return (
+                                            <div key={`wiflix_category_${cat.key}`} className="mb-3">
+                                              <div className="flex items-center gap-2 mb-2 px-2">
+                                                <span className="text-lg"><ReactCountryFlag countryCode={cat.flagCode} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /></span>
+                                                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{cat.label} ({categorySources.length})</span>
                                               </div>
-                                            </motion.button>
-                                            {renderHosterPin(hosterId)}
-                                          </div>
-                                        );
-                                      })}
+                                              {categorySources.map((wiflixSource: any) => {
+                                                const index = wiflixSources.findIndex((s: any) => s === wiflixSource);
+                                                const isWiflixActive = embedType === 'wiflix' && embedUrl === wiflixSource.url;
+                                                const hosterId = detectHosterFromUrl(wiflixSource.url, wiflixSource.label);
+                                                return (
+                                                  <div key={`wiflix_${index}`} className="mb-2 ml-4 flex items-stretch gap-2">
+                                                    <motion.button
+                                                      initial={{ opacity: 0 }}
+                                                      animate={{ opacity: 1 }}
+                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      onClick={() => handleSourceChange('wiflix', `wiflix_${index}`, wiflixSource.url || '')}
+                                                      className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isWiflixActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
+                                                    >
+                                                      <span>
+                                                        {wiflixSource.label}
+                                                        {hosterId && pinnedHosterId === hosterId && (
+                                                          <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                                        )}
+                                                      </span>
+                                                      <div className="flex items-center gap-2">
+                                                        <span className="text-xs text-gray-500">{wiflixSource.category}</span>
+                                                        {isWiflixActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                                      </div>
+                                                    </motion.button>
+                                                    {renderHosterPin(hosterId)}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          );
+                                        }).filter(Boolean);
+                                      })()}
+                                    </motion.div>
+                                  )}
+                                </AnimatePresence>
+                              )}
+                              {/* Ajout du menu déroulant J1F / 1jour1film */}
+                              {source.type === 'j1f_main' && (
+                                <AnimatePresence>
+                                  {showJ1fMenu && (
+                                    <motion.div
+                                      initial={{ opacity: 0, y: -5 }}
+                                      animate={{ opacity: 1, y: 0 }}
+                                      exit={{ opacity: 0 }}
+                                      transition={{ duration: 0.15 }}
+                                      className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
+                                    >
+                                      {j1fSources && j1fSources.length > 0 && (() => {
+                                        const sourcesByCategory = j1fSources.reduce((acc: Record<string, any[]>, s: any) => {
+                                          const category = s.category || 'Default';
+                                          if (!acc[category]) acc[category] = [];
+                                          acc[category].push(s);
+                                          return acc;
+                                        }, {} as Record<string, any[]>);
+                                        const categoryOrder = [
+                                          { key: 'VF', label: t('watch.french'), flagCode: 'FR' },
+                                          { key: 'VOSTFR', label: t('watch.voSubtitledFr'), flagCode: 'GB' },
+                                        ];
+                                        return categoryOrder.map((cat) => {
+                                          const categorySources = sourcesByCategory[cat.key];
+                                          if (!categorySources || categorySources.length === 0) return null;
+                                          return (
+                                            <div key={`j1f_category_${cat.key}`} className="mb-3">
+                                              <div className="flex items-center gap-2 mb-2 px-2">
+                                                <span className="text-lg"><ReactCountryFlag countryCode={cat.flagCode} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /></span>
+                                                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{cat.label} ({categorySources.length})</span>
+                                              </div>
+                                              {categorySources.map((j1fSource: any) => {
+                                                const index = j1fSources.findIndex((s: any) => s === j1fSource);
+                                                const isJ1fActive = embedType === 'j1f' && embedUrl === j1fSource.url;
+                                                const hosterId = detectHosterFromUrl(j1fSource.url, j1fSource.label);
+                                                return (
+                                                  <div key={`j1f_${index}`} className="mb-2 ml-4 flex items-stretch gap-2">
+                                                    <motion.button
+                                                      initial={{ opacity: 0 }}
+                                                      animate={{ opacity: 1 }}
+                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      onClick={() => handleSourceChange('j1f', `j1f_${index}`, j1fSource.url || '')}
+                                                      className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isJ1fActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
+                                                    >
+                                                      <span>
+                                                        {j1fSource.label}
+                                                        {hosterId && pinnedHosterId === hosterId && (
+                                                          <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                                        )}
+                                                      </span>
+                                                      <div className="flex items-center gap-2">
+                                                        <span className="text-xs text-gray-500">{j1fSource.category}</span>
+                                                        {isJ1fActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                                      </div>
+                                                    </motion.button>
+                                                    {renderHosterPin(hosterId)}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          );
+                                        }).filter(Boolean);
+                                      })()}
                                     </motion.div>
                                   )}
                                 </AnimatePresence>
@@ -1418,7 +1542,11 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       <div className="mb-4">
                         <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">{t('watch.builtInSubtitles')}</h4>
                         {subtitles.map((track, idx) => {
-                          const id = `internal:${track.language || idx}`;
+                          // Key on idx, not language: two tracks can share a language
+                          // (e.g. "Français (forced)" + "Français"), and a language-based
+                          // id collides so both rows would show "Actif" and only the first
+                          // would ever be selectable.
+                          const id = `internal:${idx}`;
                           return (
                             <button
                               key={id}
@@ -2483,12 +2611,12 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <div>
                           <div className="flex justify-between items-center mb-1">
                             <span className="text-xs text-gray-300">{t('watch.contrastLabel')}</span>
-                            <span className="text-xs text-cyan-400 font-mono">{customOled.contrast.toFixed(2)}</span>
+                            <span className="text-xs text-cyan-400 font-mono">{(customOled.contrast ?? 1).toFixed(2)}</span>
                           </div>
-                          <input type="range" min="0.5" max="2" step="0.01" value={customOled.contrast}
+                          <input type="range" min="0.5" max="2" step="0.01" value={customOled.contrast ?? 1}
                             onChange={(e) => handleCustomOledChange('contrast', parseFloat(e.target.value))}
                             className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${((customOled.contrast - 0.5) / 1.5) * 100}%, #374151 ${((customOled.contrast - 0.5) / 1.5) * 100}%, #374151 100%)` }}
+                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${(((customOled.contrast ?? 1) - 0.5) / 1.5) * 100}%, #374151 ${(((customOled.contrast ?? 1) - 0.5) / 1.5) * 100}%, #374151 100%)` }}
                           />
                           <div className="flex justify-between text-[10px] text-gray-500 mt-0.5"><span>0.50</span><span>1.00</span><span>2.00</span></div>
                         </div>
@@ -2497,12 +2625,12 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <div>
                           <div className="flex justify-between items-center mb-1">
                             <span className="text-xs text-gray-300">{t('watch.saturationLabel')}</span>
-                            <span className="text-xs text-cyan-400 font-mono">{customOled.saturate.toFixed(2)}</span>
+                            <span className="text-xs text-cyan-400 font-mono">{(customOled.saturate ?? 1).toFixed(2)}</span>
                           </div>
-                          <input type="range" min="0" max="3" step="0.01" value={customOled.saturate}
+                          <input type="range" min="0" max="3" step="0.01" value={customOled.saturate ?? 1}
                             onChange={(e) => handleCustomOledChange('saturate', parseFloat(e.target.value))}
                             className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${(customOled.saturate / 3) * 100}%, #374151 ${(customOled.saturate / 3) * 100}%, #374151 100%)` }}
+                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${((customOled.saturate ?? 1) / 3) * 100}%, #374151 ${((customOled.saturate ?? 1) / 3) * 100}%, #374151 100%)` }}
                           />
                           <div className="flex justify-between text-[10px] text-gray-500 mt-0.5"><span>{t('watch.bwLabel')}</span><span>{t('watch.normalLabel')}</span><span>3.00</span></div>
                         </div>
@@ -2511,12 +2639,12 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <div>
                           <div className="flex justify-between items-center mb-1">
                             <span className="text-xs text-gray-300">{t('watch.brightnessLabel')}</span>
-                            <span className="text-xs text-cyan-400 font-mono">{customOled.brightness.toFixed(2)}</span>
+                            <span className="text-xs text-cyan-400 font-mono">{(customOled.brightness ?? 1).toFixed(2)}</span>
                           </div>
-                          <input type="range" min="0.3" max="1.8" step="0.01" value={customOled.brightness}
+                          <input type="range" min="0.3" max="1.8" step="0.01" value={customOled.brightness ?? 1}
                             onChange={(e) => handleCustomOledChange('brightness', parseFloat(e.target.value))}
                             className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${((customOled.brightness - 0.3) / 1.5) * 100}%, #374151 ${((customOled.brightness - 0.3) / 1.5) * 100}%, #374151 100%)` }}
+                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${(((customOled.brightness ?? 1) - 0.3) / 1.5) * 100}%, #374151 ${(((customOled.brightness ?? 1) - 0.3) / 1.5) * 100}%, #374151 100%)` }}
                           />
                           <div className="flex justify-between text-[10px] text-gray-500 mt-0.5"><span>{t('watch.darkLabel')}</span><span>{t('watch.normalLabel')}</span><span>{t('watch.brightLabel')}</span></div>
                         </div>
@@ -2525,12 +2653,12 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <div>
                           <div className="flex justify-between items-center mb-1">
                             <span className="text-xs text-gray-300">{t('watch.sepiaLabel')}</span>
-                            <span className="text-xs text-cyan-400 font-mono">{customOled.sepia.toFixed(2)}</span>
+                            <span className="text-xs text-cyan-400 font-mono">{(customOled.sepia ?? 0).toFixed(2)}</span>
                           </div>
-                          <input type="range" min="0" max="1" step="0.01" value={customOled.sepia}
+                          <input type="range" min="0" max="1" step="0.01" value={customOled.sepia ?? 0}
                             onChange={(e) => handleCustomOledChange('sepia', parseFloat(e.target.value))}
                             className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${customOled.sepia * 100}%, #374151 ${customOled.sepia * 100}%, #374151 100%)` }}
+                            style={{ background: `linear-gradient(to right, #06b6d4 0%, #06b6d4 ${(customOled.sepia ?? 0) * 100}%, #374151 ${(customOled.sepia ?? 0) * 100}%, #374151 100%)` }}
                           />
                           <div className="flex justify-between text-[10px] text-gray-500 mt-0.5"><span>0</span><span>0.50</span><span>1.00</span></div>
                         </div>

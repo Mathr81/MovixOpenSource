@@ -26,6 +26,8 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@emoji-mart/data": "^1.2.1",
     "@emoji-mart/react": "^1.1.1",
+    "@fontsource/archivo-black": "^5.2.8",
+    "@fontsource/inter": "^5.2.8",
     "@headlessui/react": "^2.2.0",
     "@hono/node-server": "^1.19.14",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -68,6 +70,7 @@
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.22.3",
     "react-snowfall": "^2.4.0",
+    "recharts": "^3.8.1",
     "remark-emoji": "^5.0.1",
     "remark-gfm": "^4.0.1",
     "shaka-player": "^5.0.0",
@@ -104,6 +107,7 @@
     "wrangler": "^4.15.1"
   },
   "overrides": {
-    "framer-motion": "11.11.10"
+    "framer-motion": "11.11.10",
+    "es-toolkit": "1.39.3"
   }
 }

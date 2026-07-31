@@ -4,16 +4,15 @@
  *
  * Toutes les routes sont protégées par `isAdmin` (table `admins`).
  * Source de vérité : la table `oauth_clients` (alimentée au boot par
- * `oauthClientsDb.reloadCache()`). Toute mutation appelle `reloadCache()`
- * en fin de requête pour rafraîchir le cache du worker courant.
+ * `oauthClientsDb.reloadCache()`). Toute mutation appelle
+ * `reloadCacheAndBroadcast()` en fin de requête : recharge le cache du
+ * worker courant ET publie sur Redis (canal `oauth:clients:changed`) pour
+ * que tous les autres workers du cluster rechargent aussi.
  *
- * Note multi-worker : chaque worker a son propre cache in-process. Une
- * mutation depuis le worker A ne rafraîchit pas le cache du worker B
- * immédiatement. C'est acceptable car :
- *   1) les opérations admin sont rares ;
- *   2) le cache est rechargé au boot ;
- *   3) une lecture stale max 1 requête.
- * Si besoin d'invalidation cross-worker → publier un message Redis.
+ * Sans ce broadcast, un worker dont le cache est stale rejette
+ * indéfiniment les requêtes OAuth d'un client modifié après le boot
+ * (ex. une redirect_uri ajoutée) — symptôme intermittent selon le worker
+ * qui reçoit la requête.
  */
 
 const express = require('express');
@@ -286,7 +285,7 @@ router.post('/', async (req, res) => {
       ],
     );
 
-    await oauthClientsDb.reloadCache();
+    await oauthClientsDb.reloadCacheAndBroadcast();
     const row = await fetchAppByClientId(pool, clientId);
     const serialized = serializeAppRow(row);
     // Le secret n'est exposé qu'UNE fois (à la création) — l'admin doit le copier.
@@ -359,7 +358,7 @@ router.put('/:clientId', async (req, res) => {
       params,
     );
 
-    await oauthClientsDb.reloadCache();
+    await oauthClientsDb.reloadCacheAndBroadcast();
     const row = await fetchAppByClientId(pool, clientId);
     return res.json({ success: true, app: serializeAppRow(row) });
   } catch (err) {
@@ -382,7 +381,7 @@ router.post('/:clientId/regenerate-secret', async (req, res) => {
       'UPDATE oauth_clients SET client_secret = ?, updated_at = ? WHERE client_id = ?',
       [newSecret, Date.now(), clientId],
     );
-    await oauthClientsDb.reloadCache();
+    await oauthClientsDb.reloadCacheAndBroadcast();
     return res.json({ success: true, clientSecret: newSecret });
   } catch (err) {
     return serverError(res, err, 'Impossible de régénérer le secret');
@@ -403,7 +402,7 @@ router.delete('/:clientId', async (req, res) => {
     if (existing.icon_filename) {
       await removeIconFile(existing.icon_filename);
     }
-    await oauthClientsDb.reloadCache();
+    await oauthClientsDb.reloadCacheAndBroadcast();
     return res.json({ success: true });
   } catch (err) {
     return serverError(res, err, 'Impossible de supprimer l\'application');
@@ -467,7 +466,7 @@ router.post('/:clientId/icon', async (req, res) => {
       await removeIconFile(previousFilename);
     }
 
-    await oauthClientsDb.reloadCache();
+    await oauthClientsDb.reloadCacheAndBroadcast();
     return res.json({
       success: true,
       iconFilename: filename,
@@ -491,7 +490,7 @@ router.delete('/:clientId/icon', async (req, res) => {
         'UPDATE oauth_clients SET icon_filename = NULL, updated_at = ? WHERE client_id = ?',
         [Date.now(), clientId],
       );
-      await oauthClientsDb.reloadCache();
+      await oauthClientsDb.reloadCacheAndBroadcast();
     }
     return res.json({ success: true });
   } catch (err) {
@@ -532,7 +531,7 @@ router.post('/:clientId/vip-balance', async (req, res) => {
         [next, Date.now(), rows[0].id],
       );
       await conn.commit();
-      await oauthClientsDb.reloadCache();
+      await oauthClientsDb.reloadCacheAndBroadcast();
       return res.json({
         success: true,
         previousBalance: current,

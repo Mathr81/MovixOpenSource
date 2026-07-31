@@ -25,6 +25,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import ssl
 import random
+import socket
 from aiohttp_socks import ProxyConnector
 from collections import OrderedDict
 import gc
@@ -38,6 +39,12 @@ import builtins
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+from uqload_utils import (
+    extract_uqload_media_url,
+    get_uqload_site_origin,
+    normalize_uqload_embed_url,
+    parse_allowed_uqload_url,
+)
 
 # Load local .env from proxiesembed folder
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -591,10 +598,11 @@ DEBRID_PROVIDERS = frozenset({'deepbrid', 'realdebrid'})
 SIBNET_PROXY = PROXIES[0] if len(PROXIES) > 0 else None
 VIDMOLY_PROXY = PROXIES[1] if len(PROXIES) > 1 else (PROXIES[0] if len(PROXIES) > 0 else None)
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+# Logging — default WARNING (errors/warns only); set LOG_LEVEL=INFO|DEBUG to reenable.
+_LOG_LEVEL = getattr(logging, os.environ.get('LOG_LEVEL', 'WARNING').upper(), logging.WARNING)
+logging.basicConfig(level=_LOG_LEVEL)
 logger = logging.getLogger(__name__)
-logging.getLogger('aiohttp.access').setLevel(logging.INFO)
+logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
 
 # Filter to suppress HTTP/2 connection attempts (PRI/Upgrade errors)
 class HTTP2NoiseFilter(logging.Filter):
@@ -918,6 +926,87 @@ def detect_content_type(url: str, accept_header: str = '') -> ContentType:
     )
 
 
+# ---------------------------------------------------------------------------
+#  curl_cffi (JA3 impersonation) upstream â€” cinep-proxy only.
+#  Direct request first; on HTTP 403 retry once through a random SOCKS5
+#  proxy from PROXIES (same pool as the other services).
+# ---------------------------------------------------------------------------
+try:
+    from curl_cffi.requests import AsyncSession as _CurlAsyncSession
+    from curl_cffi.requests.exceptions import RequestException as _CurlRequestException
+    _CURL_CFFI_AVAILABLE = True
+except Exception as _curl_import_err:
+    logger.warning(f'[curl_cffi] Not available, cinep-proxy will use plain aiohttp: {_curl_import_err}')
+    _CurlRequestException = ()  # empty except-tuple: matches nothing
+    _CURL_CFFI_AVAILABLE = False
+
+
+class _CurlContent:
+    """Mimics aiohttp's StreamReader chunk iteration over an already-buffered body."""
+    __slots__ = ('_body',)
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    async def iter_chunked(self, chunk_size: int):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i:i + chunk_size]
+
+    async def iter_any(self):
+        if self._body:
+            yield self._body
+
+
+class _CurlResponseAdapter:
+    """Wraps a curl_cffi Response so it quacks like the aiohttp response _service_proxy expects."""
+    __slots__ = ('status', 'headers', 'content')
+
+    def __init__(self, resp):
+        self.status = resp.status_code
+        self.headers = resp.headers
+        self.content = _CurlContent(resp.content)
+
+    async def read(self) -> bytes:
+        return self.content._body
+
+
+class _CurlCffiUpstream:
+    """Async context manager: curl_cffi request with JA3 impersonation.
+    Retries once through a random SOCKS5 proxy if the direct attempt is a 403."""
+    __slots__ = ('_session', '_url', '_headers', '_timeout_s', '_service_name')
+
+    def __init__(self, session, url: str, headers: Dict, timeout_s: float, service_name: str):
+        self._session = session
+        self._url = url
+        self._headers = headers
+        self._timeout_s = timeout_s
+        self._service_name = service_name
+
+    async def __aenter__(self):
+        resp = await self._session.get(
+            self._url, headers=self._headers, timeout=self._timeout_s,
+            impersonate='chrome', allow_redirects=False,
+        )
+        if resp.status_code == 403 and PROXIES:
+            proxy_url = _build_socks5_proxy_url(random.choice(PROXIES))
+            if proxy_url:
+                logger.warning(f'[{self._service_name.upper()}-PROXY] 403 direct â€” retrying via {_redact_proxy_url(proxy_url)}')
+                try:
+                    resp = await self._session.get(
+                        self._url, headers=self._headers, timeout=self._timeout_s,
+                        impersonate='chrome', allow_redirects=False,
+                        proxies={'http': proxy_url, 'https': proxy_url},
+                    )
+                except Exception:
+                    logger.exception(f'[{self._service_name.upper()}-PROXY] Proxy retry failed, keeping 403')
+                else:
+                    logger.warning(f'[{self._service_name.upper()}-PROXY] Proxy retry result: {resp.status_code} for {self._url}')
+        return _CurlResponseAdapter(resp)
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
 class ProxyServer:
     # Compiled regex patterns (class-level for sharing)
     RE_BANDWIDTH = re.compile(r'bandwidth\.com|edgeon-bandwidth\.com', re.IGNORECASE)
@@ -928,8 +1017,8 @@ class ProxyServer:
     RE_FAMILYRESTREAM = re.compile(r'familyrestream\.com', re.IGNORECASE)
     RE_SOSPLAY = re.compile(r'srvagu|6522236688\.shop|vuunov|1396168994\.live', re.IGNORECASE)
     RE_WITV = re.compile(r'lansdrud\.space', re.IGNORECASE)
-    RE_UQLOAD_EMBED = re.compile(r'uqload\.(cx|com|net|bz)/(embed-)?[^/]+\.html', re.IGNORECASE)
-    RE_UQLOAD = re.compile(r'uqload\.(cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
+    RE_UQLOAD_EMBED = re.compile(r'uqload\.(is|cx|com|net|bz|org|to|io|co)/(embed-)?[^/]+\.html', re.IGNORECASE)
+    RE_UQLOAD = re.compile(r'uqload\.(is|cx|com|bz|net|org|to|io|co)', re.IGNORECASE)
     RE_NIGGAFLIX = re.compile(r'cdn\.niggaflix\.xyz', re.IGNORECASE)
     RE_DROPCDN = re.compile(r'dropcdn', re.IGNORECASE)
     RE_SERVERSICURO = re.compile(r'serversicuro', re.IGNORECASE)
@@ -938,7 +1027,7 @@ class ProxyServer:
     RE_NUMERIC_CDN = re.compile(r'([a-z0-9]+\.\d+\.net|epicquest|questher|hero.*\.com|trainer\.net|dishtrainer)', re.IGNORECASE)
     RE_DOODSTREAM = re.compile(r'd0000d\.com|doodstream\.com|dood\.(cx|la|pm|sh|so|to|watch|wf|yt|re)|cloudatacdn\.com|dsvplay\.com|doply\.net', re.IGNORECASE)
     RE_DOODSTREAM_PASS = re.compile(r'/pass_md5/[\w-]+/(?P<token>[\w-]+)')
-    RE_SEEKSTREAMING = re.compile(r'embed4me\.com|lpayer\.embed4me\.com|servicecatalog\.site|technicalcatalog\.site|embedseek\.com|seekplayer\.me', re.IGNORECASE)
+    RE_SEEKSTREAMING = re.compile(r'embed4me\.com|lpayer\.embed4me\.com|servicecatalog\.site|technicalcatalog\.site|embedseek\.com|embedseek\.online|embedseek\.xyz|seekplayer\.me|seekplayer\.vip|seeks\.cloud|seekplays\.com|seekplays\.ink|seekplays\.online|seekplays\.pro', re.IGNORECASE)
     RE_RANGE = re.compile(r'bytes=(\d+)-(\d*)')
     RE_M3U8_URI_DQ = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
     RE_M3U8_URI_SQ = re.compile(r"URI='([^']+)'", re.IGNORECASE)
@@ -1076,6 +1165,9 @@ class ProxyServer:
             )
         else:
             self.sessions['sibnet'] = self.sessions['normal']
+
+        # curl_cffi session (JA3 impersonation) â€” cinep-proxy only
+        self.curl_session = _CurlAsyncSession() if _CURL_CFFI_AVAILABLE else None
             
     @staticmethod
     def _is_francetv_url(url: str) -> bool:
@@ -1132,9 +1224,19 @@ class ProxyServer:
                                 include_range: bool = False, range_info: Dict = None) -> Dict:
         """Prepare headers for streaming response"""
         excluded = frozenset(['transfer-encoding', 'connection', 'content-encoding'])
-        headers = {k: v for k, v in upstream_headers.items() if k.lower() not in excluded}
+        # Drop any upstream CORS headers too â€” we set our own below, and a
+        # case-mismatched upstream 'access-control-allow-origin' would survive
+        # the dict.update() and emit a duplicate '*, *' the browser rejects.
+        headers = {k: v for k, v in upstream_headers.items()
+                   if k.lower() not in excluded and not k.lower().startswith('access-control-')}
         headers.update(CORS_HEADERS)
-        
+
+        # Some segment CDNs (e.g. fctv streamas*) mislabel raw MPEG-TS segments as
+        # 'application/zip'. Relabel to video/mp2t so strict HLS/MSE players accept them.
+        for _k in list(headers.keys()):
+            if _k.lower() == 'content-type' and str(headers[_k]).lower().startswith('application/zip'):
+                headers[_k] = 'video/mp2t'
+
         if content_type:
             headers['Content-Type'] = content_type
         
@@ -1357,11 +1459,17 @@ class ProxyServer:
         return random.choice(valid_proxies) if valid_proxies else {}
     
     def _create_socks5_connector(self, proxy: Dict) -> ProxyConnector:
-        """Create SOCKS5 connector with connection pooling"""
+        """Create SOCKS5 connector with connection pooling.
+
+        Force IPv4 (rdns=False + AF_INET): several stream CDNs are dual-stack
+        (has A + AAAA) but only their v4 nodes accept our SOCKS egress IPs. With
+        remote DNS the proxy picks the v6 node and can't route it -> 'Connection
+        refused by destination host'. Resolving locally to v4 and handing the
+        proxy a v4 address makes the segment CDN reachable."""
         proxy_url = _build_aiohttp_socks_proxy_url(proxy, default_type='socks5')
         if not proxy_url:
             raise ValueError('Proxy SOCKS5 invalide')
-        return ProxyConnector.from_url(proxy_url, rdns=True, limit=0)
+        return ProxyConnector.from_url(proxy_url, rdns=False, family=socket.AF_INET, limit=0)
     
     def setup_routes(self):
         """Configure server routes"""
@@ -1706,11 +1814,15 @@ class ProxyServer:
             # Parse use_proxy parameter (0=first SOCKS5, 1=second, etc.)
             use_proxy_param = request.query.get('use_proxy')
             use_proxy = int(use_proxy_param) if use_proxy_param is not None and use_proxy_param.isdigit() else None
-            
+
+            # ponytail: use_proxy_key (deterministic SOCKS-pool spread for fctv) removed —
+            # fctv no longer routed through SOCKS5. Param still stripped below so a stray
+            # ?use_proxy_key never leaks upstream. Explicit ?use_proxy=N still works.
+
             # Reconstruct split query parameters (handles unencoded URLs)
             query_params = []
             for k, v in request.query.items():
-                if k not in ('url', 'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'sosplay', 'use_proxy'):
+                if k not in ('url', 'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'sosplay', 'use_proxy', 'use_proxy_key'):
                     query_params.append((k, v))
             
             if query_params:
@@ -1752,7 +1864,7 @@ class ProxyServer:
                 custom_headers = {**custom_headers, **shortcut_headers}
             
             # Clean proxy-specific params from target URL
-            proxy_params = {'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'url', 'sosplay', 'use_proxy'}
+            proxy_params = {'headers', 'referer', 'origin', 'user_agent', 'user-agent', 'url', 'sosplay', 'use_proxy', 'use_proxy_key'}
             if parsed_target.query:
                 existing_params = urllib.parse.parse_qs(parsed_target.query, keep_blank_values=True)
                 for p in proxy_params:
@@ -1975,10 +2087,12 @@ class ProxyServer:
             if response.status >= 400:
                 err_body = await response.read()
                 err_text = err_body.decode('utf-8', errors='replace') if err_body else '(empty)'
-                logger.warning(f"[PROXY] Upstream HTTP {response.status} for segment {target_url} â€” headers_sent: {headers}")
+                logger.warning(f"[PROXY] Upstream HTTP {response.status} for segment {target_url} â€” headers_sent: {headers} â€” body: {err_text[:200]}")
                 body = json.dumps({
                     'error': f'Upstream HTTP error: {response.status}',
                     'upstream_status': response.status,
+                    'upstream_url': target_url,
+                    'upstream_body': err_text[:2000],
                 }).encode()
                 return (response.status, body, {**CORS_HEADERS, 'Content-Type': 'application/json'}, None)
 
@@ -2363,33 +2477,39 @@ class ProxyServer:
     async def _handle_uqload_embed(self, request: Request, target_url: str,
                                     headers: Dict, timeout: ClientTimeout,
                                     range_header: Optional[str], session: aiohttp.ClientSession) -> Response:
-        """Handle UQLOAD embed URLs by extracting and streaming MP4"""
+        """Handle UQLOAD embed URLs by extracting HLS or streaming MP4."""
         try:
             cache_key = hashlib.md5(target_url.encode()).hexdigest()
-            mp4_url = self.uqload_mp4_cache.get(cache_key)
+            media_url = self.uqload_mp4_cache.get(cache_key)
             
-            if not mp4_url:
-                mp4_url = await self._extract_uqload_mp4_url(target_url)
-                self.uqload_mp4_cache.set(cache_key, mp4_url)
+            if not media_url:
+                media_url = await self._extract_uqload_media_url(target_url)
+                self.uqload_mp4_cache.set(cache_key, media_url)
+
+            if '.m3u8' in urlparse(media_url).path.lower():
+                location = f"/uqload-proxy?url={urllib.parse.quote(media_url)}"
+                return web.HTTPFound(location=location, headers=CORS_HEADERS)
+
+            uqload_origin = get_uqload_site_origin(media_url)
             
-            mp4_headers = self._prepare_headers(mp4_url, request)
+            mp4_headers = self._prepare_headers(media_url, request)
             mp4_headers.update({
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity;q=1, *;q=0',
-                'Referer': 'https://uqload.bz/',
-                'Origin': 'https://uqload.bz'
+                'Referer': f'{uqload_origin}/',
+                'Origin': uqload_origin,
             })
             
             if not range_header:
                 # HEAD request for metadata
-                async with session.request('HEAD', mp4_url, headers=mp4_headers,
+                async with session.request('HEAD', media_url, headers=mp4_headers,
                                            timeout=ClientTimeout(total=10)) as resp:
                     resp_headers = self._prepare_stream_headers(resp.headers, 'video/mp4')
                     resp_headers['Accept-Ranges'] = 'bytes'
                     return _safe_response(b'', 200, resp_headers)
             else:
                 mp4_headers['Range'] = range_header
-                async with session.request('GET', mp4_url, headers=mp4_headers,
+                async with session.request('GET', media_url, headers=mp4_headers,
                                            timeout=ClientTimeout(total=None, connect=10, sock_read=30)) as resp:
                     resp_headers = self._prepare_stream_headers(resp.headers, 'video/mp4')
                     resp_headers['Accept-Ranges'] = 'bytes'
@@ -2519,11 +2639,16 @@ class ProxyServer:
             return {'Accept': '*/*'}
         
         if self.RE_UQLOAD.search(target_url):
+            try:
+                uqload_origin = get_uqload_site_origin(target_url)
+            except ValueError:
+                uqload_origin = 'https://uqload.bz'
             return {
                 'Accept': '*/*',
                 'Accept-Encoding': 'identity;q=1, *;q=0',
                 'Host': target_host,
-                'Referer': 'https://uqload.bz/',
+                'Origin': uqload_origin,
+                'Referer': f'{uqload_origin}/',
                 'User-Agent': 'Mozilla/5.0 Chrome/142.0.0.0'
             }
         
@@ -2706,14 +2831,20 @@ class ProxyServer:
             return False
         
         access_key = raw_key.strip()
-        
-        # Fix encoding: aiohttp uses Python's surrogateescape for non-ASCII header bytes.
-        # Byte 0xe9 (Ã© in Latin-1) becomes surrogate \udce9. We recover the original bytes
-        # with surrogateescape, then decode as Latin-1 to get the proper Unicode character.
+
+        # Normalize key encoding to match how Mainapi (checkVip.js) looks it up.
+        # aiohttp hands header bytes back as Latin-1 (or surrogate-escaped). Recover the
+        # raw wire bytes, then: valid UTF-8 -> decode it; otherwise the bytes are Latin-1
+        # (e.g. 'é' = U+00E9 sent as a single 0xE9 byte). This mirrors checkVip.js
+        # (latin1 bytes -> utf8, keep original when invalid) so the key_value lookup
+        # matches the stored value and VIP users aren't falsely denied.
         try:
-            raw_bytes = access_key.encode('utf-8', 'surrogateescape')
-            access_key = raw_bytes.decode('latin-1')
-        except (UnicodeDecodeError, UnicodeEncodeError):
+            raw = access_key.encode('latin-1', 'surrogateescape')
+            try:
+                access_key = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                access_key = raw.decode('latin-1')
+        except UnicodeEncodeError:
             pass
         
         # Check cache first
@@ -2746,32 +2877,16 @@ class ProxyServer:
                 self.vip_cache.set(access_key, False)
                 return False
             
-            # Check expiration (if set). access_keys.expires_at is BIGINT (Unix epoch ms),
-            # but legacy/admin paths could still produce DATETIME or ISO strings — handle all three.
-            # Note: do NOT fall back to datetime.fromisoformat(str(int)) — Python 3.11+ parses
-            # e.g. "1808043002043" as year 1808, marking every non-null key as expired.
+            # Check expiration. access_keys.expires_at is epoch MILLISECONDS (BIGINT),
+            # matching Mainapi (parseAccessKeyExpiresAt -> getTime()). Compare as ms,
+            # same as checkVip.js: new Date() > new Date(expires_at).
             if expires_at is not None:
-                now = datetime.now(timezone.utc)
-                exp = None
-                if isinstance(expires_at, bool):
-                    pass  # bool is an int subclass — ignore
-                elif isinstance(expires_at, (int, float)):
-                    try:
-                        exp = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
-                    except (ValueError, OSError, OverflowError):
-                        exp = None
-                elif isinstance(expires_at, datetime):
-                    exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-                elif isinstance(expires_at, str):
-                    try:
-                        parsed = datetime.fromisoformat(expires_at)
-                        exp = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-                    except (ValueError, TypeError):
-                        exp = None
-
-                if exp is not None and exp < now:
-                    self.vip_cache.set(access_key, False)
-                    return False
+                try:
+                    if int(expires_at) < int(time.time() * 1000):
+                        self.vip_cache.set(access_key, False)
+                        return False
+                except (ValueError, TypeError):
+                    pass
             
             # Key is valid
             self.vip_cache.set(access_key, True)
@@ -2969,24 +3084,13 @@ class ProxyServer:
                     return web.json_response({'error': 'Script not found'}, status=404)
                 
                 deobfuscated = self._deobfuscate_fsvid_script(script_match.group(0))
-                
-                # Try multiple patterns â€” videojs uses sources:[{src:"..."}]
-                m3u8_match = None
-                for pattern in [
-                    r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'sources:\s*\[\s*\{[^}]*?["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'["\']([^"\']*\.m3u8[^"\']*)["\']',
-                ]:
-                    m3u8_match = re.search(pattern, deobfuscated)
-                    if m3u8_match:
-                        break
-                
-                if not m3u8_match:
+
+                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/fsvid-proxy?url={urllib.parse.quote(m3u8_match.group(1))}",
+                    'm3u8Url': f"{PROXY_BASE}/fsvid-proxy?url={urllib.parse.quote(m3u8_url)}",
                     'source': 'fsvid'
                 }
                 
@@ -3024,6 +3128,67 @@ class ProxyServer:
                 result = re.sub(r'\b' + re.escape(to_base(c, a)) + r'\b', k[c], result)
         
         return result
+
+    def _extract_m3u8_url(self, script: str, embed_url: str) -> Optional[str]:
+        """Extract a plain or Base64/XOR-obfuscated M3U8 URL."""
+        script = script.replace(r"\'", "'").replace(r'\"', '"')
+
+        def normalize(candidate: str) -> Optional[str]:
+            candidate = candidate.replace(r'\/', '/').replace('&amp;', '&').strip().rstrip('\\')
+            if '.m3u8' not in candidate.lower():
+                return None
+
+            parsed = urlparse(candidate)
+            if parsed.scheme in ('http', 'https') and parsed.netloc:
+                return candidate
+
+            if candidate.startswith(('/', './', '../')):
+                return urljoin(embed_url, candidate)
+
+            return None
+
+        # New fsvid/vidzy player format:
+        # (function(s){var k=[...],b=atob(s),r=""; ... XOR ...})("...")
+        xor_pattern = re.compile(
+            r'var\s+[A-Za-z_$][\w$]*\s*=\s*\[(?P<key>[0-9,\s]+)\]\s*,'
+            r'\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)'
+            r'.{0,2000}?\}\)\s*\(\s*["\'](?P<payload>[A-Za-z0-9+/_=-]+)["\']\s*\)',
+            re.DOTALL
+        )
+        for match in xor_pattern.finditer(script):
+            try:
+                key_values = [int(value.strip()) for value in match.group('key').split(',')]
+                if not key_values or len(key_values) > 64 or any(value < 0 or value > 255 for value in key_values):
+                    continue
+
+                payload = match.group('payload')
+                payload += '=' * (-len(payload) % 4)
+                encrypted = base64.b64decode(payload, altchars=b'-_', validate=True)
+                decoded = bytes(
+                    value ^ key_values[index % len(key_values)]
+                    for index, value in enumerate(encrypted)
+                ).decode('utf-8')
+
+                candidate = normalize(decoded)
+                if candidate:
+                    return candidate
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                continue
+
+        # Legacy formats with a directly embedded URL.
+        for pattern in [
+            r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'sources:\s*\[\s*\{[^}]*?["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'["\']([^"\']*\.m3u8[^"\']*)["\']',
+        ]:
+            match = re.search(pattern, script)
+            if match:
+                candidate = normalize(match.group(1))
+                if candidate:
+                    return candidate
+
+        return None
     
     async def vidzy_extract_handler(self, request: Request) -> Response:
         """VIDZY M3U8 extraction"""
@@ -3063,22 +3228,13 @@ class ProxyServer:
                     return web.json_response({'error': 'Script not found'}, status=404)
                 
                 deobfuscated = self._deobfuscate_fsvid_script(script.string)
-                
-                # Try multiple M3U8 patterns
-                for pattern in [
-                    r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'sources:\s*\[["\']([^"\']+\.m3u8[^"\']*)["\']',
-                    r'["\']([^"\']*\.m3u8[^"\']*)["\']'
-                ]:
-                    m3u8_match = re.search(pattern, deobfuscated)
-                    if m3u8_match:
-                        break
-                
-                if not m3u8_match:
+
+                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
                 result = {
-                    'm3u8Url': f"{PROXY_BASE}/vidzy-proxy?url={urllib.parse.quote(m3u8_match.group(1))}",
+                    'm3u8Url': f"{PROXY_BASE}/vidzy-proxy?url={urllib.parse.quote(m3u8_url)}",
                     'source': 'vidzy'
                 }
                 
@@ -3225,38 +3381,21 @@ class ProxyServer:
     
     def _validate_uqload_url(self, url: str) -> str:
         """Validate and format UQLOAD URL"""
-        if not url or len(url) < 12:
-            raise ValueError('Invalid URL')
-        
-        parts = url.split('/')
-        base = '/'.join(parts[:-1]) or 'https://uqload.bz'
-        video_id = parts[-1]
-        
-        if '.html' not in video_id:
-            video_id += '.html'
-        if 'embed-' not in video_id:
-            video_id = 'embed-' + video_id
-        
-        full_url = f'{base}/{video_id}'
-        if 'uqload' not in full_url:
-            raise ValueError('Invalid UQLOAD URL')
-        
-        return full_url
+        return normalize_uqload_embed_url(url)
     
-    async def _extract_uqload_mp4_url(self, embed_url: str) -> str:
-        """Extract video URL from UQLOAD embed.
-
-        Prefers HLS master.m3u8 (audio + video) over the v.mp4 fallback,
-        because Uqload's v.mp4 is currently a video-only track.
-        """
+    async def _extract_uqload_media_url(self, embed_url: str) -> str:
+        """Extract an HLS or MP4 URL from a UQLOAD embed without executing it."""
         validated = self._validate_uqload_url(embed_url)
-        urls = [validated, validated.replace('embed-', '')]
-
+        site_origin = get_uqload_site_origin(validated)
+        urls = [validated, validated.replace('/embed-', '/')]
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 Chrome/91.0.0.0',
-            'Accept': 'text/html,*/*'
+            'Accept': 'text/html,*/*',
+            'Referer': f'{site_origin}/',
+            'Origin': site_origin,
         }
-
+        
         html = None
         for url in urls:
             try:
@@ -3266,24 +3405,20 @@ class ProxyServer:
                     if resp.status == 200:
                         html = await resp.text()
                         break
-            except:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
-
+        
         if not html:
             raise ValueError('No content from UQLOAD')
-
+        
         if 'File was deleted' in html:
             raise ValueError('Video deleted')
-
-        m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
-        if m3u8_matches:
-            return m3u8_matches[0]
-
-        mp4_matches = re.findall(r'https?://[^\s"\'<>]+/v\.mp4', html)
-        if not mp4_matches:
-            raise ValueError('Video URL not found')
-
-        return mp4_matches[0]
+        
+        media_url = extract_uqload_media_url(html)
+        if not media_url:
+            raise ValueError('Uqload media URL not found')
+        
+        return media_url
     
     async def uqload_extract_handler(self, request: Request) -> Response:
         """UQLOAD extraction"""
@@ -3302,13 +3437,13 @@ class ProxyServer:
                 return resp
             
             validated = self._validate_uqload_url(url)
-            mp4_url = await self._extract_uqload_mp4_url(validated)
+            media_url = await self._extract_uqload_media_url(validated)
             
-            if not mp4_url:
+            if not media_url:
                 return web.json_response({'error': 'Extraction failed'}, status=404)
             
             result = {
-                'url': f"{PROXY_BASE}/uqload-proxy?url={urllib.parse.quote(mp4_url)}",
+                'url': f"{PROXY_BASE}/uqload-proxy?url={urllib.parse.quote(media_url)}",
                 'source': 'uqload'
             }
             
@@ -3317,6 +3452,8 @@ class ProxyServer:
             resp.headers['X-Cache'] = 'MISS'
             return resp
             
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
     
@@ -3405,20 +3542,7 @@ class ProxyServer:
             return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
     
     # ===== SeekStreaming (Embed4me) Extraction =====
-
-    async def _check_url_alive(self, url: str, headers: Dict, timeout_s: int = 4) -> bool:
-        """Quick liveness check: True if upstream returns 2xx within timeout."""
-        try:
-            async with self.sessions['no_ssl'].get(
-                url,
-                headers=headers,
-                timeout=ClientTimeout(total=timeout_s),
-                allow_redirects=True,
-            ) as r:
-                return 200 <= r.status < 300
-        except Exception:
-            return False
-
+    
     def _decrypt_seekstreaming_data(self, hex_str: str) -> Optional[str]:
         """Decrypt AES-CBC encrypted data from seekstreaming/embed4me API"""
         try:
@@ -3495,12 +3619,17 @@ class ProxyServer:
             }
             
             session = self.sessions['normal']
-            timeout = ClientTimeout(total=10)
-            
-            async with session.get(api_url, headers=headers, timeout=timeout) as response:
-                if response.status != 200:
-                    return web.json_response({'error': f'API error: {response.status}'}, status=502, headers=CORS_HEADERS)
-                encrypted_text = await response.text()
+            timeout = ClientTimeout(total=2, connect=2, sock_connect=2, sock_read=2)
+
+            try:
+                async with session.get(api_url, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        return web.json_response({'error': f'API error: {response.status}'}, status=502, headers=CORS_HEADERS)
+                    encrypted_text = await asyncio.wait_for(response.text(), timeout=2)
+            except asyncio.TimeoutError:
+                return web.json_response({'error': 'Upstream API timeout'}, status=504, headers=CORS_HEADERS)
+            except aiohttp.ClientConnectorError as e:
+                return web.json_response({'error': f'Connection failed: {e}'}, status=502, headers=CORS_HEADERS)
             
             # Decrypt the response
             decrypted_raw = self._decrypt_seekstreaming_data(encrypted_text)
@@ -3520,34 +3649,13 @@ class ProxyServer:
             # Pass the correct origin/referer to the proxy
             proxy_queries = f"&referer=https%3A//{api_domain}/&origin=https%3A//{api_domain}"
             
+            if raw_cf:
+                result['url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_cf)}{proxy_queries}"
+            if raw_source:
+                result['ip_url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_source)}{proxy_queries}"
+            
             if not raw_cf and not raw_source:
                 return web.json_response({'error': 'No video source found'}, status=404, headers=CORS_HEADERS)
-
-            # Liveness check: probe both upstreams in parallel and only return
-            # one that actually responds. CF-fronted hosts (technicalcatalog.site,
-            # servicecatalog.site, ...) can get flagged as phishing and 403
-            # globally; the IP-direct URL (signed token + expiry) keeps working.
-            # Reuse the player domain from the request as Referer/Origin.
-            upstream_headers = {
-                'Accept': '*/*',
-                'Referer': f'https://{api_domain}/',
-                'Origin': f'https://{api_domain}',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-            }
-            source_alive, cf_alive = await asyncio.gather(
-                self._check_url_alive(raw_source, upstream_headers) if raw_source else asyncio.sleep(0, result=False),
-                self._check_url_alive(raw_cf, upstream_headers) if raw_cf else asyncio.sleep(0, result=False),
-            )
-
-            if not source_alive and not cf_alive:
-                return web.json_response(
-                    {'error': 'All upstream sources failed liveness check (likely 403/blocked)'},
-                    status=502,
-                    headers=CORS_HEADERS,
-                )
-
-            chosen = raw_source if source_alive else raw_cf
-            result['url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(chosen)}{proxy_queries}"
             
             self.seekstreaming_cache.set(cache_key, result)
             resp = web.json_response(result)
@@ -3583,24 +3691,40 @@ class ProxyServer:
                 url_lower = abs_url.lower()
                 if any(ext in url_lower for ext in ('.ts', '.m4s', '.aac', '.mp4', '.fmp4', '.key')):
                     abs_url = f"{abs_url}?{base_query}"
-            
+
             # Append extra query params (referer, origin, etc.)
             suffix = f"&{extra_query}" if extra_query else ""
             return f"{proxy_route}?url={urllib.parse.quote(abs_url)}{suffix}"
-        
+
+        def proxify_sub(url: str) -> str:
+            # SUBTITLES URIs must resolve to an m3u8 playlist. When a source
+            # points directly at a subtitle file, tag it so the proxy returns a
+            # synthetic wrapper playlist instead of the raw .vtt (which hls.js
+            # would reject with "Missing #EXTM3U"). Real subtitle playlists
+            # (.m3u8) are proxied normally.
+            abs_url = to_absolute(url)
+            if not abs_url:
+                return url
+            low = abs_url.split('?', 1)[0].lower()
+            if not (low.endswith('.vtt') or low.endswith('.srt')):
+                return proxify(url)
+            suffix = f"&{extra_query}" if extra_query else ""
+            return f"{proxy_route}?url={urllib.parse.quote(abs_url)}&vttwrap=1{suffix}"
+
         re_uri_dq = self.RE_M3U8_URI_DQ
         re_uri_sq = self.RE_M3U8_URI_SQ
         re_uri_uq = self.RE_M3U8_URI_UQ
         re_http = self.RE_M3U8_HTTP
-        
+
         def rewrite_line(line: str) -> str:
             trimmed = line.strip()
             if not trimmed:
                 return line
             if trimmed.startswith('#'):
-                line = re_uri_dq.sub(lambda m: f'URI="{proxify(m.group(1).strip())}"', line)
-                line = re_uri_sq.sub(lambda m: f'URI="{proxify(m.group(1).strip())}"', line)
-                line = re_uri_uq.sub(lambda m: f'URI="{proxify(m.group(1).strip())}"', line)
+                fn = proxify_sub if ('TYPE=SUBTITLES' in trimmed.upper()) else proxify
+                line = re_uri_dq.sub(lambda m: f'URI="{fn(m.group(1).strip())}"', line)
+                line = re_uri_sq.sub(lambda m: f'URI="{fn(m.group(1).strip())}"', line)
+                line = re_uri_uq.sub(lambda m: f'URI="{fn(m.group(1).strip())}"', line)
                 return line
             if re_http.match(trimmed):
                 return proxify(trimmed)
@@ -3633,21 +3757,23 @@ class ProxyServer:
         except:
             pass
         
-        # Range support
+        # Detect content type
+        content = detect_content_type(target_url, request.headers.get('accept', ''))
+
+        # Range support â€” never forward to manifests: we need the full text to
+        # parse/rewrite, and upstreams that honor Range return a truncated 206
+        # that fails M3U8 validation (client then retries forever).
         range_header = request.headers.get('range') or request.headers.get('Range')
-        if range_header:
+        if range_header and not content.is_m3u8:
             headers['Range'] = range_header
-        
+
         # Capture extra query params (referer, origin) to pass to rewritten segments
         extra_params = []
         for k, v in request.query.items():
             if k != 'url':
                 extra_params.append(f"{k}={urllib.parse.quote(v)}")
         extra_query = "&".join(extra_params)
-        
-        # Detect content type
-        content = detect_content_type(target_url, request.headers.get('accept', ''))
-        
+
         # Timeouts based on content
         if content.is_mp4 and range_header:
             timeout = ClientTimeout(total=None, connect=10, sock_read=30)
@@ -3669,6 +3795,31 @@ class ProxyServer:
             logger.warning(f'[{service_name.upper()}-PROXY] âš  Session "{session_key}" introuvable, fallback sur "normal" (sans proxy) ! VÃ©rifier PROXIES_SOCKS5_JSON')
         route = proxy_route or f'/{service_name}-proxy'
 
+        # Subtitle wrapper: some sources (e.g. topstream) declare
+        # #EXT-X-MEDIA:TYPE=SUBTITLES with a URI pointing straight at a .vtt file.
+        # hls.js expects that URI to be an m3u8 playlist, so synthesize a
+        # one-segment playlist that references the real VTT (fetched normally
+        # on the follow-up request without the marker).
+        if request.query.get('vttwrap'):
+            inner_params = [f"{k}={urllib.parse.quote(v)}" for k, v in request.query.items()
+                            if k not in ('url', 'vttwrap')]
+            inner_suffix = ('&' + '&'.join(inner_params)) if inner_params else ''
+            inner_url = f"{route}?url={urllib.parse.quote(target_url)}{inner_suffix}"
+            playlist = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:3\n"
+                "#EXT-X-TARGETDURATION:999999\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                "#EXTINF:999999.0,\n"
+                f"{inner_url}\n"
+                "#EXT-X-ENDLIST\n"
+            )
+            return web.Response(text=playlist, headers={
+                **CORS_HEADERS,
+                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Cache-Control': 'no-cache',
+            })
+
         logger.info(f'[{service_name.upper()}-PROXY] â†’ session={actual_session_key} url={target_url} headers={headers}')
 
         try:
@@ -3688,7 +3839,13 @@ class ProxyServer:
                         'X-Segment-Cache': 'HIT',
                     })
 
-            async with session.get(target_url, headers=headers, timeout=timeout) as response:
+            if service_name == 'cinep' and self.curl_session is not None:
+                timeout_s = timeout.total or timeout.sock_read or 30
+                upstream_cm = _CurlCffiUpstream(self.curl_session, target_url, headers, timeout_s, service_name)
+            else:
+                upstream_cm = session.get(target_url, headers=headers, timeout=timeout)
+
+            async with upstream_cm as response:
                 resp_headers = self._prepare_stream_headers(response.headers)
 
                 # Pass through redirects while keeping the client inside this service proxy route
@@ -3817,7 +3974,7 @@ class ProxyServer:
 
                 # Default streaming
                 return await self._stream_response(request, response, resp_headers, CHUNK_DEFAULT)
-                
+
         except asyncio.TimeoutError as e:
             return web.json_response(
                 {
@@ -3829,7 +3986,7 @@ class ProxyServer:
                 status=504,
                 headers=CORS_HEADERS,
             )
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, _CurlRequestException) as e:
             return web.json_response(
                 {
                     'error': 'Upstream request failed',
@@ -3902,10 +4059,22 @@ class ProxyServer:
     
     async def uqload_proxy_handler(self, request: Request) -> Response:
         """Uqload proxy"""
+        target_url = request.query.get('url')
+        try:
+            parse_allowed_uqload_url(target_url)
+            uqload_origin = get_uqload_site_origin(target_url)
+        except ValueError as exc:
+            return web.json_response(
+                {'error': str(exc)},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+
         return await self._service_proxy(request, 'uqload', {
             'Accept': '*/*',
             'Accept-Encoding': 'identity;q=1, *;q=0',
-            'Referer': 'https://uqload.bz/',
+            'Origin': uqload_origin,
+            'Referer': f'{uqload_origin}/',
             'User-Agent': 'Mozilla/5.0 Chrome/142.0.0.0'
         })
     
@@ -4090,8 +4259,8 @@ class ProxyServer:
         """CinePulse proxy"""
         return await self._service_proxy(request, 'cinep', {
             'Accept': 'application/vnd.apple.mpegurl,*/*',
-            'Origin': 'https://cinepulse.lol',
-            'Referer': 'https://cinepulse.lol/',
+            'Origin': 'https://purstream.mx',
+            'Referer': 'https://purstream.mx/',
             'User-Agent': 'Mozilla/5.0 Chrome/143.0.0.0'
         })
 
@@ -4470,7 +4639,9 @@ async def main():
         for name, session in server.sessions.items():
             if not session.closed:
                 cleanup_tasks.append(session.close())
-        
+        if server.curl_session is not None:
+            cleanup_tasks.append(server.curl_session.close())
+
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             

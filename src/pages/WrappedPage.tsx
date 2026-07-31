@@ -1,16 +1,17 @@
-﻿import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { motion, AnimatePresence, PanInfo } from 'framer-motion';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { motion, AnimatePresence, PanInfo, useReducedMotion } from 'framer-motion';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import i18n from '../i18n';
-import { ChevronLeft, ChevronRight, Share2, X, Sparkles, Calendar, Trophy, BarChart3, Clock, Flame, Music, ShieldOff, Settings, ImageIcon, Download, Copy, FileText, Loader2, LogIn, UserPlus } from 'lucide-react';
-import { fetchWrappedData, WrappedData, WrappedProgress, WrappedSlide, WrappedTopContent } from '../services/wrappedService';
+import { ChevronLeft, ChevronRight, Share2, X, Sparkles, Calendar, Trophy, BarChart3, Clock, Flame, Music, ShieldOff, Settings, ImageIcon, Download, Copy, FileText, Loader2, LogIn, UserPlus, TrendingUp, Repeat, Hourglass, MousePointerClick, HelpCircle } from 'lucide-react';
+import { fetchWrappedData, WrappedData, WrappedProgress, WrappedSlide, WrappedTopContent, WrappedResponse } from '../services/wrappedService';
+import { drawRoundedRectPath, wrapCanvasText, loadCanvasImage, ensureShareFonts, drawSeededStickers } from '../utils/wrappedCanvas';
+import { generatePosterShareImage, generateTicketShareImage, WrappedShareCardData } from '../utils/wrappedShareCards';
 import { SquareBackground } from '../components/ui/square-background';
 import AnimatedBorderCard from '../components/ui/animated-border-card';
 import ShinyText from '../components/ui/shiny-text';
 import axios from 'axios';
 import { getTmdbLanguage } from '../i18n';
-import { buildApiProxyUrl } from '../config/runtime';
 import { toast } from 'sonner';
 import { areSoundEffectsEnabled, SOUND_EFFECTS_CHANGED_EVENT } from '../utils/soundSettings';
 
@@ -74,144 +75,6 @@ function formatWrappedTypeLabel(
 const WRAPPED_SHARE_IMAGE_WIDTH = 1080;
 const WRAPPED_SHARE_IMAGE_HEIGHT = 1920;
 
-function drawRoundedRectPath(
-    ctx: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    width: number,
-    height: number,
-    radius: number
-) {
-    const safeRadius = Math.min(radius, width / 2, height / 2);
-    ctx.beginPath();
-    ctx.moveTo(x + safeRadius, y);
-    ctx.lineTo(x + width - safeRadius, y);
-    ctx.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
-    ctx.lineTo(x + width, y + height - safeRadius);
-    ctx.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
-    ctx.lineTo(x + safeRadius, y + height);
-    ctx.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
-    ctx.lineTo(x, y + safeRadius);
-    ctx.quadraticCurveTo(x, y, x + safeRadius, y);
-    ctx.closePath();
-}
-
-function drawPopcornSticker(
-    ctx: CanvasRenderingContext2D,
-    {
-        x,
-        y,
-        scale = 1,
-        rotation = 0,
-        opacity = 0.5,
-        accent = '#f6c453', // Unused but kept for signature
-    }: {
-        x: number;
-        y: number;
-        scale?: number;
-        rotation?: number;
-        opacity?: number;
-        accent?: string;
-        fillLevel?: number;
-    }
-) {
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(rotation);
-    // Adjusted scale down drastically because original SVG is 512x512
-    ctx.scale(scale * 0.05, scale * 0.05); 
-    // Shift so it rotates somewhat around its center (256, 256)
-    ctx.translate(-256, -256);
-    ctx.globalAlpha = opacity;
-    
-    // SVG Path for Popcorn
-    const combinedPath = new Path2D(
-        "M415.08,147.991c-0.582-0.661-1.27-1.201-2.025-1.618c-2.051-13.744-8.438-27.651-20.957-27.856 c-1.149-2.05-2.159-7.502-2.786-10.891c-0.847-4.574-1.723-9.304-3.418-13.119c-4.147-9.33-11.46-9.194-14.405-8.702 c-4.744,0.791-9.651-2.179-10.522-3.816c0.228-0.314,0.77-0.892,1.831-1.599c5.878-3.918,8.79-8.526,8.654-13.697 c-0.247-9.384-9.945-15.137-22.223-22.421c-1.595-0.946-3.232-1.917-4.884-2.919c-13.683-8.292-24.607-3.13-32.584,0.64 c-3.66,1.729-6.869,3.246-9.73,3.352c-0.035-0.649-0.057-1.374-0.075-1.991c-0.212-7.208-0.568-19.271-14.256-31.474 C274.131-0.211,262.42-0.939,254.984,0.582c-10.465,2.138-19.319,9.884-24.931,21.809c-2.617,5.561-4.708,9.396-6.41,10.034 c-2.405,0.901-8.666-0.019-17.332-1.293l-2.647-0.388c-4.139-0.602-7.984,2.263-8.588,6.402s2.262,7.984,6.402,8.588l2.63,0.386 c12.116,1.78,18.791,2.761,24.852,0.49c7.258-2.721,10.712-9.081,14.8-17.77c3.475-7.385,8.671-12.276,14.255-13.417 c7.32-1.495,14.702,3.398,19.604,7.767c8.819,7.861,9.018,14.634,9.194,20.61c0.149,5.083,0.461,15.658,13.134,16.633 c7.087,0.541,13.038-2.264,18.284-4.742c7.585-3.582,11.841-5.272,18.261-1.382c1.694,1.027,3.372,2.022,5.007,2.992 c4.807,2.852,11.761,6.977,14.196,9.523c-0.315,0.265-0.738,0.588-1.301,0.962c-7.601,5.068-10.446,12.378-7.608,19.555 c3.417,8.64,14.778,14.601,25.421,13.633c0.875,2.2,1.688,6.589,2.21,9.409c1.755,9.477,4.404,23.786,17.302,23.281 c1.706-0.07,4.236,5.117,5.72,11.755h-274.7c-0.115-0.071-0.225-0.146-0.345-0.212c-1.163-0.638-4.7-3.277-5.188-5.688 c-0.075-0.369-0.302-1.491,1.425-3.672c2.923-3.692,5.246-4.908,7.937-6.315c6.07-3.177,10.867-6.586,12.796-18.929 c1.208-7.729,4.202-10.008,11.438-15.514c3.905-2.972,8.767-6.67,14.206-12.111c2.958-2.958,2.958-7.754,0-10.711 c-2.958-2.958-7.754-2.958-10.711,0c-4.716,4.716-8.941,7.932-12.668,10.767c-8.093,6.158-15.082,11.477-17.231,25.23 c-0.903,5.779-1.506,6.095-4.851,7.846c-3.32,1.738-7.869,4.117-12.791,10.335c-5.035,6.361-5.169,12.256-4.395,16.08 c0.205,1.015,0.509,1.972,0.86,2.894h-0.614c-2.177,0-4.249,0.937-5.687,2.571c-1.438,1.635-2.104,3.808-1.826,5.967l7.52,58.553 c0.532,4.148,4.326,7.074,8.477,6.547c4.149-0.533,7.08-4.328,6.548-8.477l-6.423-50.014h17.445l43.185,336.283H154.4 l-27.572-214.71c-0.533-4.149-4.328-7.082-8.477-6.548c-4.149,0.533-7.08,4.328-6.548,8.477l28.422,221.32 c0.485,3.779,3.702,6.61,7.512,6.61h32.688c0.007,0,0.014,0.001,0.021,0.001c0.005,0,0.01-0.001,0.015-0.001h38.037 c0.003,0,0.007,0,0.01,0c0.005,0,0.009,0,0.014,0h81.925c0.005,0,0.009,0,0.014,0c0.003,0,0.007,0,0.01,0h38.037 c0.005,0,0.01,0.001,0.015,0.001c0.007,0,0.014-0.001,0.021-0.001h25.718c3.81,0,7.027-2.831,7.512-6.61l45.13-351.431 C417.182,151.8,416.518,149.626,415.08,147.991z M187.118,496.851l-43.185-336.283h42.594l23.857,336.283H187.118z M251.857,496.851h-26.285l-23.858-336.283h50.143V496.851z M293.397,496.851h-26.393V160.568h50.25L293.397,496.851z M331.851,496.851h-23.267l23.858-336.283h42.594L331.851,496.851z M357.599,496.851h-10.476l43.185-336.283h10.476 L357.599,496.851z " +
-        "M296.654,97.087c-1.495-3.907-5.874-5.862-9.781-4.367c-10.043,3.844-12.895,2.129-19.785-2.013 c-3.833-2.305-8.605-5.173-15.305-7.342c-21.151-6.856-34.389,9.688-40.75,17.636c-0.555,0.694-1.076,1.346-1.567,1.939 c-1.149,1.389-1.668,1.682-1.659,1.682c-0.363,0.102-1.676,0.084-2.73,0.069c-2.714-0.038-6.431-0.091-11.781,0.853 c-17.312,3.055-22.505,22.439-22.718,23.263c-1.039,4.033,1.379,8.127,5.405,9.193c0.645,0.171,1.293,0.253,1.93,0.253 c3.344,0,6.409-2.241,7.323-5.617c0.029-0.108,3.014-10.818,10.693-12.174c3.937-0.695,6.592-0.655,8.934-0.624 c5.941,0.09,10.601-0.385,16.272-7.24c0.539-0.651,1.114-1.368,1.725-2.132c7.145-8.927,13.902-16.041,24.256-12.691 c5.049,1.636,8.669,3.811,12.169,5.915c7.901,4.748,16.071,9.657,33.002,3.176C296.194,105.373,298.148,100.993,296.654,97.087z"
-    );
-
-    ctx.fillStyle = accent;
-    ctx.fill(combinedPath);
-    ctx.restore();
-}
-
-function drawClapperSticker(
-    ctx: CanvasRenderingContext2D,
-    {
-        x,
-        y,
-        scale = 1,
-        rotation = 0,
-        opacity = 0.5,
-        accent = '#4ecdc4',
-    }: {
-        x: number;
-        y: number;
-        scale?: number;
-        rotation?: number;
-        opacity?: number;
-        accent?: string;
-    }
-) {
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(rotation);
-    ctx.scale(scale, scale);
-    ctx.translate(-12, -12); // Center a 24x24 viewBox
-    ctx.globalAlpha = opacity;
-
-    // SVG Path for Clapperboard
-    const combinedPath = new Path2D(
-        "M4 11H16C17.8856 11 18.8284 11 19.4142 11.5858C20 12.1716 20 13.1144 20 15V16C20 18.8284 20 20.2426 19.1213 21.1213C18.2426 22 16.8284 22 14 22H10C7.17157 22 5.75736 22 4.87868 21.1213C4 20.2426 4 18.8284 4 16V11Z " +
-        "M4.00128 10.9997C3.51749 9.19412 3.27559 8.29135 3.48364 7.51489C3.61994 7.00622 3.88773 6.5424 4.2601 6.17003C4.82851 5.60162 5.73128 5.35973 7.53682 4.87593L14.5398 2.99949C15.213 2.8191 15.5496 2.72891 15.8445 2.70958C17.0553 2.63022 18.1946 3.28804 18.7313 4.37629C18.862 4.64129 18.9522 4.97791 19.1326 5.65114C19.1927 5.87556 19.2228 5.98776 19.2292 6.08604C19.2557 6.48964 19.0364 6.86943 18.6736 7.04832C18.5853 7.09188 18.4731 7.12195 18.2487 7.18208L4.00128 10.9997Z " +
-        "M14.7004 2.94135L14.0627 8.28861 " +
-        "M8.42209 4.62396L7.78433 9.97123"
-    );
-
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 1.5;
-    ctx.stroke(combinedPath);
-    ctx.restore();
-}
-
-function wrapCanvasText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-    if (!text) return [''];
-
-    const words = text.split(/\s+/).filter(Boolean);
-    const lines: string[] = [];
-    let currentLine = '';
-
-    words.forEach((word) => {
-        const candidate = currentLine ? `${currentLine} ${word}` : word;
-        if (ctx.measureText(candidate).width <= maxWidth) {
-            currentLine = candidate;
-        } else {
-            if (currentLine) {
-                lines.push(currentLine);
-            }
-            currentLine = word;
-        }
-    });
-
-    if (currentLine) {
-        lines.push(currentLine);
-    }
-
-    return lines.length > 0 ? lines : [text];
-}
-
-async function loadCanvasImage(src: string): Promise<HTMLImageElement | null> {
-    return new Promise((resolve) => {
-        const image = new Image();
-        const resolvedSrc = src.startsWith('http') ? buildApiProxyUrl(src) : src;
-        if (!resolvedSrc.startsWith(window.location.origin)) {
-            image.crossOrigin = 'anonymous';
-        }
-        image.onload = () => resolve(image);
-        image.onerror = () => resolve(null);
-        image.src = resolvedSrc;
-    });
-}
 
 function downloadBlob(blob: Blob, filename: string) {
     const blobUrl = URL.createObjectURL(blob);
@@ -1073,7 +936,7 @@ const SlideTopGenres: React.FC<{ slide: WrappedSlide; topGenres?: WrappedData['t
 // ==========================================
 // SLIDE: LISTENING CLOCK
 // ==========================================
-const SlideListeningClock: React.FC<{ slide: WrappedSlide; listeningClock?: WrappedData['listeningClock']; peakHour?: number }> = ({ slide, listeningClock, peakHour }) => {
+const SlideListeningClock: React.FC<{ slide: WrappedSlide; listeningClock?: WrappedData['listeningClock']; peakHour?: number; weekday?: WrappedData['weekday'] }> = ({ slide, listeningClock, peakHour, weekday }) => {
     const maxMinutes = listeningClock ? Math.max(...listeningClock.map(h => h.minutes)) : 1;
     const hourMarkers = [0, 6, 12, 18, 23];
     
@@ -1149,6 +1012,32 @@ const SlideListeningClock: React.FC<{ slide: WrappedSlide; listeningClock?: Wrap
                             <span key={hour}>{hour}{i18n.t('wrapped.hoursShort')}</span>
                         ))}
                     </div>
+                    {weekday && weekday.some(d => d.minutes > 0) && (
+                        <div className="mt-4">
+                            <div className="flex items-end justify-center gap-1.5 h-12">
+                                {/* dow MySQL : 1=dimanche … 7=samedi → on affiche Lun→Dim */}
+                                {[2, 3, 4, 5, 6, 7, 1].map((dow) => {
+                                    const entry = weekday.find(d => d.dow === dow);
+                                    const minutes = entry?.minutes || 0;
+                                    const maxW = Math.max(1, ...weekday.map(d => d.minutes));
+                                    const isTop = minutes === maxW && minutes > 0;
+                                    return (
+                                        <div key={dow} className="flex flex-col items-center gap-1 flex-1 h-full justify-end">
+                                            <motion.div
+                                                initial={{ height: 0 }}
+                                                animate={{ height: minutes > 0 ? `${Math.max(12, (minutes / maxW) * 100)}%` : '2px' }}
+                                                transition={{ duration: 0.5, delay: 1.4 }}
+                                                className={`w-full rounded-t-sm ${isTop ? 'bg-sky-400' : minutes > 0 ? 'bg-sky-500/40' : 'bg-white/5'}`}
+                                            />
+                                            <span className="text-[9px] text-white/40 font-mono">
+                                                {new Intl.DateTimeFormat(i18n.language, { weekday: 'narrow' }).format(new Date(2026, 0, 3 + dow))}
+                                            </span>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
                 </motion.div>
             )}
 
@@ -1277,22 +1166,65 @@ const SlideFunFact: React.FC<{ slide: WrappedSlide }> = ({ slide }) => (
     </WrappedCenteredSlide>
 );
 
+const CreditsRoll: React.FC<{ topContent: WrappedData['topContent']; topGenres?: WrappedData['topGenres']; stats: WrappedData['stats'] }> = ({ topContent, topGenres, stats }) => {
+    const { t } = useTranslation();
+    const prefersReducedMotion = useReducedMotion();
+    const lines: { label: string; value: string }[] = [
+        { label: t('wrapped.creditsDirectedBy'), value: t('wrapped.creditsYou') },
+        ...(topContent.length ? [{ label: t('wrapped.creditsStarring'), value: topContent.slice(0, 5).map(c => c.title).join(' · ') }] : []),
+        ...(topGenres?.length ? [{ label: t('wrapped.creditsGenre'), value: topGenres[0].name }] : []),
+        { label: t('wrapped.creditsRuntime'), value: formatCompactDuration(stats.totalMinutes, t) },
+        { label: t('wrapped.creditsProducedBy'), value: 'MOVIX' },
+        { label: '©', value: 'movix.date' },
+    ];
+
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1 }} className="mt-6 h-36 w-full max-w-md overflow-hidden relative" style={{ maskImage: 'linear-gradient(to bottom, transparent, black 18%, black 82%, transparent)' }}>
+            <motion.div
+                initial={{ y: prefersReducedMotion ? 0 : 144 }}
+                animate={prefersReducedMotion ? { y: 0 } : { y: -lines.length * 44 }}
+                transition={prefersReducedMotion ? undefined : { duration: lines.length * 2.2, ease: 'linear', repeat: Infinity, repeatDelay: 1.2 }}
+                className="flex flex-col items-center gap-3"
+            >
+                {lines.map((line) => (
+                    <div key={line.label + line.value} className="text-center">
+                        <p className="text-[10px] uppercase tracking-[0.3em] text-white/40">{line.label}</p>
+                        <p className="text-sm md:text-base font-bold text-white/90 max-w-sm">{line.value}</p>
+                    </div>
+                ))}
+            </motion.div>
+        </motion.div>
+    );
+};
+
 const SlideClosing: React.FC<{
     slide: WrappedSlide;
     stats: WrappedData['stats'];
+    topContent: WrappedData['topContent'];
+    topGenres?: WrappedData['topGenres'];
     onShareImage: () => void;
     onDownloadImage: () => void;
     onShareText: () => void;
     onCopyText: () => void;
     isPreparingImage: boolean;
+    shareFormat: 'story' | 'poster' | 'ticket';
+    onFormatChange: (f: 'story' | 'poster' | 'ticket') => void;
+    previewUrl: string | null;
+    isGeneratingPreview: boolean;
 }> = ({
     slide,
     stats,
+    topContent,
+    topGenres,
     onShareImage,
     onDownloadImage,
     onShareText,
     onCopyText,
-    isPreparingImage
+    isPreparingImage,
+    shareFormat,
+    onFormatChange,
+    previewUrl,
+    isGeneratingPreview
 }) => (
     <WrappedCenteredSlide contentClassName="max-w-4xl">
         <motion.div
@@ -1355,6 +1287,9 @@ const SlideClosing: React.FC<{
             </AnimatedBorderCard>
         </motion.div>
 
+        {/* Générique de fin */}
+        <CreditsRoll topContent={topContent} topGenres={topGenres} stats={stats} />
+
         {/* Stats summary */}
         <motion.div
             initial={{ opacity: 0 }}
@@ -1402,6 +1337,50 @@ const SlideClosing: React.FC<{
                 <p className="text-sm text-white/60 mb-4">
                     {i18n.t('wrapped.shareOptionsDesc')}
                 </p>
+
+                <div className="mb-3 flex items-center justify-center gap-2">
+                    {([['story', i18n.t('wrapped.shareFormatStory')], ['poster', i18n.t('wrapped.shareFormatPoster')], ['ticket', i18n.t('wrapped.shareFormatTicket')]] as const).map(([fmt, label]) => (
+                        <button
+                            key={fmt}
+                            onClick={() => onFormatChange(fmt)}
+                            className={`rounded-full px-4 py-1.5 text-xs font-semibold transition-colors border ${
+                                shareFormat === fmt
+                                    ? 'border-fuchsia-400/60 bg-fuchsia-500/25 text-white'
+                                    : 'border-white/10 bg-white/[0.04] text-white/60 hover:text-white'
+                            }`}
+                        >
+                            {label}
+                        </button>
+                    ))}
+                </div>
+
+                {/* Préviz du format sélectionné (cliquer = ouvrir en plein écran dans un nouvel onglet) */}
+                <div className="mb-4 flex justify-center">
+                    <button
+                        type="button"
+                        onClick={() => { if (previewUrl) window.open(previewUrl, '_blank', 'noopener'); }}
+                        disabled={!previewUrl}
+                        className={`relative h-48 overflow-hidden rounded-xl border border-white/10 bg-black/40 transition-transform hover:scale-[1.02] sm:h-56 ${shareFormat === 'poster' ? 'aspect-[2/3]' : 'aspect-[9/16]'}`}
+                    >
+                        {previewUrl ? (
+                            <img
+                                src={previewUrl}
+                                alt={i18n.t('wrapped.shareFormatsTitle')}
+                                className="h-full w-full object-cover"
+                                draggable={false}
+                            />
+                        ) : (
+                            <span className="flex h-full w-full items-center justify-center">
+                                <Loader2 className="h-5 w-5 animate-spin text-white/40" />
+                            </span>
+                        )}
+                        {isGeneratingPreview && previewUrl && (
+                            <span className="absolute inset-0 flex items-center justify-center bg-black/50">
+                                <Loader2 className="h-5 w-5 animate-spin text-white/70" />
+                            </span>
+                        )}
+                    </button>
+                </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <motion.button
@@ -1861,6 +1840,338 @@ const SlideWatchBookends: React.FC<{
 };
 
 // ==========================================
+// SLIDE: TIMELINE (12 mois)
+// ==========================================
+const SlideTimeline: React.FC<{ slide: WrappedSlide; monthlyGraph?: WrappedData['monthlyGraph']; peakMonth: WrappedData['peakMonth'] }> = ({ slide, monthlyGraph, peakMonth }) => {
+    const maxMinutes = monthlyGraph && monthlyGraph.length ? Math.max(1, ...monthlyGraph.map(m => m.minutes)) : 1;
+    const monthShort = (m: number) => new Intl.DateTimeFormat(i18n.language, { month: 'narrow' }).format(new Date(2026, m - 1, 1));
+
+    return (
+        <WrappedCenteredSlide contentClassName="max-w-4xl">
+            <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', duration: 0.8 }} className="mb-6">
+                <div className="relative">
+                    <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(99, 102, 241, 0.55) 0%, transparent 70%)' }} />
+                    <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-blue-500 via-indigo-500 to-violet-600 flex items-center justify-center shadow-2xl rotate-3">
+                        <TrendingUp className="w-14 h-14 md:w-16 md:h-16 text-white" />
+                    </div>
+                </div>
+            </motion.div>
+
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+                <h2 className="text-3xl md:text-5xl font-black mb-2">
+                    <ShinyText text={slide.title} speed={2} color="#818cf8" shineColor="#ffffff" className="" />
+                </h2>
+            </motion.div>
+
+            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-lg text-indigo-300 mb-6 font-medium">
+                {slide.subtitle}
+            </motion.p>
+
+            {monthlyGraph && (
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.5 }} className="w-full max-w-md">
+                    <div className="flex items-end justify-center gap-1.5 h-32 mb-2">
+                        {monthlyGraph.map((m) => {
+                            const isPeak = m.month === peakMonth.month && m.minutes > 0;
+                            const heightPercent = m.minutes > 0 ? Math.max(8, (m.minutes / maxMinutes) * 100) : 0;
+                            return (
+                                <div key={m.month} className="flex flex-col items-center gap-1 flex-1 h-full justify-end">
+                                    <motion.div
+                                        initial={{ height: 0 }}
+                                        animate={{ height: m.minutes > 0 ? `${heightPercent}%` : '2px' }}
+                                        transition={{ duration: 0.6, delay: 0.6 + m.month * 0.04, type: 'spring', bounce: 0.2 }}
+                                        className={`w-full rounded-t-md ${isPeak ? 'bg-indigo-400 shadow-[0_0_12px_rgba(129,140,248,0.6)]' : m.minutes > 0 ? 'bg-indigo-500/60' : 'bg-white/5'}`}
+                                    />
+                                    <span className={`text-[10px] font-mono ${isPeak ? 'text-indigo-300' : 'text-white/40'}`}>{monthShort(m.month)}</span>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </motion.div>
+            )}
+
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 1.1 }} className="mt-4">
+                <AnimatedBorderCard highlightColor="129 140 248" backgroundColor="0 0 0" className="p-4 max-w-md backdrop-blur-md">
+                    <p className="text-sm md:text-base text-white/85">{slide.text}</p>
+                    {slide.subtext && <p className="mt-2 text-indigo-400/80 italic text-sm">{slide.subtext}</p>}
+                </AnimatedBorderCard>
+            </motion.div>
+        </WrappedCenteredSlide>
+    );
+};
+
+// ==========================================
+// SLIDE: RECORD DAY
+// ==========================================
+const SlideRecordDay: React.FC<{ slide: WrappedSlide }> = ({ slide }) => (
+    <WrappedCenteredSlide contentClassName="max-w-4xl">
+        <motion.div initial={{ scale: 0, rotate: -12 }} animate={{ scale: 1, rotate: 0 }} transition={{ type: 'spring', duration: 0.8 }} className="mb-8">
+            <div className="relative">
+                <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(245, 158, 11, 0.5) 0%, transparent 70%)' }} />
+                <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-amber-500 via-orange-500 to-red-500 flex items-center justify-center shadow-2xl -rotate-3">
+                    <Trophy className="w-14 h-14 md:w-16 md:h-16 text-white" />
+                </div>
+            </div>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+            <h2 className="text-4xl md:text-6xl font-black mb-3">
+                <ShinyText text={slide.title} speed={2} color="#f59e0b" shineColor="#ffffff" className="" />
+            </h2>
+        </motion.div>
+
+        <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-xl md:text-2xl text-amber-300 mb-6 font-semibold">
+            {slide.subtitle}
+        </motion.p>
+
+        {slide.highlight && (
+            <motion.p initial={{ opacity: 0, scale: 0.6 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.5, type: 'spring' }} className="text-5xl md:text-7xl font-black text-white mb-8">
+                {slide.highlight}
+            </motion.p>
+        )}
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.7 }}>
+            <AnimatedBorderCard highlightColor="245 158 11" backgroundColor="0 0 0" className="p-8 max-w-xl backdrop-blur-md">
+                <p className="text-lg md:text-xl text-white/90 leading-relaxed">{slide.text}</p>
+                {slide.subtext && <p className="mt-4 text-amber-400/80 italic">{slide.subtext}</p>}
+            </AnimatedBorderCard>
+        </motion.div>
+    </WrappedCenteredSlide>
+);
+
+// ==========================================
+// SLIDE: REWATCH
+// ==========================================
+const SlideRewatch: React.FC<{ slide: WrappedSlide }> = ({ slide }) => (
+    <WrappedCenteredSlide contentClassName="max-w-4xl">
+        <motion.div initial={{ scale: 0, rotate: 180 }} animate={{ scale: 1, rotate: 0 }} transition={{ type: 'spring', duration: 0.9 }} className="mb-8">
+            <div className="relative">
+                <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(16, 185, 129, 0.5) 0%, transparent 70%)' }} />
+                <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-emerald-500 via-teal-500 to-cyan-600 flex items-center justify-center shadow-2xl rotate-3">
+                    <Repeat className="w-14 h-14 md:w-16 md:h-16 text-white" />
+                </div>
+            </div>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+            <h2 className="text-4xl md:text-6xl font-black mb-3">
+                <ShinyText text={slide.title} speed={2} color="#10b981" shineColor="#ffffff" className="" />
+            </h2>
+        </motion.div>
+
+        <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-xl md:text-2xl text-emerald-300 mb-6 font-semibold">
+            {slide.subtitle}
+        </motion.p>
+
+        {slide.highlight && (
+            <motion.p initial={{ opacity: 0, scale: 0.6 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.5, type: 'spring' }} className="text-5xl md:text-7xl font-black text-white mb-8">
+                {slide.highlight}
+            </motion.p>
+        )}
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.7 }}>
+            <AnimatedBorderCard highlightColor="16 185 129" backgroundColor="0 0 0" className="p-8 max-w-xl backdrop-blur-md">
+                <p className="text-lg md:text-xl text-white/90 leading-relaxed">{slide.text}</p>
+                {slide.subtext && <p className="mt-4 text-emerald-400/80 italic">{slide.subtext}</p>}
+            </AnimatedBorderCard>
+        </motion.div>
+    </WrappedCenteredSlide>
+);
+
+// ==========================================
+// SLIDE: WATCH AGE (âge ciné)
+// ==========================================
+const SlideWatchAge: React.FC<{ slide: WrappedSlide }> = ({ slide }) => (
+    <WrappedCenteredSlide contentClassName="max-w-4xl">
+        <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', duration: 0.8 }} className="mb-8">
+            <div className="relative">
+                <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(168, 85, 247, 0.5) 0%, transparent 70%)' }} />
+                <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-600 flex items-center justify-center shadow-2xl rotate-3">
+                    <Hourglass className="w-14 h-14 md:w-16 md:h-16 text-white" />
+                </div>
+            </div>
+        </motion.div>
+
+        {slide.highlight && (
+            <motion.p initial={{ opacity: 0, scale: 0.5 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.3, type: 'spring' }} className="text-7xl md:text-9xl font-black text-white mb-4 tracking-tight">
+                {slide.highlight}
+            </motion.p>
+        )}
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }}>
+            <h2 className="text-3xl md:text-5xl font-black mb-3">
+                <ShinyText text={slide.title} speed={2} color="#a855f7" shineColor="#ffffff" className="" />
+            </h2>
+        </motion.div>
+
+        <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.6 }} className="text-xl md:text-2xl text-purple-300 mb-8 font-semibold">
+            {slide.subtitle}
+        </motion.p>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.8 }}>
+            <AnimatedBorderCard highlightColor="168 85 247" backgroundColor="0 0 0" className="p-8 max-w-xl backdrop-blur-md">
+                <p className="text-lg md:text-xl text-white/90 leading-relaxed">{slide.text}</p>
+                {slide.subtext && <p className="mt-4 text-purple-400/80 italic">{slide.subtext}</p>}
+            </AnimatedBorderCard>
+        </motion.div>
+    </WrappedCenteredSlide>
+);
+
+// ==========================================
+// SLIDE: PAGES TIME (temps de navigation)
+// ==========================================
+const SlidePagesTime: React.FC<{ slide: WrappedSlide; topPages: WrappedData['topPages'] }> = ({ slide, topPages }) => {
+    const { t } = useTranslation();
+    const pages = (topPages || []).filter(p => p.page !== 'live-tv').slice(0, 5);
+    const maxMinutes = pages.length ? Math.max(1, ...pages.map(p => p.minutes)) : 1;
+    const pageLabel = (page: string) => {
+        const key = `wrapped.pageNames.${page}`;
+        const label = t(key);
+        return label === key ? page : label;
+    };
+
+    return (
+        <WrappedCenteredSlide contentClassName="max-w-4xl">
+            <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', duration: 0.8 }} className="mb-6">
+                <div className="relative">
+                    <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(34, 211, 238, 0.45) 0%, transparent 70%)' }} />
+                    <div className="relative w-28 h-28 md:w-36 md:h-36 rounded-3xl bg-gradient-to-br from-cyan-500 via-sky-500 to-blue-600 flex items-center justify-center shadow-2xl -rotate-3">
+                        <MousePointerClick className="w-14 h-14 md:w-16 md:h-16 text-white" />
+                    </div>
+                </div>
+            </motion.div>
+
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+                <h2 className="text-3xl md:text-5xl font-black mb-2">
+                    <ShinyText text={slide.title} speed={2} color="#22d3ee" shineColor="#ffffff" className="" />
+                </h2>
+            </motion.div>
+
+            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-lg text-cyan-300 mb-6 font-medium">
+                {slide.subtitle}
+            </motion.p>
+
+            {pages.length > 0 && (
+                <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }} className="w-full max-w-md space-y-3 mb-6">
+                    {pages.map((p, i) => (
+                        <motion.div key={p.page} initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.6 + i * 0.1 }} className="flex items-center gap-3">
+                            <span className="text-sm text-white/60 w-16 text-right font-mono">{formatDurationShort(p.minutes)}</span>
+                            <div className="flex-1 h-8 bg-white/5 rounded-lg overflow-hidden relative">
+                                <motion.div
+                                    initial={{ width: 0 }}
+                                    animate={{ width: `${Math.max(10, (p.minutes / maxMinutes) * 100)}%` }}
+                                    transition={{ duration: 1, delay: 0.7 + i * 0.1 }}
+                                    className="h-full bg-gradient-to-r from-cyan-500 to-sky-400 rounded-lg"
+                                />
+                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-white text-sm font-medium capitalize">{pageLabel(p.page)}</span>
+                            </div>
+                        </motion.div>
+                    ))}
+                </motion.div>
+            )}
+
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 1.2 }}>
+                <AnimatedBorderCard highlightColor="34 211 238" backgroundColor="0 0 0" className="p-4 max-w-md backdrop-blur-md">
+                    <p className="text-sm md:text-base text-white/85">{slide.text}</p>
+                    {slide.subtext && <p className="mt-2 text-cyan-400/80 italic text-sm">{slide.subtext}</p>}
+                </AnimatedBorderCard>
+            </motion.div>
+        </WrappedCenteredSlide>
+    );
+};
+
+// ==========================================
+// SLIDE: QUIZ — "Devine ton top 1"
+// ==========================================
+const SlideQuiz: React.FC<{ slide: WrappedSlide; topContent: WrappedData['topContent']; onContinue: () => void }> = ({ slide, topContent, onContinue }) => {
+    const { t } = useTranslation();
+    const [picked, setPicked] = useState<number | null>(null);
+    // Ordre d'affichage déterministe : top 3 réordonné par (tmdbId % 3)
+    const options = useMemo(() => {
+        const top3 = topContent.slice(0, 3);
+        const offset = (top3[0]?.tmdbId || 0) % 3;
+        return top3.map((_, i) => top3[(i + offset) % 3]);
+    }, [topContent]);
+    const revealed = picked !== null;
+    const isCorrect = revealed && options[picked!]?.rank === 1;
+
+    return (
+        <WrappedCenteredSlide contentClassName="max-w-4xl">
+            <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', duration: 0.8 }} className="mb-6">
+                <div className="relative">
+                    <div className="absolute inset-0 rounded-full scale-150 pointer-events-none" style={{ background: 'radial-gradient(circle, rgba(251, 191, 36, 0.5) 0%, transparent 70%)' }} />
+                    <div className="relative w-24 h-24 md:w-32 md:h-32 rounded-3xl bg-gradient-to-br from-amber-400 via-orange-500 to-rose-500 flex items-center justify-center shadow-2xl rotate-3">
+                        <HelpCircle className="w-12 h-12 md:w-16 md:h-16 text-white" />
+                    </div>
+                </div>
+            </motion.div>
+
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+                <h2 className="text-3xl md:text-5xl font-black mb-2">
+                    <ShinyText text={revealed ? (isCorrect ? t('wrapped.quizCorrect') : t('wrapped.quizWrong')) : slide.title} speed={2} color="#fbbf24" shineColor="#ffffff" className="" />
+                </h2>
+            </motion.div>
+
+            <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-lg md:text-xl text-amber-300 mb-8 font-medium">
+                {revealed ? t('wrapped.quizRevealSubtitle') : slide.subtitle}
+            </motion.p>
+
+            <div className="flex items-center justify-center gap-3 md:gap-6 mb-8">
+                {options.map((item, i) => {
+                    const isTop1 = item.rank === 1;
+                    const isPicked = picked === i;
+                    return (
+                        <motion.button
+                            key={item.rank}
+                            initial={{ opacity: 0, y: 30 }}
+                            animate={{ opacity: 1, y: 0, scale: revealed && isTop1 ? 1.08 : revealed && isPicked && !isTop1 ? 0.94 : 1 }}
+                            transition={{ delay: 0.5 + i * 0.15, type: 'spring' }}
+                            whileHover={!revealed ? { scale: 1.05, rotate: i === 1 ? 0 : i === 0 ? -2 : 2 } : undefined}
+                            onClick={() => { if (!revealed) setPicked(i); }}
+                            disabled={revealed}
+                            className={`relative w-24 md:w-40 aspect-[2/3] rounded-2xl overflow-hidden border-2 transition-colors ${
+                                revealed && isTop1 ? 'border-amber-400 shadow-[0_0_30px_rgba(251,191,36,0.5)]'
+                                : revealed && isPicked ? 'border-red-400/70'
+                                : 'border-white/15'
+                            }`}
+                        >
+                            {item.poster_path ? (
+                                <img
+                                    src={`${TMDB_IMAGE_BASE}${item.poster_path}`}
+                                    alt=""
+                                    className={`w-full h-full object-cover transition-all duration-700 ${revealed ? 'blur-0 scale-100' : 'blur-xl scale-110'}`}
+                                    draggable={false}
+                                />
+                            ) : (
+                                <div className="w-full h-full bg-gradient-to-br from-white/10 to-white/5 flex items-center justify-center text-3xl">🎬</div>
+                            )}
+                            {revealed && (
+                                <div className="absolute inset-x-0 bottom-0 bg-black/80 px-2 py-1.5">
+                                    <p className="text-[10px] md:text-xs text-white font-semibold truncate">#{item.rank} · {item.title}</p>
+                                </div>
+                            )}
+                        </motion.button>
+                    );
+                })}
+            </div>
+
+            {!revealed ? (
+                <motion.button initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.2 }} onClick={onContinue} className="text-sm text-white/50 underline underline-offset-4 hover:text-white/80 transition-colors">
+                    {t('wrapped.quizSkip')}
+                </motion.button>
+            ) : (
+                <motion.button
+                    initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.6 }}
+                    onClick={onContinue}
+                    className="rounded-2xl border border-amber-400/30 bg-gradient-to-r from-amber-500/20 to-orange-500/20 px-6 py-3 text-sm font-semibold text-white"
+                >
+                    {t('wrapped.quizContinue')}
+                </motion.button>
+            )}
+        </WrappedCenteredSlide>
+    );
+};
+
+// ==========================================
 // SLIDE BACKGROUNDS
 // ==========================================
 const slideBackgrounds: Record<string, { color: string; gradient: string }> = {
@@ -1879,6 +2190,12 @@ const slideBackgrounds: Record<string, { color: string; gradient: string }> = {
     'watch-bookends': { color: 'rgba(52, 211, 153, 0.15)', gradient: 'from-emerald-500/20 via-transparent to-transparent' },
     closing: { color: 'rgba(232, 121, 249, 0.15)', gradient: 'from-fuchsia-500/20 via-transparent to-transparent' },
     'detailed-stats': { color: 'rgba(34, 211, 238, 0.15)', gradient: 'from-cyan-500/20 via-transparent to-transparent' },
+    timeline: { color: 'rgba(129, 140, 248, 0.15)', gradient: 'from-indigo-500/20 via-transparent to-transparent' },
+    'record-day': { color: 'rgba(245, 158, 11, 0.15)', gradient: 'from-amber-500/20 via-transparent to-transparent' },
+    rewatch: { color: 'rgba(16, 185, 129, 0.15)', gradient: 'from-emerald-500/20 via-transparent to-transparent' },
+    'watch-age': { color: 'rgba(168, 85, 247, 0.15)', gradient: 'from-purple-500/20 via-transparent to-transparent' },
+    'pages-time': { color: 'rgba(34, 211, 238, 0.15)', gradient: 'from-cyan-500/20 via-transparent to-transparent' },
+    quiz: { color: 'rgba(251, 191, 36, 0.15)', gradient: 'from-amber-400/20 via-transparent to-transparent' },
 };
 
 // ==========================================
@@ -1896,6 +2213,7 @@ const WrappedPage: React.FC = () => {
     const [noData, setNoData] = useState(false);
     const [wrappedProgress, setWrappedProgress] = useState<WrappedProgress | null>(null);
     const [isPreparingShareImage, setIsPreparingShareImage] = useState(false);
+    const [shareFormat, setShareFormat] = useState<'story' | 'poster' | 'ticket'>('story');
     const [isPodiumTrailerLoaded, setIsPodiumTrailerLoaded] = useState(false);
     const bgMode = (localStorage.getItem('settings_bg_mode') as 'combined' | 'static' | 'animated') || 'combined';
     const hasWrappedAccount = Boolean(localStorage.getItem('auth_token'));
@@ -2084,70 +2402,47 @@ const WrappedPage: React.FC = () => {
         );
     }
 
-    // Fetch TMDB data for top content
-    const fetchTMDBData = useCallback(async (topContent: WrappedTopContent[]) => {
-        const newTmdbData = new Map<number, TMDBData>();
-        
-        const fetchPromises = topContent.map(async (item, index) => {
+    // Le payload backend contient déjà poster/backdrop/year/vote — zéro re-fetch TMDB.
+    const buildTmdbDataFromPayload = useCallback((topContent: WrappedTopContent[]) => {
+        const map = new Map<number, TMDBData>();
+        topContent.forEach((item) => {
             if (!item.tmdbId) return;
-            
-            try {
-                const mediaType = item.type === 'tv' || item.type === 'anime' ? 'tv' : 'movie';
-                const response = await axios.get(
-                    `https://api.themoviedb.org/3/${mediaType}/${item.tmdbId}`,
-                    { params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() } }
-                );
-                const data: TMDBData = response.data;
-
-                // Fetch trailer for the podium items so the background video can follow top 1, 2 and 3.
-                if (index < 3) {
-                    try {
-                        const videosRes = await axios.get(
-                            `https://api.themoviedb.org/3/${mediaType}/${item.tmdbId}/videos`,
-                            { params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() } }
-                        );
-                        let trailer = videosRes.data.results?.find(
-                            (v: any) => v.site === 'YouTube' && v.type === 'Trailer'
-                        );
-                        // Fallback: try English trailers
-                        if (!trailer) {
-                            const videosResEN = await axios.get(
-                                `https://api.themoviedb.org/3/${mediaType}/${item.tmdbId}/videos`,
-                                { params: { api_key: TMDB_API_KEY, language: 'en-US' } }
-                            );
-                            trailer = videosResEN.data.results?.find(
-                                (v: any) => v.site === 'YouTube' && v.type === 'Trailer'
-                            );
-                            // Last fallback: any YouTube video (teaser, clip, etc.)
-                            if (!trailer) {
-                                trailer = videosResEN.data.results?.find(
-                                    (v: any) => v.site === 'YouTube'
-                                );
-                            }
-                        }
-                        data.trailerKey = trailer?.key || null;
-                    } catch {
-                        data.trailerKey = null;
-                    }
-                }
-
-                newTmdbData.set(item.tmdbId, data);
-            } catch (error) {
-                console.error(`[Wrapped] Error fetching TMDB data for ${item.tmdbId}:`, error);
-            }
+            map.set(item.tmdbId, {
+                id: item.tmdbId,
+                title: item.title,
+                name: item.title,
+                poster_path: item.poster_path ?? null,
+                backdrop_path: item.backdrop_path ?? null,
+                vote_average: item.vote_average ?? undefined,
+                release_date: item.year ? `${item.year}-01-01` : undefined,
+                genres: (item.genres || []).map((name, i) => ({ id: i, name })),
+                // trailerKey: undefined = pas encore fetché (lazy au slide podium)
+            });
         });
-
-        await Promise.all(fetchPromises);
-        setTmdbData(newTmdbData);
+        setTmdbData(map);
     }, []);
 
     useEffect(() => {
         const loadWrapped = async () => {
             setLoading(true);
 
-            const response = await fetchWrappedData(year);
+            const profileId = localStorage.getItem('selected_profile_id') || 'default';
+            const sessionKey = `wrapped:${year}:${profileId}`;
+            let response: WrappedResponse | null = null;
 
-            if (response.success && response.wrapped) {
+            const cachedRaw = sessionStorage.getItem(sessionKey);
+            if (cachedRaw) {
+                try { response = JSON.parse(cachedRaw) as WrappedResponse; } catch { /* refetch */ }
+            }
+
+            if (!response) {
+                response = await fetchWrappedData(year);
+                if (response.success && response.wrapped) {
+                    try { sessionStorage.setItem(sessionKey, JSON.stringify(response)); } catch { /* quota — tant pis */ }
+                }
+            }
+
+            if (response?.success && response.wrapped) {
                 // Hotfix: Ensure detailed-stats slide exists if backend doesn't send it yet
                 const hasStats = response.wrapped.slides.some((s: WrappedSlide) => s.type === 'detailed-stats');
                 if (!hasStats) {
@@ -2205,6 +2500,22 @@ const WrappedPage: React.FC = () => {
                     response.wrapped.slides.splice(top1Index, 0, ...podiumSlides);
                 }
 
+                // Quiz "devine ton top 1" — avant le podium (3 titres avec posters requis)
+                const hasQuiz = response.wrapped.slides.some((s: WrappedSlide) => s.type === 'quiz');
+                const quizEligible = !hasQuiz && response.wrapped.topContent.slice(0, 3).filter((c: WrappedTopContent) => c.poster_path).length === 3;
+                if (quizEligible) {
+                    const firstPodiumIndex = response.wrapped.slides.findIndex((s: WrappedSlide) =>
+                        s.type === 'top3-focus' || s.type === 'top2-focus' || s.type === 'top1');
+                    if (firstPodiumIndex !== -1) {
+                        response.wrapped.slides.splice(firstPodiumIndex, 0, {
+                            type: 'quiz',
+                            title: t('wrapped.quizTitle'),
+                            subtitle: t('wrapped.quizSubtitle'),
+                            text: ''
+                        });
+                    }
+                }
+
                 const bonusSlides: WrappedSlide[] = [];
                 const hasSessionSummary = response.wrapped.slides.some((s: WrappedSlide) => s.type === 'session-summary');
                 const hasWatchBookends = response.wrapped.slides.some((s: WrappedSlide) => s.type === 'watch-bookends');
@@ -2234,9 +2545,12 @@ const WrappedPage: React.FC = () => {
                 }
 
                 if (bonusSlides.length > 0) {
+                    const recordDayIndex = response.wrapped.slides.findIndex((s: WrappedSlide) => s.type === 'record-day');
+                    const rewatchIndex = response.wrapped.slides.findIndex((s: WrappedSlide) => s.type === 'rewatch');
                     const top5Index = response.wrapped.slides.findIndex((s: WrappedSlide) => s.type === 'top5');
-                    const insertIndex = top5Index !== -1
-                        ? top5Index + 1
+                    const anchorIndex = recordDayIndex !== -1 ? recordDayIndex : rewatchIndex !== -1 ? rewatchIndex : top5Index;
+                    const insertIndex = anchorIndex !== -1
+                        ? anchorIndex + 1
                         : response.wrapped.slides.findIndex((s: WrappedSlide) => s.type === 'persona');
 
                     if (insertIndex !== -1) {
@@ -2249,12 +2563,12 @@ const WrappedPage: React.FC = () => {
                 setWrappedData(response.wrapped);
                 setWrappedProgress(response.progress ?? null);
                 setNoData(false);
-                // Fetch TMDB data for posters
-                fetchTMDBData(response.wrapped.topContent);
+                // Build TMDB data map from enriched backend payload (zero network)
+                buildTmdbDataFromPayload(response.wrapped.topContent);
             } else {
                 // No data available for this user/year
                 setWrappedData(null);
-                setWrappedProgress(response.progress ?? null);
+                setWrappedProgress(response?.progress ?? null);
                 setNoData(true);
             }
 
@@ -2262,7 +2576,7 @@ const WrappedPage: React.FC = () => {
         };
 
         loadWrapped();
-    }, [year, fetchTMDBData]);
+    }, [year, buildTmdbDataFromPayload, t]);
 
     const goToSlide = useCallback((index: number) => {
         if (!wrappedData) return;
@@ -2303,6 +2617,44 @@ const WrappedPage: React.FC = () => {
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [nextSlide, prevSlide, navigate]);
 
+    // Trailers : fetch lazy à l'arrivée sur une slide podium uniquement
+    useEffect(() => {
+        if (!wrappedData) return;
+        const slideType = wrappedData.slides[currentSlide]?.type;
+        const idx = slideType === 'top1' ? 0 : slideType === 'top2-focus' ? 1 : slideType === 'top3-focus' ? 2 : -1;
+        if (idx === -1) return;
+        const item = wrappedData.topContent[idx];
+        if (!item?.tmdbId) return;
+        const existing = tmdbData.get(item.tmdbId);
+        if (existing && existing.trailerKey !== undefined) return; // déjà fetché
+
+        let cancelled = false;
+        (async () => {
+            let trailerKey: string | null = null;
+            try {
+                const mediaType = item.type === 'tv' || item.type === 'anime' ? 'tv' : 'movie';
+                const res = await axios.get(`https://api.themoviedb.org/3/${mediaType}/${item.tmdbId}/videos`, { params: { api_key: TMDB_API_KEY, language: getTmdbLanguage() } });
+                let trailer = res.data.results?.find((v: any) => v.site === 'YouTube' && v.type === 'Trailer');
+                if (!trailer) {
+                    const resEN = await axios.get(`https://api.themoviedb.org/3/${mediaType}/${item.tmdbId}/videos`, { params: { api_key: TMDB_API_KEY, language: 'en-US' } });
+                    trailer = resEN.data.results?.find((v: any) => v.site === 'YouTube' && v.type === 'Trailer')
+                        || resEN.data.results?.find((v: any) => v.site === 'YouTube');
+                }
+                trailerKey = trailer?.key || null;
+            } catch {
+                trailerKey = null;
+            }
+            if (cancelled) return;
+            setTmdbData(prev => {
+                const next = new Map(prev);
+                const cur = next.get(item.tmdbId!);
+                if (cur) next.set(item.tmdbId!, { ...cur, trailerKey });
+                return next;
+            });
+        })();
+        return () => { cancelled = true; };
+    }, [currentSlide, wrappedData, tmdbData]);
+
     const handleDragEnd = (_: any, info: PanInfo) => {
         const threshold = 50;
         if (info.offset.x < -threshold) nextSlide();
@@ -2311,6 +2663,7 @@ const WrappedPage: React.FC = () => {
 
     const generateWrappedShareImage = useCallback(async (): Promise<Blob | null> => {
         if (!wrappedData) return null;
+        await ensureShareFonts();
 
         const canvas = document.createElement('canvas');
         canvas.width = WRAPPED_SHARE_IMAGE_WIDTH;
@@ -2371,7 +2724,7 @@ const WrappedPage: React.FC = () => {
                 textColor,
                 paddingX = 22,
                 height: pillHeight = 42,
-                font = '800 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                font = '800 22px Inter, system-ui, sans-serif',
                 stroke,
             }: {
                 fill: string | CanvasGradient;
@@ -2466,7 +2819,7 @@ const WrappedPage: React.FC = () => {
                 ctx.fill();
 
                 ctx.fillStyle = '#ffffff';
-                ctx.font = `${withMeta ? '900 118px' : '900 68px'} system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+                ctx.font = `${withMeta ? '900 118px' : '900 68px'} Inter, system-ui, sans-serif`;
                 const letterWidth = ctx.measureText(fallbackLabel).width;
                 ctx.fillText(fallbackLabel, -letterWidth / 2, withMeta ? 34 : 24);
             }
@@ -2475,7 +2828,7 @@ const WrappedPage: React.FC = () => {
             ctx.fillStyle = chipFill;
             ctx.fill();
             ctx.fillStyle = chipTextColor;
-            ctx.font = '900 24px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+            ctx.font = '900 24px Inter, system-ui, sans-serif';
             ctx.fillText(rank, -w / 2 + 44, -h / 2 + 46);
 
             if (withMeta) {
@@ -2487,11 +2840,11 @@ const WrappedPage: React.FC = () => {
                 ctx.stroke();
 
                 ctx.fillStyle = 'rgba(255,255,255,0.82)';
-                ctx.font = '700 20px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+                ctx.font = '700 20px Inter, system-ui, sans-serif';
                 fillTextCenteredInArea(topTypeLabel, -w / 2 + 20, w - 40, h / 2 - 88);
 
                 ctx.fillStyle = '#ffffff';
-                ctx.font = '900 30px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+                ctx.font = '900 30px Inter, system-ui, sans-serif';
                 fillTextCenteredInArea(topItem ? formatCompactDuration(topItem.minutes, t) : formattedShareWatchTime, -w / 2 + 20, w - 40, h / 2 - 46);
             }
 
@@ -2569,32 +2922,10 @@ const WrappedPage: React.FC = () => {
             ctx.fill();
         }
 
-        for (let i = 0; i < 40; i++) {
-            const isPopcorn = Math.random() > 0.5;
-            const x = Math.random() * 1080;
-            const y = Math.random() * 1920;
-            const scale = 1.0 + Math.random() * 1.5;
-            const rotation = Math.random() * Math.PI * 2;
-            const opacity = 0.05 + Math.random() * 0.15;
-            const colors = ['#4ecdc4', '#ff7a59', '#f6c453', '#ff5f56'];
-            const accent = colors[Math.floor(Math.random() * colors.length)];
-            
-            if (isPopcorn) {
-                drawPopcornSticker(ctx, {
-                    x, y, scale, rotation, opacity,
-                    fillLevel: 0.3 + Math.random() * 0.7,
-                    accent
-                });
-            } else {
-                drawClapperSticker(ctx, {
-                    x, y, scale, rotation, opacity,
-                    accent
-                });
-            }
-        }
+        drawSeededStickers(ctx, width, height, (topItem?.tmdbId || 0) + year);
 
         const brandIconX = 280;
-        const brandIconY = 86;
+        const brandIconY = 226;
         ctx.strokeStyle = '#ff5f56';
         ctx.lineWidth = 7;
         drawRoundedRectPath(ctx, brandIconX, brandIconY, 54, 38, 12);
@@ -2607,31 +2938,31 @@ const WrappedPage: React.FC = () => {
         ctx.stroke();
 
         ctx.fillStyle = '#ffffff';
-        ctx.font = '900 54px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        ctx.fillText('MOVIX', 356, 122);
+        ctx.font = '900 54px Inter, system-ui, sans-serif';
+        ctx.fillText('MOVIX', 356, 262);
         ctx.fillStyle = accentGradient;
-        ctx.fillText('Wrapped', 557, 122);
+        ctx.fillText('Wrapped', 557, 262);
 
         ctx.save();
         ctx.strokeStyle = 'rgba(255,255,255,0.07)';
         ctx.lineWidth = 3;
-        ctx.font = '900 184px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        ctx.strokeText(String(year), (width - ctx.measureText(String(year)).width) / 2, 268);
+        ctx.font = '900 184px Inter, system-ui, sans-serif';
+        ctx.strokeText(String(year), (width - ctx.measureText(String(year)).width) / 2, 396);
         ctx.restore();
 
         ctx.fillStyle = 'rgba(255,255,255,0.52)';
-        ctx.font = '800 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        fillCenteredText(`MOVIX WRAPPED ${year}`, 188);
+        ctx.font = '800 22px Inter, system-ui, sans-serif';
+        fillCenteredText(`MOVIX WRAPPED ${year}`, 330);
 
         ctx.fillStyle = '#ffffff';
-        ctx.font = '900 68px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        fillCenteredText(`Ton top ${year}`, 284);
+        ctx.font = '900 68px Inter, system-ui, sans-serif';
+        fillCenteredText(`Ton top ${year}`, 404);
 
         ctx.fillStyle = titleGradient;
-        ctx.font = '900 88px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+        ctx.font = '900 82px Inter, system-ui, sans-serif';
         const mainTitleLines = wrapCanvasText(ctx, topItem?.title || t('wrapped.title'), 860).slice(0, 2);
         mainTitleLines.forEach((line, index) => {
-            fillCenteredText(line, 386 + index * 92);
+            fillCenteredText(line, 488 + index * 86);
         });
 
         const chips = [
@@ -2640,11 +2971,11 @@ const WrappedPage: React.FC = () => {
             { text: '#1', fill: 'rgba(246,196,83,0.2)', textColor: '#f6c453', stroke: 'rgba(246,196,83,0.35)' },
         ];
 
-        ctx.font = '800 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+        ctx.font = '800 22px Inter, system-ui, sans-serif';
         const chipWidths = chips.map(({ text }) => Math.ceil(ctx.measureText(text).width + 44));
         const totalChipWidth = chipWidths.reduce((sum, item) => sum + item, 0) + (chips.length - 1) * 14;
         let chipX = (width - totalChipWidth) / 2;
-        const chipY = 468;
+        const chipY = 620;
         chips.forEach((chip, index) => {
             const usedWidth = drawPill(chipX, chipY, chip.text, {
                 fill: chip.fill,
@@ -2654,136 +2985,87 @@ const WrappedPage: React.FC = () => {
             chipX += usedWidth + (index < chips.length - 1 ? 14 : 0);
         });
 
-        drawPosterCard({
-            x: 212,
-            y: 694,
-            w: 224,
-            h: 334,
-            rotation: -0.14,
-            image: exportTopAssets[1]?.posterImage || null,
-            fallbackLabel: getTypeInitial(exportTopAssets[1]?.item.type),
-            rank: '#2',
-            borderColor: 'rgba(246,196,83,0.8)',
-            chipFill: '#f6c453',
-            chipTextColor: '#181818',
-        });
-
-        drawPosterCard({
-            x: 634,
-            y: 694,
-            w: 224,
-            h: 334,
-            rotation: 0.14,
-            image: exportTopAssets[2]?.posterImage || null,
-            fallbackLabel: getTypeInitial(exportTopAssets[2]?.item.type),
-            rank: '#3',
-            borderColor: 'rgba(78,205,196,0.78)',
-            chipFill: '#4ecdc4',
-            chipTextColor: '#0f1212',
-        });
-
-        drawPosterCard({
-            x: 334,
-            y: 556,
-            w: 412,
-            h: 612,
-            rotation: -0.035,
-            image: posterImage,
-            fallbackLabel: getTypeInitial(topItem?.type),
-            rank: '#1',
-            borderColor: 'rgba(255,122,89,0.96)',
-            chipFill: '#ff7a59',
-            chipTextColor: '#190d0b',
-            withMeta: true,
-        });
+        drawPosterCard({ x: 222, y: 700, w: 210, h: 300, rotation: -0.14, image: exportTopAssets[1]?.posterImage || null, fallbackLabel: getTypeInitial(exportTopAssets[1]?.item.type), rank: '#2', borderColor: 'rgba(246,196,83,0.8)', chipFill: '#f6c453', chipTextColor: '#181818' });
+        drawPosterCard({ x: 648, y: 700, w: 210, h: 300, rotation: 0.14, image: exportTopAssets[2]?.posterImage || null, fallbackLabel: getTypeInitial(exportTopAssets[2]?.item.type), rank: '#3', borderColor: 'rgba(78,205,196,0.78)', chipFill: '#4ecdc4', chipTextColor: '#0f1212' });
+        drawPosterCard({ x: 345, y: 668, w: 390, h: 560, rotation: -0.035, image: posterImage, fallbackLabel: getTypeInitial(topItem?.type), rank: '#1', borderColor: 'rgba(255,122,89,0.96)', chipFill: '#ff7a59', chipTextColor: '#190d0b', withMeta: true });
 
         ctx.fillStyle = 'rgba(255,255,255,0.74)';
-        ctx.font = '700 22px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        fillCenteredText(t('wrapped.top3FocusSubtitle'), 1234);
+        ctx.font = '700 22px Inter, system-ui, sans-serif';
+        fillCenteredText(t('wrapped.shareTop3Label'), 1268);
 
-        const statsBoxes = [
-            {
-                label: wrappedData.stats.totalHours > 0 ? t('wrapped.statHours') : t('wrapped.statMinutes'),
-                value: wrappedData.stats.totalHours > 0 ? wrappedData.stats.totalHours.toLocaleString(i18n.language) : wrappedData.stats.totalMinutes.toLocaleString(i18n.language),
-                accent: '#ff7a59',
-            },
-            { label: t('wrapped.statTitles'), value: wrappedData.stats.uniqueTitles.toLocaleString(i18n.language), accent: '#f6c453' },
-            { label: t('wrapped.statSessions'), value: wrappedData.stats.totalSessions.toLocaleString(i18n.language), accent: '#4ecdc4' }
+        const streakCount = wrappedData.stats.longestStreak || 0;
+        const pctl = wrappedData.stats.percentile;
+        const lastTile = (pctl != null && pctl >= 90)
+            ? { label: t('wrapped.shareTopPercentLabel').toUpperCase(), value: `TOP ${100 - pctl}%`, accent: '#a78bfa' }
+            : { label: t('wrapped.shareStreakLabel').toUpperCase(), value: t('wrapped.shareStreakValue', { days: streakCount }), accent: '#a78bfa' };
+
+        const tiles = [
+            { label: (wrappedData.stats.totalHours > 0 ? t('wrapped.statHours') : t('wrapped.statMinutes')).toUpperCase(), value: (wrappedData.stats.totalHours > 0 ? wrappedData.stats.totalHours : wrappedData.stats.totalMinutes).toLocaleString(i18n.language), accent: '#ff7a59' },
+            { label: t('wrapped.statTitles').toUpperCase(), value: wrappedData.stats.uniqueTitles.toLocaleString(i18n.language), accent: '#f6c453' },
+            { label: t('wrapped.statSessions').toUpperCase(), value: wrappedData.stats.totalSessions.toLocaleString(i18n.language), accent: '#4ecdc4' },
+            { label: t('wrapped.sharePersonaLabel').toUpperCase(), value: `${wrappedData.persona.emoji} ${wrappedData.persona.title}`, accent: wrappedData.persona.color || '#ff7a59' },
+            { label: t('wrapped.shareGenreLabel').toUpperCase(), value: topWrappedGenre?.name || t('wrapped.shareGenreFallback'), accent: '#f6c453' },
+            lastTile,
         ];
 
-        statsBoxes.forEach((stat, index) => {
-            const boxWidth = 286;
-            const gap = 31;
-            const x = 80 + index * (boxWidth + gap);
-            const y = 1268;
-            drawRoundedRectPath(ctx, x, y, boxWidth, 154, 30);
-            ctx.fillStyle = 'rgba(17, 17, 20, 0.92)';
-            ctx.fill();
-            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-            ctx.lineWidth = 2;
-            ctx.stroke();
+        const tileW = 296, tileH = 130, tileGap = 16;
+        tiles.forEach((tile, index) => {
+            const col = index % 3;
+            const row = Math.floor(index / 3);
+            const tileX = 78 + col * (tileW + tileGap);
+            const tileY = 1310 + row * (tileH + tileGap + 2);
 
-            drawRoundedRectPath(ctx, x + 20, y + 18, 60, 8, 4);
-            ctx.fillStyle = stat.accent;
-            ctx.fill();
-
-            ctx.fillStyle = '#ffffff';
-            ctx.font = '900 58px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-            ctx.fillText(stat.value, x + 24, y + 86);
-
-            ctx.fillStyle = 'rgba(255,255,255,0.52)';
-            ctx.font = '800 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-            ctx.fillText(stat.label.toUpperCase(), x + 24, y + 124);
-        });
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '800 30px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        ctx.fillText(t('wrapped.shareSnapshotTitle'), 78, 1496);
-
-        const snapshotTiles = [
-            { label: t('wrapped.sharePersonaLabel'), value: wrappedData.persona.title, accent: '#ff7a59' },
-            { label: t('wrapped.shareGenreLabel'), value: topWrappedGenre?.name || t('wrapped.shareGenreFallback'), accent: '#f6c453' },
-            { label: t('wrapped.sharePeakMonthLabel'), value: wrappedData.peakMonth.name, accent: '#4ecdc4' },
-            { label: t('wrapped.shareWatchTimeLabel'), value: formattedShareWatchTime, accent: '#ffffff' }
-        ];
-
-        const snapshotTileStartY = 1528;
-        const snapshotTileHeight = 136;
-        const snapshotTileGapY = 28;
-        const snapshotBottomY = snapshotTileStartY + snapshotTileHeight * 2 + snapshotTileGapY;
-        const footerDividerY = snapshotBottomY + 32;
-        const footerTextY = footerDividerY + 42;
-
-        snapshotTiles.forEach((tile, index) => {
-            const col = index % 2;
-            const row = Math.floor(index / 2);
-            const tileX = 78 + col * 462;
-            const tileY = snapshotTileStartY + row * (snapshotTileHeight + snapshotTileGapY);
-            const tileWidth = 384;
-            const tileHeight = snapshotTileHeight;
-
-            drawRoundedRectPath(ctx, tileX, tileY, tileWidth, tileHeight, 28);
+            drawRoundedRectPath(ctx, tileX, tileY, tileW, tileH, 26);
             ctx.fillStyle = 'rgba(16,16,18,0.92)';
             ctx.fill();
             ctx.strokeStyle = 'rgba(255,255,255,0.1)';
             ctx.lineWidth = 2;
             ctx.stroke();
 
-            drawRoundedRectPath(ctx, tileX + 20, tileY + 20, 70, 8, 4);
+            drawRoundedRectPath(ctx, tileX + 18, tileY + 16, 54, 7, 4);
             ctx.fillStyle = tile.accent;
             ctx.fill();
 
             ctx.fillStyle = 'rgba(255,255,255,0.48)';
-            ctx.font = '800 16px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-            ctx.fillText(tile.label.toUpperCase(), tileX + 20, tileY + 56);
+            ctx.font = '800 15px Inter, system-ui, sans-serif';
+            ctx.fillText(tile.label, tileX + 18, tileY + 48);
 
             ctx.fillStyle = '#ffffff';
-            ctx.font = '800 30px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-            const tileLines = wrapCanvasText(ctx, tile.value, tileWidth - 40).slice(0, 2);
+            const isBigNumber = index < 3;
+            ctx.font = isBigNumber ? '900 44px Inter, system-ui, sans-serif' : '800 23px Inter, system-ui, sans-serif';
+            const tileLines = wrapCanvasText(ctx, tile.value, tileW - 36).slice(0, 2);
             tileLines.forEach((line, lineIndex) => {
-                ctx.fillText(line, tileX + 20, tileY + 96 + lineIndex * 34);
+                ctx.fillText(line, tileX + 18, tileY + (isBigNumber ? 102 : 82) + lineIndex * 27);
             });
         });
+
+        // Barre des genres (top 3 empilés)
+        if (wrappedData.topGenres && wrappedData.topGenres.length > 0) {
+            const segs = wrappedData.topGenres.slice(0, 3);
+            const segTotal = segs.reduce((s, g) => s + g.percent, 0) || 1;
+            const segColors = ['#ff7a59', '#f6c453', '#4ecdc4'];
+            const barX = 78, barW = width - 156, barY = 1638, barH = 34;
+
+            ctx.save();
+            drawRoundedRectPath(ctx, barX, barY, barW, barH, 17);
+            ctx.clip();
+            let segX = barX;
+            segs.forEach((g, i) => {
+                const w = barW * (g.percent / segTotal);
+                ctx.fillStyle = segColors[i];
+                ctx.fillRect(segX, barY, w, barH);
+                if (w > 150) {
+                    ctx.fillStyle = 'rgba(10,10,12,0.85)';
+                    ctx.font = '800 17px Inter, system-ui, sans-serif';
+                    ctx.fillText(`${g.name} ${g.percent}%`, segX + 14, barY + 23);
+                }
+                segX += w;
+            });
+            ctx.restore();
+        }
+
+        const footerDividerY = 1706;
+        const footerTextY = 1748;
 
         ctx.strokeStyle = 'rgba(255,255,255,0.08)';
         ctx.lineWidth = 1.5;
@@ -2793,12 +3075,12 @@ const WrappedPage: React.FC = () => {
         ctx.stroke();
 
         ctx.fillStyle = 'rgba(255,255,255,0.76)';
-        ctx.font = '800 26px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+        ctx.font = '800 26px Inter, system-ui, sans-serif';
         ctx.fillText(t('wrapped.shareFooterTag'), 78, footerTextY);
 
         ctx.fillStyle = 'rgba(255,255,255,0.36)';
-        ctx.font = '600 26px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-        const domainLabel = 'movix.tax';
+        ctx.font = '600 26px Inter, system-ui, sans-serif';
+        const domainLabel = 'movix.date';
         ctx.fillText(domainLabel, width - 78 - ctx.measureText(domainLabel).width, footerTextY);
 
         return new Promise((resolve) => {
@@ -2806,18 +3088,91 @@ const WrappedPage: React.FC = () => {
         });
     }, [formattedShareWatchTime, t, tmdbData, topWrappedGenre?.name, topWrappedItem, wrappedData, year]);
 
+    const buildShareCardData = useCallback((): WrappedShareCardData | null => {
+        if (!wrappedData) return null;
+        const top3 = wrappedData.topContent.slice(0, 3);
+        const top1 = top3[0];
+        const tmdb = top1?.tmdbId ? tmdbData.get(top1.tmdbId) : null;
+        return {
+            year,
+            totalHours: wrappedData.stats.totalHours,
+            totalMinutes: wrappedData.stats.totalMinutes,
+            uniqueTitles: wrappedData.stats.uniqueTitles,
+            totalSessions: wrappedData.stats.totalSessions,
+            longestStreak: wrappedData.stats.longestStreak || 0,
+            peakHour: wrappedData.peakHour ?? null,
+            peakMonthName: wrappedData.peakMonth.name,
+            peakMonthIndex: wrappedData.peakMonth.month,
+            personaTitle: wrappedData.persona.title,
+            personaEmoji: wrappedData.persona.emoji,
+            personaColor: wrappedData.persona.color,
+            topTitles: wrappedData.topContent.slice(0, 5).map(c => c.title),
+            topGenreName: topWrappedGenre?.name || null,
+            watchTimeLabel: formattedShareWatchTime,
+            topPosterUrl: top1?.poster_path ? `${TMDB_IMAGE_BASE}${top1.poster_path}` : null,
+            topBackdropUrl: (tmdb?.backdrop_path || top1?.backdrop_path) ? `https://image.tmdb.org/t/p/w1280${tmdb?.backdrop_path || top1?.backdrop_path}` : null,
+            posterUrls: top3.map(c => (c.poster_path ? `${TMDB_IMAGE_BASE}${c.poster_path}` : null)),
+            seed: (top1?.tmdbId || 0) + year,
+        };
+    }, [wrappedData, tmdbData, topWrappedGenre?.name, formattedShareWatchTime, year]);
+
+    const generateShareBlob = useCallback(async (): Promise<Blob | null> => {
+        if (shareFormat === 'story') return generateWrappedShareImage();
+        const data = buildShareCardData();
+        if (!data) return null;
+        return shareFormat === 'poster' ? generatePosterShareImage(data) : generateTicketShareImage(data);
+    }, [shareFormat, generateWrappedShareImage, buildShareCardData]);
+
+    // Cache des blobs par format : partagé entre la préviz, le téléchargement et le partage
+    // (une seule génération canvas par format et par session de slide).
+    const shareBlobCacheRef = useRef<Partial<Record<'story' | 'poster' | 'ticket', Blob>>>({});
+    const [sharePreviewUrl, setSharePreviewUrl] = useState<string | null>(null);
+    const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
+
+    const getOrGenerateShareBlob = useCallback(async (): Promise<Blob | null> => {
+        const cached = shareBlobCacheRef.current[shareFormat];
+        if (cached) return cached;
+        const blob = await generateShareBlob();
+        if (blob) shareBlobCacheRef.current[shareFormat] = blob;
+        return blob;
+    }, [shareFormat, generateShareBlob]);
+
+    // Préviz : générée à l'arrivée sur la slide finale et à chaque changement de format.
+    const isClosingSlideActive = wrappedData?.slides[currentSlide]?.type === 'closing';
+    useEffect(() => {
+        if (!isClosingSlideActive || !wrappedData) return;
+        let cancelled = false;
+        (async () => {
+            setIsGeneratingPreview(true);
+            try {
+                const blob = await getOrGenerateShareBlob();
+                if (cancelled || !blob) return;
+                const url = URL.createObjectURL(blob);
+                setSharePreviewUrl(prev => {
+                    if (prev) URL.revokeObjectURL(prev);
+                    return url;
+                });
+            } catch (error) {
+                console.error('[Wrapped] Unable to build share preview:', error);
+            } finally {
+                if (!cancelled) setIsGeneratingPreview(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [isClosingSlideActive, wrappedData, getOrGenerateShareBlob]);
+
     const handleDownloadShareImage = useCallback(async () => {
         if (!wrappedData) return;
 
         setIsPreparingShareImage(true);
         try {
-            const blob = await generateWrappedShareImage();
+            const blob = await getOrGenerateShareBlob();
             if (!blob) {
                 toast.error(t('wrapped.shareError'));
                 return;
             }
 
-            downloadBlob(blob, `movix-wrapped-${year}.png`);
+            downloadBlob(blob, `movix-wrapped-${year}-${shareFormat}.png`);
             toast.success(t('wrapped.imageDownloaded'));
         } catch (error) {
             console.error('[Wrapped] Unable to download share image:', error);
@@ -2825,20 +3180,20 @@ const WrappedPage: React.FC = () => {
         } finally {
             setIsPreparingShareImage(false);
         }
-    }, [generateWrappedShareImage, t, wrappedData, year]);
+    }, [getOrGenerateShareBlob, shareFormat, t, wrappedData, year]);
 
     const handleShareImage = useCallback(async () => {
         if (!wrappedData) return;
 
         setIsPreparingShareImage(true);
         try {
-            const blob = await generateWrappedShareImage();
+            const blob = await getOrGenerateShareBlob();
             if (!blob) {
                 toast.error(t('wrapped.shareError'));
                 return;
             }
 
-            const file = new File([blob], `movix-wrapped-${year}.png`, { type: 'image/png' });
+            const file = new File([blob], `movix-wrapped-${year}-${shareFormat}.png`, { type: 'image/png' });
             if (navigator.share && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })) {
                 await navigator.share({
                     title: t('wrapped.shareTitle', { year }),
@@ -2848,7 +3203,7 @@ const WrappedPage: React.FC = () => {
                 return;
             }
 
-            downloadBlob(blob, `movix-wrapped-${year}.png`);
+            downloadBlob(blob, `movix-wrapped-${year}-${shareFormat}.png`);
             toast.success(t('wrapped.imageShareFallback'));
         } catch (error) {
             if (!isShareAbortError(error)) {
@@ -2858,7 +3213,7 @@ const WrappedPage: React.FC = () => {
         } finally {
             setIsPreparingShareImage(false);
         }
-    }, [generateWrappedShareImage, t, wrappedData, wrappedShareText, year]);
+    }, [getOrGenerateShareBlob, shareFormat, t, wrappedData, wrappedShareText, year]);
 
     const handleCopyShareText = useCallback(async () => {
         try {
@@ -2904,7 +3259,7 @@ const WrappedPage: React.FC = () => {
             case 'persona': return <SlidePersona slide={slide} persona={wrappedData.persona} />;
             case 'peak-month': return <SlidePeakMonth slide={slide} peakMonth={wrappedData.peakMonth} />;
             case 'top-genres': return <SlideTopGenres slide={slide} topGenres={wrappedData.topGenres} />;
-            case 'listening-clock': return <SlideListeningClock slide={slide} listeningClock={wrappedData.listeningClock} peakHour={wrappedData.peakHour} />;
+            case 'listening-clock': return <SlideListeningClock slide={slide} listeningClock={wrappedData.listeningClock} peakHour={wrappedData.peakHour} weekday={wrappedData.weekday} />;
             case 'streak': return <SlideStreak slide={slide} stats={wrappedData.stats} />;
             case 'fun-fact': return <SlideFunFact slide={slide} />;
             case 'session-summary': return <SlideSessionSummary slide={slide} stats={wrappedData.stats} />;
@@ -2913,14 +3268,26 @@ const WrappedPage: React.FC = () => {
                 <SlideClosing
                     slide={slide}
                     stats={wrappedData.stats}
+                    topContent={wrappedData.topContent}
+                    topGenres={wrappedData.topGenres}
                     onShareImage={handleShareImage}
                     onDownloadImage={handleDownloadShareImage}
                     onShareText={handleShareText}
                     onCopyText={handleCopyShareText}
                     isPreparingImage={isPreparingShareImage}
+                    shareFormat={shareFormat}
+                    onFormatChange={setShareFormat}
+                    previewUrl={sharePreviewUrl}
+                    isGeneratingPreview={isGeneratingPreview}
                 />
             );
             case 'detailed-stats': return <SlideDetailedStats slide={slide} data={wrappedData} tmdbData={tmdbData} />;
+            case 'timeline': return <SlideTimeline slide={slide} monthlyGraph={wrappedData.monthlyGraph} peakMonth={wrappedData.peakMonth} />;
+            case 'record-day': return <SlideRecordDay slide={slide} />;
+            case 'rewatch': return <SlideRewatch slide={slide} />;
+            case 'watch-age': return <SlideWatchAge slide={slide} />;
+            case 'pages-time': return <SlidePagesTime slide={slide} topPages={wrappedData.topPages} />;
+            case 'quiz': return <SlideQuiz slide={slide} topContent={wrappedData.topContent} onContinue={nextSlide} />;
             default: return null;
         }
     };
@@ -2994,20 +3361,19 @@ const WrappedPage: React.FC = () => {
         return (
             <SquareBackground mode={bgMode} borderColor="rgba(168, 85, 247, 0.15)" className="fixed inset-0 z-50 bg-black flex items-center justify-center">
                 <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(168,85,247,0.2),transparent_50%)]" />
-                <div className="flex flex-col items-center justify-center w-full h-full">
-                    <motion.div
-                        initial={{ opacity: 0, scale: 0.8 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className="text-center relative z-10"
-                    >
-                        <motion.div
-                            animate={{ rotate: 360 }}
-                            transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
-                            className="w-20 h-20 mx-auto mb-6 rounded-full border-4 border-purple-500/30 border-t-purple-400"
-                        />
-                        <h2 className="text-2xl font-bold text-white mb-2">{t('wrapped.preparingWrapped')}</h2>
-                        <p className="text-purple-400">{t('wrapped.analyzingYear')}</p>
-                    </motion.div>
+                <div className="relative z-10 mx-auto flex w-full max-w-md flex-col items-center px-6 sm:px-0">
+                    {/* Skeleton d'une slide : icône + titre + carte (largeurs relatives pour mobile) */}
+                    <div className="mb-6 h-20 w-20 animate-pulse rounded-3xl bg-white/10 sm:mb-8 sm:h-28 sm:w-28 md:h-36 md:w-36" />
+                    <div className="mb-3 h-7 w-3/5 max-w-[16rem] animate-pulse rounded-xl bg-white/10 sm:h-9" />
+                    <div className="mb-6 h-4 w-2/5 max-w-[11rem] animate-pulse rounded-lg bg-white/5 sm:mb-8 sm:h-5" />
+                    <div className="w-full space-y-3 rounded-[1.5rem] border border-white/10 bg-white/5 p-5 sm:p-6">
+                        <div className="h-4 w-full animate-pulse rounded bg-white/10" />
+                        <div className="h-4 w-5/6 animate-pulse rounded bg-white/10" />
+                        <div className="h-4 w-2/3 animate-pulse rounded bg-white/10" />
+                    </div>
+                    <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.3 }} className="mt-8 text-sm font-medium text-purple-300">
+                        {t('wrapped.analyzingYear')}
+                    </motion.p>
                 </div>
             </SquareBackground>
         );

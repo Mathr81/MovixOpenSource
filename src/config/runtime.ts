@@ -8,8 +8,6 @@ export const WATCHPARTY_API = normalizeBaseUrl(import.meta.env.VITE_WATCHPARTY_A
 
 export const PROXY_BASE_URL = normalizeBaseUrl(import.meta.env.VITE_PROXY_BASE_URL as string);
 export const MAIN_API = normalizeBaseUrl(import.meta.env.VITE_MAIN_API as string);
-export const API_PROXY_BASE_URL = normalizeBaseUrl(import.meta.env.VITE_API_PROXY_BASE_URL as string) ||
-  normalizeBaseUrl(import.meta.env.VITE_MAIN_API as string);
 export const PROXIES_EMBED_API = normalizeBaseUrl(import.meta.env.VITE_PROXIES_EMBED_API as string);
 export const BESTDEBRID_API_BASE = 'https://bestdebrid.com/api/v1';
 
@@ -21,9 +19,4 @@ export const buildSiteUrl = (path: string): string => {
 export const buildProxyUrl = (url: string): string => {
   if (!PROXY_BASE_URL) return url;
   return `${PROXY_BASE_URL}/proxy/${url}`;
-};
-
-export const buildApiProxyUrl = (url: string): string => {
-  if (!API_PROXY_BASE_URL) return url;
-  return `${API_PROXY_BASE_URL}/proxy/${url}`;
 };
