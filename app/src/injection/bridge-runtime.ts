@@ -1,3 +1,5 @@
+import { MEDIA_ENTRY_PATH_SOURCE } from './mediaProxyRouting';
+
 /**
  * Runtime bridge injecté dans le WebView AVANT le chargement de la page.
  *
@@ -18,6 +20,9 @@ export function buildBridgeRuntime(): string {
   // --- Pending requests ---
   var _pendingRequests = {};
   var _requestCounter = 0;
+  var _nativeWindowFetch =
+    typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+  var _mediaEntryPath = new RegExp(${JSON.stringify(MEDIA_ENTRY_PATH_SOURCE)}, 'i');
 
   function generateId() {
     return 'req_' + (++_requestCounter) + '_' + Date.now();
@@ -88,8 +93,78 @@ export function buildBridgeRuntime(): string {
     return bytes.buffer;
   }
 
+  function isLocalMediaProxyCandidate(details) {
+    var method = String(details.method || 'GET').toUpperCase();
+    var url = String(details.url || '').trim();
+    if (method !== 'GET' && method !== 'HEAD') return false;
+    if (!/^https:\\/\\//i.test(url)) return false;
+    if (/^https:\\/\\/(?:127\\.0\\.0\\.1|localhost)(?::|\\/)/i.test(url)) {
+      return false;
+    }
+    if (!_mediaEntryPath.test(url)) return false;
+
+    var headers = details.headers || {};
+    return Object.keys(headers).some(function(key) {
+      return /^(?:origin|referer|range)$/i.test(key);
+    });
+  }
+
+  function responseHeadersToString(headers) {
+    var headersStr = '';
+    if (headers && typeof headers.forEach === 'function') {
+      headers.forEach(function(value, key) {
+        headersStr += key + ': ' + value + '\\r\\n';
+      });
+    }
+    return headersStr;
+  }
+
+  async function tryLocalMediaProxy(details) {
+    if (!_nativeWindowFetch) {
+      throw new Error('Native WebView fetch unavailable');
+    }
+
+    var openResponse = await bridgeRequest({
+      type: 'GM_OPEN_MEDIA_PROXY',
+      url: details.url,
+      method: (details.method || 'GET').toUpperCase(),
+      headers: details.headers || {}
+    });
+    if (!openResponse.success || typeof openResponse.value !== 'string') {
+      throw new Error(openResponse.error || 'Local media proxy unavailable');
+    }
+
+    var localHeaders = {};
+    var originalHeaders = details.headers || {};
+    for (var key in originalHeaders) {
+      if (/^(?:accept|range)$/i.test(key)) {
+        localHeaders[key] = originalHeaders[key];
+      }
+    }
+
+    var response = await _nativeWindowFetch(openResponse.value, {
+      method: (details.method || 'GET').toUpperCase(),
+      headers: localHeaders
+    });
+    var responseBody;
+    if (details.responseType === 'arraybuffer') {
+      responseBody = await response.arrayBuffer();
+    } else {
+      responseBody = await response.text();
+    }
+
+    return {
+      status: response.status || 0,
+      statusText: response.statusText || '',
+      responseHeaders: responseHeadersToString(response.headers),
+      response: responseBody,
+      responseText: typeof responseBody === 'string' ? responseBody : '',
+      finalUrl: details.url
+    };
+  }
+
   // --- GM_xmlhttpRequest ---
-  function GM_xmlhttpRequest(details) {
+  function sendBridgeRequest(details) {
     var headers = details.headers || {};
 
     var bodyStr = null;
@@ -154,6 +229,34 @@ export function buildBridgeRuntime(): string {
     });
 
     return { abort: function() {} };
+  }
+
+  function GM_xmlhttpRequest(details) {
+    if (!isLocalMediaProxyCandidate(details)) {
+      return sendBridgeRequest(details);
+    }
+
+    var cancelled = false;
+    Promise.resolve()
+      .then(function() {
+        return tryLocalMediaProxy(details);
+      })
+      .then(function(response) {
+        if (!cancelled && details.onload) {
+          details.onload(response);
+        }
+      })
+      .catch(function() {
+        if (!cancelled) {
+          sendBridgeRequest(details);
+        }
+      });
+
+    return {
+      abort: function() {
+        cancelled = true;
+      }
+    };
   }
 
   // --- GM_getValue / GM_setValue / GM_deleteValue ---

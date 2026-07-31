@@ -42,7 +42,7 @@ function configure(deps) {
 /** Wrap une URL m3u8 dans le proxy cinep si VIP et PROXY_SERVER_URL configuré */
 function wrapSourceUrl(url, isVip) {
   if (isVip && PROXY_SERVER_URL && url) {
-    // PROXY_SERVER_URL = "https://proxy.movix.tax/proxy" → on veut la base sans /proxy
+    // PROXY_SERVER_URL = "https://proxy.movix.cloud/proxy" → on veut la base sans /proxy
     const serverBase = PROXY_SERVER_URL.replace(/\/proxy\/?$/, '').replace(/\/+$/, '');
     return `${serverBase}/cinep-proxy?url=${encodeURIComponent(url)}`;
   }

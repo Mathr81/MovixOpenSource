@@ -12,6 +12,7 @@ import {
   ShieldCheck,
   Sparkles,
   Sprout,
+  Users,
   Wrench
 } from 'lucide-react';
 
@@ -22,6 +23,7 @@ import AdminWishboard from './Greenlight/AdminWishboard';
 import AdminOAuthApps from './AdminOAuthApps';
 import AdminReports from './AdminReports';
 import AdminSharedLists from './AdminSharedLists';
+import AdminTeam from './AdminTeam';
 import StreamingLinksManager from './StreamingLinksManager';
 import VipInvoicesManager from './VipInvoicesManager';
 import VipKeysManager from './VipKeysManager';
@@ -38,7 +40,8 @@ type AdminSection =
   | 'comments'
   | 'shared-lists'
   | 'reports'
-  | 'help-feedback';
+  | 'help-feedback'
+  | 'team';
 
 interface AdminDashboardProps {
   role: 'admin' | 'uploader';
@@ -59,6 +62,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ role }) => {
 
   const allSections = useMemo<DashboardSection[]>(
     () => [
+      {
+        id: 'team',
+        title: t('admin.team.cardTitle', 'Admins & Uploaders'),
+        description: t('admin.team.cardDesc', 'Gérer l\'équipe, ajouter des uploaders et voir leur historique'),
+        icon: Users,
+        accent: 'text-sky-300',
+        highlight: '56 189 248'
+      },
       {
         id: 'links',
         title: t('admin.manageMoviesSeries'),
@@ -237,6 +248,16 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ role }) => {
           backgroundColor="10 10 10"
           className="p-6 md:p-7"
         >
+          {activeSection === 'team' && role === 'admin' && (
+            <div>
+              <h2 className="mb-6 flex items-center gap-3 text-2xl font-bold text-white">
+                <Users className="h-6 w-6 text-sky-300" />
+                {t('admin.team.cardTitle', 'Admins & Uploaders')}
+              </h2>
+              <AdminTeam />
+            </div>
+          )}
+
           {activeSection === 'links' && (
             <div>
               <h2 className="mb-6 flex items-center gap-3 text-2xl font-bold text-white">

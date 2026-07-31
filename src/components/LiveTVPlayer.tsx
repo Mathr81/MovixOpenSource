@@ -32,6 +32,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, X, Loader2, Volume1, Cast, Airplay, Settings, ArrowLeft, ExternalLink } from 'lucide-react';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
 import { isLiveTvSourceEnabled, type LiveTvSourceKey } from '../utils/extractionPrefs';
+import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { getVipHeaders } from '../utils/vipUtils';
@@ -1105,14 +1106,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             player.on(MediaPlayer.events.ERROR, (e: any) => {
                 console.error('DASH Error:', e);
 
-                // If network error/download error and not using proxy yet, try proxy
-                // DashJS error objects vary, we check for common download issues
-                if (!useProxy) {
-                    console.log('DASH Error encountered, switching to proxy...');
-                    setUseProxy(true);
-                    return;
-                }
-
                 // Try next server if available
                 if (currentStreamIndex < streams.length - 1) {
                     setCurrentStreamIndex(prev => prev + 1);
@@ -1129,7 +1122,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             // Initialize HLS Player
             const hlsConfig: any = {
                 enableWorker: true,
-                lowLatencyMode: false,
+                lowLatencyMode: isLowLatencyEnabled('livetv'), // opt-in via Settings › Performance
                 startPosition: -1, // Start at live edge instead of beginning
                 backBufferLength: 30,
                 maxBufferLength: 30,
@@ -1396,21 +1389,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                     setError(t('liveTV.codecNotSupportedFull'));
                     setIsLoading(false);
                     return;
-                }
-
-                // Détecter les erreurs réseau critiques (CORS, 403, 406) même non fatales pour hls.js
-                if (!useProxy && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    const netStatus = data.response?.code;
-                    // 0 = souvent erreur CORS ou network down
-                    // 403 = Forbidden (geo-block etc)
-                    // 406 = Not Acceptable (headers incorrects)
-                    if (netStatus === 0 || netStatus === 403 || netStatus === 406 || data.fatal) {
-                        console.log(`Switching to proxy due to network error (Status: ${netStatus})`);
-                        hls.destroy();
-                        hlsRef.current = null;
-                        setUseProxy(true);
-                        return;
-                    }
                 }
 
                 // Non-fatal fragment loading errors: just let HLS.js retry, no action needed

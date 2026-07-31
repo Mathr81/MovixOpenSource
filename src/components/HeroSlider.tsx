@@ -303,7 +303,7 @@ const HeroSliderInner: React.FC<HeroSliderProps> = ({ items }) => {
                     draggable={false}
                     loading={isActive ? 'eager' : 'lazy'}
                     decoding="async"
-                    fetchPriority={isActive ? 'high' : 'low'}
+                    {...{ fetchpriority: isActive ? 'high' : 'low' }}
                   />
 
                   {/* Smooth combined gradient — no harsh transitions */}

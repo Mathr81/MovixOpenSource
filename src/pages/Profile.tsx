@@ -1641,21 +1641,16 @@ const Profile: React.FC = () => {
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('auth');
-    localStorage.removeItem('discord_auth');
-    localStorage.removeItem('discord_user');
-    localStorage.removeItem('discord_token');
-    localStorage.removeItem('google_auth');
-    localStorage.removeItem('google_user');
-    localStorage.removeItem('google_token');
-    localStorage.removeItem('bip39_auth');
-    localStorage.removeItem('auth_method');
-    localStorage.removeItem('resolved_user_type');
-    localStorage.removeItem('resolved_user_id');
-    localStorage.removeItem('user_id');
-    localStorage.removeItem('session_id');
-    localStorage.removeItem('auth_token');
-    localStorage.removeItem('selected_profile_id');
+    // Use the centralized helpers so the auth-key list stays in sync with
+    // every other logout path (ProfileMenu, 401 interceptor, OAuth flows).
+    // The previous hand-rolled list drifted: it missed `requires_username_change`
+    // (in AUTH_KEYS) and removed `selected_profile_id` (intentionally NOT in
+    // AUTH_KEYS per the accountAuth.ts comment — preserved across logout so
+    // the user lands on the same profile after re-auth on mirror domains).
+    try {
+      clearStoredAuthSession();
+      broadcastAuthChange();
+    } catch { /* noop */ }
     window.location.href = '/';
   };
 
@@ -2664,6 +2659,7 @@ const Profile: React.FC = () => {
                     className="bg-gray-800/70 text-white px-4 py-2 rounded-xl w-full md:w-auto focus:ring-2 focus:ring-red-500 outline-none transition-colors border border-gray-700"
                     autoFocus
                     placeholder={t('profilePage.header.usernamePlaceholder')}
+                    maxLength={32}
                   />
                   <div className="flex gap-2 mt-3 sm:mt-0 w-full sm:w-auto">
                     <button

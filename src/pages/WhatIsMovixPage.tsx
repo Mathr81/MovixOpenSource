@@ -11,6 +11,7 @@ import { Button } from '../components/ui/button';
 // Sources supportées
 const supportedSources = [
   { name: 'Wiflix', color: '#f97316' },
+  { name: '1jour1film', color: '#eab308' },
   { name: 'Coflix', color: '#3b82f6' },
   { name: 'Cpasmal', color: '#8b5cf6' },
   { name: 'Anime-Sama', color: '#ec4899' },

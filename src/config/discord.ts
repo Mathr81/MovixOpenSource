@@ -5,7 +5,7 @@ const getRedirectUri = () => {
 };
 
 export const DISCORD_CONFIG = {
-  CLIENT_ID: '1259926474174238741',
+  CLIENT_ID: '1517232036425895996',
   GUILD_ID: '1183496423535288401',
   // Liste des IDs de rôle pour l'accès admin
   ADMIN_ROLE_IDS: [

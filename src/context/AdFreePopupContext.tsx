@@ -1,5 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react';
 import { isUserVip } from '../utils/vipUtils';
+import { getAdPopupMode, subscribeToAdPopupModeChanges } from '../utils/adPopupMode';
+import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from '../utils/adScriptMode';
 
 
 interface AdFreePopupContextType {
@@ -50,6 +52,16 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
     };
   }, []);
 
+  // Précharge le script popunder quand le popup est en mode normal/bouton.
+  // Auto et click-anywhere continuent d'utiliser le lien direct.
+  useEffect(() => {
+    const sync = () => {
+      if (getAdPopupMode() === 'normal' && SCRIPT_AD_MODE_ENABLED) loadAdScript();
+    };
+    sync();
+    return subscribeToAdPopupModeChanges(sync);
+  }, []);
+
   const showPopupForPlayer = useCallback((playerType: string, additionalInfo?: any) => {
     // First check VIP status via server-verified utility
     const isVipUser = isUserVip() || is_vip;
@@ -89,6 +101,8 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
       console.log(`[AdFreePopupContext] FStream player detected`);
     } else if (playerType === 'wiflix') {
       console.log(`[AdFreePopupContext] Wiflix/Lynx player detected`);
+    } else if (playerType === 'j1f') {
+      console.log(`[AdFreePopupContext] 1jour1film player detected`);
     } else if (playerType === 'frembed') {
       console.log(`[AdFreePopupContext] Frembed player detected`);
     } else if (playerType === 'coflix') {
@@ -104,7 +118,11 @@ export const AdFreePopupProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Always show popup for any player type
     setPlayerToShow(playerType);
     setShowAdFreePopup(true);
-    setShouldLoadIframe(false);
+    // Click-anywhere preloads the player (iframe/HLS) behind the transparent
+    // catcher so the user sees the video instead of a black screen. The catcher
+    // (z-100000) intercepts the first click to open the ad, then unmounts. Other
+    // modes keep the player gated until the user accepts via the popup.
+    setShouldLoadIframe(getAdPopupMode() === 'click-anywhere');
     console.log(`[AdFreePopupContext] Popup shown for ${playerType}`);
   }, [is_vip]);
 

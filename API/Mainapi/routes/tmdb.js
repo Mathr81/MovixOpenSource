@@ -485,7 +485,9 @@ router.get('/tmdb/:type/:id', async (req, res) => {
         }
 
       } catch (updateError) {
-        if (updateError && updateError.isAxiosError) {
+        if (updateError && updateError.coflixSiteRateLimited) {
+          // Coflix global 429 — announced once by the cooldown; stay silent here.
+        } else if (updateError && updateError.isAxiosError) {
           const url = updateError.config && updateError.config.url ? updateError.config.url : '';
           console.error(
             `Erreur lors de la mise a jour du cache TMDB ${id} (${type}): [AxiosError] ${updateError.code || ''} ${updateError.message} ${url}`

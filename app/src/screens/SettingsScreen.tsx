@@ -21,7 +21,7 @@ import DebugConsole from '../components/DebugConsole';
 const { DnsModule } = NativeModules;
 
 const M3U8_KEYS = ['voe','fsvid','vidzy','vidmoly','sibnet','uqload','doodstream','seekstreaming'] as const;
-const LIVETV_KEYS = ['linkzy','wiflix','sosplay','livetv','matches'] as const;
+const LIVETV_KEYS = ['northlive','wiflix','sosplay','livetv','matches'] as const;
 
 type ExtractionPrefs = {
   version: 1;

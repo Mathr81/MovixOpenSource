@@ -26,7 +26,7 @@ const {
 const { readUserData, writeUserData, readProfileData, writeProfileData, withProfileSyncLock } = require('./sync');
 const { recordEvent: recordOAuthAppEvent, grantVip: grantVipFromAppBalance } = require('../utils/oauthClientsDb');
 const { verifyAccessKey } = require('../checkVip');
-const { ensureSafeProfileId, getProfileFilePath } = require('../utils/syncPolicy');
+const { ensureSafeProfileId, getProfileFilePath, validateProfileName, SyncPolicyError } = require('../utils/syncPolicy');
 const { v4: uuidv4 } = require('uuid');
 const {
   createVipInvoice,
@@ -994,11 +994,21 @@ router.get('/profiles/:profileId', async (req, res) => {
 router.post('/profiles', async (req, res) => {
   try {
     const tokenRecord = await getOauthTokenAuth(req, ['profile.manage']);
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const rawName = typeof req.body?.name === 'string' ? req.body.name : '';
     const avatar = typeof req.body?.avatar === 'string' ? req.body.avatar.trim() : '';
 
-    if (!name || !avatar) {
+    if (!rawName || !avatar) {
       return sendOauthJsonError(res, 400, 'invalid_request', 'name et avatar sont requis');
+    }
+
+    let safeName;
+    try {
+      safeName = validateProfileName(rawName);
+    } catch (e) {
+      if (e instanceof SyncPolicyError) {
+        return sendOauthJsonError(res, e.status, 'invalid_request', e.message);
+      }
+      throw e;
     }
 
     if (!avatar.startsWith('/avatars/')) {
@@ -1019,7 +1029,7 @@ router.post('/profiles', async (req, res) => {
 
     const newProfile = {
       id: uuidv4(),
-      name,
+      name: safeName,
       avatar,
       ageRestriction,
       createdAt: new Date().toISOString(),
@@ -1049,16 +1059,28 @@ router.put('/profiles/:profileId', async (req, res) => {
   try {
     const tokenRecord = await getOauthTokenAuth(req, ['profile.manage']);
     const profileId = ensureSafeProfileId(req.params.profileId);
-    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const rawName = typeof req.body?.name === 'string' ? req.body.name : '';
     const avatar = typeof req.body?.avatar === 'string' ? req.body.avatar.trim() : '';
     const ageRestriction = req.body?.ageRestriction;
 
-    if (!name && !avatar && ageRestriction === undefined) {
+    if (!rawName && !avatar && ageRestriction === undefined) {
       return sendOauthJsonError(res, 400, 'invalid_request', 'name, avatar ou ageRestriction requis');
     }
 
     if (avatar && !avatar.startsWith('/avatars/')) {
       return sendOauthJsonError(res, 400, 'invalid_request', 'avatar doit commencer par /avatars/');
+    }
+
+    let safeName = null;
+    if (rawName) {
+      try {
+        safeName = validateProfileName(rawName);
+      } catch (e) {
+        if (e instanceof SyncPolicyError) {
+          return sendOauthJsonError(res, e.status, 'invalid_request', e.message);
+        }
+        throw e;
+      }
     }
 
     const userData = await readUserData(tokenRecord.userType, tokenRecord.userId);
@@ -1069,7 +1091,7 @@ router.put('/profiles/:profileId', async (req, res) => {
       return sendOauthJsonError(res, 404, 'not_found', 'Profil introuvable');
     }
 
-    if (name) profiles[profileIndex].name = name;
+    if (safeName) profiles[profileIndex].name = safeName;
     if (avatar) profiles[profileIndex].avatar = avatar;
     if (ageRestriction !== undefined) {
       const validAgeRestrictions = [0, 7, 12, 16, 18];

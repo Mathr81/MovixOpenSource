@@ -12,10 +12,45 @@ const { HttpProxyAgent } = require("http-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const tough = require("tough-cookie");
 const initCycleTLS = require("cycletls");
+const { LruMap } = require("./lruMap");
+const { redis } = require("../config/redis");
 
 // === PROXY AGENT CACHES ===
-const proxyAgentCache = new Map();
-const darkinoProxyAgentCache = new Map();
+// LRU-capped with onEvict that destroys the underlying agent (closes its
+// keep-alive socket pool) so evicted entries do not leak sockets at the OS
+// level. Without this, growing proxy rotation accumulated agents indefinitely
+// — the root cause of multi-GB worker RSS.
+const PROXY_AGENT_CACHE_MAX = 256;
+
+function destroyHttpAgentLike(value) {
+  if (!value || typeof value !== "object") return;
+  // SocksProxyAgent / HttpProxyAgent / HttpsProxyAgent all extend http.Agent
+  // and expose a `destroy()` that closes pooled sockets.
+  if (typeof value.destroy === "function") {
+    try { value.destroy(); } catch (_) { /* ignore */ }
+    return;
+  }
+  // Darkino/Wiflix entries wrap two agents.
+  if (value.httpAgent && typeof value.httpAgent.destroy === "function") {
+    try { value.httpAgent.destroy(); } catch (_) { /* ignore */ }
+  }
+  if (
+    value.httpsAgent &&
+    value.httpsAgent !== value.httpAgent &&
+    typeof value.httpsAgent.destroy === "function"
+  ) {
+    try { value.httpsAgent.destroy(); } catch (_) { /* ignore */ }
+  }
+}
+
+const proxyAgentCache = new LruMap({
+  max: PROXY_AGENT_CACHE_MAX,
+  onEvict: destroyHttpAgentLike,
+});
+const darkinoProxyAgentCache = new LruMap({
+  max: PROXY_AGENT_CACHE_MAX,
+  onEvict: destroyHttpAgentLike,
+});
 const proxyRotationState = new Map();
 
 // Initialize global agent keep-alive with socket limits
@@ -34,15 +69,116 @@ const ENABLE_LECTEURVIDEO_PROXY = true; // Active/d\u00e9sactive le proxy pour L
 const ENABLE_FSTREAM_PROXY = true; // Active/d\u00e9sactive le proxy pour FStream
 const ENABLE_ANIME_PROXY = true; // Active/d\u00e9sactive le proxy pour AnimeSama (via Cloudflare Workers)
 const ENABLE_WIFLIX_PROXY = true; // Active/d\u00e9sactive le proxy pour Wiflix
-const MAX_LECTEURVIDEO_PROXY_ATTEMPTS = 2;
+const MAX_PROXYSCRAPE_PROXY_ATTEMPTS = 2;
 
 // Constante pour l'enhancement Darkino
 const darkiworld_premium = false; // Passe \u00e0 false pour d\u00e9sactiver l'enhancement Darkino
 
-// === DARKINO 403 COOLDOWN ===
-// Cooldown de 5 minutes apr\u00e8s une erreur 403 (Cloudflare challenge)
-const DARKINO_403_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
-let darkino403CooldownUntil = 0; // Timestamp jusqu'auquel on ne fait plus de requ\u00eates
+// === DARKINO COOLDOWNS (cluster-wide via Redis) ===
+// Cooldown de 5 minutes apr\u00e8s une erreur 403 (Cloudflare challenge), 429
+// (Too Many Requests / Cloudflare Workers daily limit) ou 5xx (erreur
+// serveur). Stock\u00e9 en Redis pour que les 6 workers partagent le signal :
+// un seul worker doit hit l'erreur pour que tous arr\u00eatent de marteler.
+const DARKINO_403_COOLDOWN_MS = 5 * 60 * 1000;
+const DARKINO_429_COOLDOWN_MS = 5 * 60 * 1000;
+const DARKINO_5XX_COOLDOWN_MS = 5 * 60 * 1000;
+const DARKINO_NETERR_COOLDOWN_MS = 5 * 60 * 1000;
+
+const DARKINO_COOLDOWN_KEYS = {
+  '403': 'darkino:cooldown:403',
+  '429': 'darkino:cooldown:429',
+  '5xx': 'darkino:cooldown:5xx',
+  'neterr': 'darkino:cooldown:neterr',
+};
+const DARKINO_COOLDOWN_TTL_MS = {
+  '403': DARKINO_403_COOLDOWN_MS,
+  '429': DARKINO_429_COOLDOWN_MS,
+  '5xx': DARKINO_5XX_COOLDOWN_MS,
+  'neterr': DARKINO_NETERR_COOLDOWN_MS,
+};
+
+// === DARKINO NETWORK-FAILURE CIRCUIT BREAKER ===
+// Les cooldowns 403/429/5xx ne couvrent QUE les erreurs avec une reponse HTTP.
+// Un timeout / erreur reseau (ECONNABORTED, ECONNRESET, ...) n'a pas de
+// error.response : aucun cooldown ne s'armait, donc chaque requete continuait
+// a marteler un upstream mort -> requetes en vol qui s'accumulent (RSS qui
+// monte sans redescendre). Ce compteur d'echecs reseau CONSECUTIFs est
+// cluster-wide via Redis ; au seuil il arme le cooldown 'neterr'.
+const DARKINO_NETERR_THRESHOLD = 20;            // echecs reseau consecutifs avant pause
+const DARKINO_NETERR_WINDOW_MS = 2 * 60 * 1000; // fenetre glissante du compteur
+const DARKINO_NETERR_COUNTER_KEY = 'darkino:netfail:count';
+
+/**
+ * Returns remaining cooldown in ms (0 if not active or Redis unavailable).
+ * Fail-open: a Redis outage must not block Darkino traffic.
+ */
+async function getDarkinoCooldownRemainingMs(kind) {
+  const key = DARKINO_COOLDOWN_KEYS[kind];
+  if (!key) return 0;
+  try {
+    const pttl = await redis.pttl(key);
+    return pttl > 0 ? pttl : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/**
+ * Arms a Darkino cooldown. NX so concurrent 5xx responses across workers
+ * don't keep extending the window \u2014 first arm wins, rest are no-ops.
+ * Returns true if this caller actually set the key.
+ */
+async function armDarkinoCooldown(kind) {
+  const key = DARKINO_COOLDOWN_KEYS[kind];
+  const ttlMs = DARKINO_COOLDOWN_TTL_MS[kind];
+  if (!key || !ttlMs) return false;
+  try {
+    const ttlSec = Math.max(1, Math.ceil(ttlMs / 1000));
+    const armed = await redis.set(key, String(Date.now()), 'EX', ttlSec, 'NX');
+    return armed === 'OK';
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Compte un echec reseau Darkino (timeout / erreur de connexion sans reponse
+ * HTTP). Cluster-wide via Redis INCR + fenetre glissante atomique. Au seuil,
+ * arme le cooldown 'neterr' et remet le compteur a zero. Fail-open : une
+ * panne Redis ne compte rien et ne bloque jamais le trafic.
+ * @returns {Promise<number>} compteur courant (0 si Redis indisponible)
+ */
+async function recordDarkinoNetFailure() {
+  try {
+    const execResult = await redis.multi()
+      .incr(DARKINO_NETERR_COUNTER_KEY)
+      .pexpire(DARKINO_NETERR_COUNTER_KEY, DARKINO_NETERR_WINDOW_MS)
+      .exec();
+    const count = Number(execResult?.[0]?.[1]) || 0;
+    if (count >= DARKINO_NETERR_THRESHOLD) {
+      const armed = await armDarkinoCooldown('neterr');
+      await redis.del(DARKINO_NETERR_COUNTER_KEY);
+      if (armed) {
+        console.log(`[DARKINO] ${count} echecs reseau consecutifs - cooldown ${Math.round(DARKINO_NETERR_COOLDOWN_MS / 60000)} min active`);
+      }
+    }
+    return count;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/**
+ * Reinitialise le compteur d'echecs reseau Darkino apres une requete reussie
+ * (le seuil compte des echecs *consecutifs*). Fail-open.
+ */
+async function resetDarkinoNetFailures() {
+  try {
+    await redis.del(DARKINO_NETERR_COUNTER_KEY);
+  } catch (_) {
+    /* ignore */
+  }
+}
 
 // === CPASMAL CONFIGURATION ===
 const CPASMAL_BASE_URL = "https://www.cpasmal.rip";
@@ -50,7 +186,10 @@ const CPASMAL_BASE_URL = "https://www.cpasmal.rip";
 const cpasmalJar = new tough.CookieJar(null, { rejectPublicSuffixes: false });
 
 // Cache pour les agents SOCKS5 Cpasmal (Keep-Alive)
-const cpasmalAgentCache = new Map();
+const cpasmalAgentCache = new LruMap({
+  max: PROXY_AGENT_CACHE_MAX,
+  onEvict: destroyHttpAgentLike,
+});
 
 function getCpasmalAgent(proxy) {
   if (!proxy) return null;
@@ -435,6 +574,26 @@ async function makeRequestWithCorsFallback(targetUrl, options = {}) {
 }
 
 // Fonction pour faire une requ\u00eate Coflix avec rotation Cloudflare Workers.
+// Classe un 429 recu via les Cloudflare Workers Coflix.
+//  - 'worker' : preuve POSITIVE d'un blocage Cloudflare du worker lui-meme
+//    (page "error code: 1015"/1027, "You are being rate limited", limite
+//    journaliere). Roter vers un autre worker (bucket de limite distinct) aide.
+//  - 'site'   : tout le reste -> 429 forwarde depuis coflix.band (rate-limit
+//    global). Defaut volontaire : sans preuve d'un 1015, on ne rote pas et on
+//    ne martele pas l'upstream.
+function classifyCloudflare429(body) {
+  const text = typeof body === "string" ? body : String(body || "");
+  return /error\s*code:?\s*(1015|1027|1029)|you are being rate limited|daily request limit/i.test(
+    text,
+  )
+    ? "worker"
+    : "site";
+}
+
+// Coflix (recherche + pages film/serie) via proxies ProxyScrape (HTTP prefere,
+// SOCKS5 fallback) au lieu des Cloudflare Workers. Sur 429/403/5xx/erreur reseau
+// on rote vers l'IP suivante (2 max). Si tout est 429, le flag coflixSiteRateLimited
+// coupe le spam de log par titre cote route (coflix.js).
 async function makeCoflixRequest(targetUrl, options = {}) {
   const {
     timeout = 15000,
@@ -481,10 +640,11 @@ async function makeCoflixRequest(targetUrl, options = {}) {
     delete cleanHeaders[header.toLowerCase()];
   });
 
-  const proxyCandidates = getAvailableProxies(CLOUDFLARE_WORKERS_PROXIES);
+  const { proxies, useSocks } = pickProxyscrapeCandidates();
   let lastError = null;
 
-  if (proxyCandidates.length === 0) {
+  // Aucun proxy ProxyScrape dispo -> tentative directe.
+  if (!proxies || proxies.length === 0) {
     return axios({
       url: cleanTargetUrl,
       method: otherOptions.method || "GET",
@@ -497,24 +657,29 @@ async function makeCoflixRequest(targetUrl, options = {}) {
     });
   }
 
-  // Un 403/429 peut d\u00e9pendre du worker utilise : on tente chaque worker avant d'abandonner.
-  for (let i = 0; i < proxyCandidates.length; i++) {
-    const cloudflareProxy = proxyCandidates[i];
-    const proxiedUrl = buildProxiedUrl(cloudflareProxy, cleanTargetUrl);
+  // Rotation sur 2 proxies ProxyScrape max (egress different = bucket 429 distinct).
+  for (let i = 0; i < proxies.length; i++) {
+    const proxy = proxies[i];
+    const auth = proxy.auth ? `${proxy.auth}@` : "";
+    // ponytail: agent non cache (<=2/req, keepAlive off -> pas de fuite socket).
+    const agent = useSocks
+      ? getProxyAgent(proxy)
+      : new HttpsProxyAgent(`http://${auth}${proxy.host}:${proxy.port}`);
 
     try {
       const response = await axios({
-        url: proxiedUrl,
+        url: cleanTargetUrl,
         method: otherOptions.method || "GET",
         headers: cleanHeaders,
         timeout,
         decompress,
         responseType: "text",
         responseEncoding: "utf8",
+        httpAgent: agent,
+        httpsAgent: agent,
         ...otherOptions,
       });
 
-      markProxyAsHealthy(cloudflareProxy);
       return response;
     } catch (error) {
       lastError = error;
@@ -522,27 +687,25 @@ async function makeCoflixRequest(targetUrl, options = {}) {
       const errorCode = error.code || "unknown";
 
       error.coflixUrl = cleanTargetUrl;
-      error.coflixProxy = cloudflareProxy;
-      error.coflixProxiedUrl = proxiedUrl;
+      error.coflixProxy = `${proxy.host}:${proxy.port}`;
 
-      if (statusCode === 403 || statusCode === 429) {
-        markProxyAsErrored(cloudflareProxy, statusCode);
+      // 429 = coflix.band rate-limit. Une autre IP ProxyScrape = bucket distinct
+      // -> on rote. Le flag coupe le spam de log par titre si tout est limite.
+      if (statusCode === 429) {
+        error.coflixSiteRateLimited = true;
         continue;
       }
 
-      if (statusCode >= 500 && statusCode < 600) {
-        markProxyAsErrored(cloudflareProxy, statusCode);
-        continue;
-      }
-
+      // 403 (Cloudflare), 5xx, ou erreur reseau -> proxy suivant.
       if (
+        statusCode === 403 ||
+        (statusCode >= 500 && statusCode < 600) ||
         errorCode === "ECONNABORTED" ||
         errorCode === "ETIMEDOUT" ||
         errorCode === "ECONNRESET" ||
         errorCode === "EHOSTUNREACH" ||
         errorCode === "ENETUNREACH"
       ) {
-        markProxyAsErrored(cloudflareProxy, errorCode);
         continue;
       }
 
@@ -552,9 +715,7 @@ async function makeCoflixRequest(targetUrl, options = {}) {
   }
 
   if (lastError) throw lastError;
-  throw new Error(
-    "Tous les Cloudflare Workers proxies ont \u00e9chou\u00e9 (Coflix)",
-  );
+  throw new Error("Tous les proxies ProxyScrape ont echoue (Coflix)");
 }
 
 // Fonction pour faire une requete LecteurVideo avec CycleTLS.
@@ -603,7 +764,7 @@ const CHROME_JA3 =
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-function pickLecteurVideoProxyCandidates() {
+function pickProxyscrapeCandidates() {
   const httpPool =
     HTTP_PROXIES.length > 0
       ? HTTP_PROXIES
@@ -634,7 +795,7 @@ function pickLecteurVideoProxyCandidates() {
 
   const selectedProxies = [...preferredPool.proxies]
     .sort(() => Math.random() - 0.5)
-    .slice(0, MAX_LECTEURVIDEO_PROXY_ATTEMPTS);
+    .slice(0, MAX_PROXYSCRAPE_PROXY_ATTEMPTS);
 
   return {
     proxies: selectedProxies,
@@ -653,7 +814,7 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
     useSocks,
     label: proxyPoolLabel,
     totalAvailable,
-  } = pickLecteurVideoProxyCandidates();
+  } = pickProxyscrapeCandidates();
 
   if (!proxies || proxies.length === 0) {
     const cycleTLS = await getCycleTLS();
@@ -664,8 +825,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
         ja3: CHROME_JA3,
         userAgent: CHROME_UA,
         headers: {
-          Referer: "https://coflix.date/",
-          Origin: "https://coflix.date",
+          Referer: "https://coflix.trade/",
+          Origin: "https://coflix.trade",
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "fr-FR,fr;q=0.9",
@@ -714,8 +875,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
           userAgent: CHROME_UA,
           proxy: proxyUrl,
           headers: {
-            Referer: "https://coflix.date/",
-            Origin: "https://coflix.date",
+            Referer: "https://coflix.trade/",
+            Origin: "https://coflix.trade",
             Accept:
               "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9",
@@ -763,6 +924,247 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
     `[LECTEURVIDEO] tous les proxies ont echoue pour ${cleanTargetUrl}`,
   );
   throw lastError || new Error("[LECTEURVIDEO] Tous les proxies ont echoue");
+}
+
+// CineStream (Cloudflare-fronted Next.js) via CycleTLS + ProxyScrape rotation,
+// like LecteurVideo/AnimeSama. Plain axios + CF Workers gets hammered with 525
+// (CF edge SSL errors under volume from one IP); a real Chrome JA3 over rotating
+// low-volume proxy IPs survives. Returns an axios-like {data,status,headers}
+// EVEN on 5xx/525 (never throws on HTTP status) so a flaky upstream degrades to
+// "film not found" instead of a thrown error — the caller's regex just finds no
+// tmdbid. Rotates proxies on 5xx/525/cf-block; returns 4xx immediately (a 400 on
+// an exotic-script title is deterministic, not worth burning another proxy).
+async function makeCinestreamRequest(targetUrl, options = {}) {
+  const { headers = {}, timeout = 15 } = options;
+  const cleanTargetUrl = targetUrl.trim();
+
+  const cycleHeaders = {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    Referer: "https://cinestream.info/",
+    ...headers,
+  };
+
+  const isCfBlock = (status, body) =>
+    status === 403 &&
+    typeof body === "string" &&
+    (body.includes("cf-wrapper") || body.includes("cloudflare"));
+  // 5xx (incl. Cloudflare 520-527 origin/SSL errors) + cf-block -> rotate proxy.
+  const shouldRotate = (status, body) =>
+    (status >= 500 && status < 600) || isCfBlock(status, body);
+
+  const cycleTLS = await getCycleTLS();
+  const asAxiosLike = (resp) => ({
+    data: typeof resp.body === "string" ? resp.body : JSON.stringify(resp.body),
+    status: resp.status,
+    headers: resp.headers || {},
+  });
+
+  const { proxies, useSocks } = pickProxyscrapeCandidates();
+
+  // No proxy pool -> single direct CycleTLS attempt.
+  if (!proxies || proxies.length === 0) {
+    const resp = await cycleTLS(
+      cleanTargetUrl,
+      { body: "", ja3: CHROME_JA3, userAgent: CHROME_UA, headers: cycleHeaders, timeout },
+      "get",
+    );
+    return asAxiosLike(resp);
+  }
+
+  let lastResult = null;
+  let lastError = null;
+
+  for (let i = 0; i < proxies.length; i++) {
+    const proxy = proxies[i];
+    const auth = proxy.auth ? `${proxy.auth}@` : "";
+    const proxyUrl = useSocks
+      ? `socks5h://${auth}${proxy.host}:${proxy.port}`
+      : `http://${auth}${proxy.host}:${proxy.port}`;
+
+    try {
+      const resp = await cycleTLS(
+        cleanTargetUrl,
+        { body: "", ja3: CHROME_JA3, userAgent: CHROME_UA, proxy: proxyUrl, headers: cycleHeaders, timeout },
+        "get",
+      );
+      const result = asAxiosLike(resp);
+      if (shouldRotate(result.status, result.data)) {
+        lastResult = result;
+        continue;
+      }
+      return result; // 2xx success, or a definitive 4xx
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  // All proxies 5xx/cf-block or errored: hand back the last response so the
+  // caller parses (and quietly finds nothing) instead of throwing.
+  if (lastResult) return lastResult;
+  throw lastError || new Error("[CINESTREAM] Tous les proxies ont echoue");
+}
+
+// 1jour1film (Dooplay theme, Cloudflare-fronted) via CycleTLS + ProxyScrape
+// rotation — same mechanism as makeCinestreamRequest, but:
+//   - supports POST (the Dooplay `doo_player_ajax` admin-ajax call), and
+//   - takes a caller-supplied Referer/Origin in `headers` (the domain rotates,
+//     so there's no hardcoded referer here).
+// Returns an axios-like {data,status,headers} and never throws on HTTP status;
+// rotates proxies on 5xx / Cloudflare-block, returns 4xx as-is. A degraded
+// response just yields HTML the caller's parser finds nothing in -> "not found".
+// NOTE: the residential proxy pool is what gets the *full* page payload (player
+// option labels, j1fEpsData, search nonce); datacenter IPs get a stripped
+// variant. timeout is in SECONDS (CycleTLS), like the sibling helpers.
+async function make1j1fRequest(targetUrl, options = {}) {
+  const { headers = {}, timeout = 15, method = "get", body = "" } = options;
+  const cleanTargetUrl = targetUrl.trim();
+  const lowerMethod = String(method).toLowerCase();
+
+  const cycleHeaders = {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    ...headers,
+  };
+
+  const isCfBlock = (status, b) =>
+    (status === 403 || status === 503) &&
+    typeof b === "string" &&
+    (b.includes("cf-wrapper") ||
+      b.includes("Just a moment") ||
+      b.includes("cloudflare"));
+  const shouldRotate = (status, b) =>
+    (status >= 500 && status < 600) || isCfBlock(status, b);
+
+  const cycleTLS = await getCycleTLS();
+  const asAxiosLike = (resp) => ({
+    data: typeof resp.body === "string" ? resp.body : JSON.stringify(resp.body),
+    status: resp.status,
+    headers: resp.headers || {},
+  });
+
+  const doRequest = (proxyUrl) =>
+    cycleTLS(
+      cleanTargetUrl,
+      {
+        body,
+        ja3: CHROME_JA3,
+        userAgent: CHROME_UA,
+        headers: cycleHeaders,
+        timeout,
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
+      },
+      lowerMethod,
+    );
+
+  const { proxies, useSocks } = pickProxyscrapeCandidates();
+
+  // No proxy pool -> single direct CycleTLS attempt (works from a residential
+  // host; from a datacenter IP it returns the stripped variant).
+  if (!proxies || proxies.length === 0) {
+    return asAxiosLike(await doRequest(null));
+  }
+
+  let lastResult = null;
+  let lastError = null;
+  for (let i = 0; i < proxies.length; i++) {
+    const proxy = proxies[i];
+    const auth = proxy.auth ? `${proxy.auth}@` : "";
+    const proxyUrl = useSocks
+      ? `socks5h://${auth}${proxy.host}:${proxy.port}`
+      : `http://${auth}${proxy.host}:${proxy.port}`;
+    try {
+      const result = asAxiosLike(await doRequest(proxyUrl));
+      if (shouldRotate(result.status, result.data)) {
+        lastResult = result;
+        continue;
+      }
+      return result; // 2xx success, or a definitive 4xx
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (lastResult) return lastResult;
+  throw lastError || new Error("[1J1F] Tous les proxies ont echoue");
+}
+
+// Cpasmal (DLE, Cloudflare-fronted) via CycleTLS + ProxyScrape rotation.
+// Same mechanism as make1j1fRequest: a real Chrome JA3 over rotating low-volume
+// IPs beats the Cloudflare bot-challenge that plain axios + datacenter proxies
+// hit (every GET/POST 403'd). Supports POST (DLE search form) and GET (detail /
+// getxfield / Season.php pages). Caller supplies Referer/Origin/Content-Type in
+// `headers`. timeout is in SECONDS (CycleTLS). Returns axios-like {data,status,headers}.
+async function makeCpasmalRequest(targetUrl, options = {}) {
+  const { headers = {}, timeout = 15, method = "get", body = "" } = options;
+  const cleanTargetUrl = targetUrl.trim();
+  const lowerMethod = String(method).toLowerCase();
+
+  const cycleHeaders = {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    ...headers,
+  };
+
+  const isCfBlock = (status, b) =>
+    (status === 403 || status === 503) &&
+    typeof b === "string" &&
+    (b.includes("cf-wrapper") ||
+      b.includes("Just a moment") ||
+      b.includes("cloudflare"));
+  const shouldRotate = (status, b) =>
+    (status >= 500 && status < 600) || isCfBlock(status, b);
+
+  const cycleTLS = await getCycleTLS();
+  const asAxiosLike = (resp) => ({
+    data: typeof resp.body === "string" ? resp.body : JSON.stringify(resp.body),
+    status: resp.status,
+    headers: resp.headers || {},
+  });
+
+  const doRequest = (proxyUrl) =>
+    cycleTLS(
+      cleanTargetUrl,
+      {
+        body,
+        ja3: CHROME_JA3,
+        userAgent: CHROME_UA,
+        headers: cycleHeaders,
+        timeout,
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
+      },
+      lowerMethod,
+    );
+
+  const { proxies, useSocks } = pickProxyscrapeCandidates();
+
+  // No proxy pool -> single direct CycleTLS attempt.
+  if (!proxies || proxies.length === 0) {
+    return asAxiosLike(await doRequest(null));
+  }
+
+  let lastResult = null;
+  let lastError = null;
+  for (let i = 0; i < proxies.length; i++) {
+    const proxy = proxies[i];
+    const auth = proxy.auth ? `${proxy.auth}@` : "";
+    const proxyUrl = useSocks
+      ? `socks5h://${auth}${proxy.host}:${proxy.port}`
+      : `http://${auth}${proxy.host}:${proxy.port}`;
+    try {
+      const result = asAxiosLike(await doRequest(proxyUrl));
+      if (shouldRotate(result.status, result.data)) {
+        lastResult = result;
+        continue;
+      }
+      return result; // 2xx success, or a definitive 4xx
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (lastResult) return lastResult;
+  throw lastError || new Error("[CPASMAL] Tous les proxies ont echoue");
 }
 
 // Fonction AnimeSama avec CycleTLS (cloudscraper-style : JA3 Chrome pour bypass Cloudflare).
@@ -866,7 +1268,6 @@ const parseJsonArrayEnv = (envName, fallback = []) => {
   }
 };
 
-const { redis } = require("../config/redis");
 const { acquireRedisLock } = require("./redisLock");
 
 const PROXY_ROTATION_REDIS_PREFIX = "proxyscrape:rotation:v1";
@@ -1673,10 +2074,17 @@ scheduleProxyScrapeRefresh();
 const WIFLIX_FREE_PROXY_URL =
   "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text";
 const WIFLIX_FREE_PROXY_REFRESH_MS = 5 * 60 * 1000; // 5 minutes
-const WIFLIX_FREE_PROXY_MAX_ATTEMPTS = 10; // Try up to 10 proxies per request
+const WIFLIX_FREE_PROXY_MAX_ATTEMPTS = 3; // Try up to 3 proxies per request
 const WIFLIX_FREE_PROXY_TIMEOUT = 5000; // 5s per proxy attempt (fail fast)
+
+// Cookie requis sur l'endpoint search (do=search) sinon réponse "Bot shield active.".
+// Le site vérifie h_check==25 exactement (posé par son JS). Bump ici si le site change la valeur.
+const WIFLIX_H_CHECK = "25";
 const wiflixFreeProxies = []; // HTTP-only proxy URL strings
-const wiflixProxyAgentCache = new Map();
+const wiflixProxyAgentCache = new LruMap({
+  max: PROXY_AGENT_CACHE_MAX,
+  onEvict: destroyHttpAgentLike,
+});
 const wiflixDeadProxies = new Set(); // Proxies who echoue — survit entre les requetes, reset au refresh
 
 async function fetchWiflixFreeProxies() {
@@ -1740,13 +2148,25 @@ async function makeWiflixRequest(targetUrl, options = {}) {
   } = options;
 
   const method = (requestMethod || "GET").toUpperCase();
+
+  // Cookie anti "Bot shield active." : l'endpoint search (do=search) l'exige.
+  // Inoffensif sur les GET de pages. Mergé avec un éventuel Cookie fourni par l'appelant.
+  const callerCookie = headers.cookie || headers.Cookie;
+  const mergedHeaders = { ...headers };
+  delete mergedHeaders.Cookie;
+  mergedHeaders.cookie = callerCookie
+    ? `h_check=${WIFLIX_H_CHECK}; ${callerCookie}`
+    : `h_check=${WIFLIX_H_CHECK}`;
+  // Re-propage à toutes les phases (le fallback CF Workers relit options.headers).
+  options = { ...options, headers: mergedHeaders };
+
   const defaultHeaders = {
     accept:
       "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     "user-agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-    ...headers,
+    ...mergedHeaders,
   };
 
   // --- Phase 1: free proxy list (skip already-dead ones) ---
@@ -1794,6 +2214,107 @@ async function makeWiflixRequest(targetUrl, options = {}) {
 
   // --- Phase 2: fallback to Cloudflare Workers ---
   return makeRequestWithCorsFallback(targetUrl, options);
+}
+
+// Set-Cookie[] -> "name=value; name2=value2" (drop path/expires/etc. attributes)
+function extractCookieHeader(setCookie) {
+  if (!Array.isArray(setCookie) || setCookie.length === 0) return "";
+  return setCookie
+    .map((c) => String(c).split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
+// One GET (harvest the bot-shield session cookie) + one POST (search) over the
+// given axios proxy agents. Returns the response if it's a real result page,
+// else throws so the caller rotates to the next proxy.
+async function wiflixHandshake(homeUrl, searchUrl, baseHeaders, pdata, agents, timeout) {
+  const home = await axios({
+    url: homeUrl,
+    method: "GET",
+    headers: { ...baseHeaders, referer: homeUrl },
+    timeout,
+    decompress: true,
+    ...agents,
+  });
+
+  const harvested = extractCookieHeader(home.headers["set-cookie"]);
+  const cookie = harvested
+    ? `${harvested}; h_check=${WIFLIX_H_CHECK}`
+    : `h_check=${WIFLIX_H_CHECK}`;
+
+  const res = await axios({
+    url: searchUrl,
+    method: "POST",
+    headers: { ...baseHeaders, cookie },
+    data: pdata,
+    timeout,
+    decompress: true,
+    ...agents,
+  });
+
+  const body = typeof res.data === "string" ? res.data : "";
+  if (
+    res.status === 200 &&
+    body.length > 100 &&
+    !body.includes("Bot shield active")
+  ) {
+    return res;
+  }
+  throw new Error(`wiflix search bad response (status ${res.status}, ${body.length}b)`);
+}
+
+/**
+ * Wiflix search — the bot shield rejects do=search unless the request carries a
+ * real session cookie issued by the homepage GET (plus h_check=25). The session
+ * cookie is IP-bound, so the GET (harvest) and the POST (search) MUST run on the
+ * same proxy. Port of vStream wiflix.py showMovies() handshake.
+ */
+async function makeWiflixSearchRequest(homeUrl, searchUrl, options = {}) {
+  const { timeout = 10000, headers = {}, data: pdata } = options;
+
+  const baseHeaders = {
+    accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    ...headers,
+  };
+
+  // --- Phase 1: free public proxies (residential) — handshake on same proxy ---
+  const alive = wiflixFreeProxies.filter((p) => !wiflixDeadProxies.has(p));
+  if (alive.length > 0) {
+    const candidates = alive
+      .sort(() => Math.random() - 0.5)
+      .slice(0, WIFLIX_FREE_PROXY_MAX_ATTEMPTS);
+
+    for (let i = 0; i < candidates.length; i++) {
+      const proxyUrl = candidates[i];
+      try {
+        const res = await wiflixHandshake(
+          homeUrl, searchUrl, baseHeaders, pdata,
+          getWiflixFreeProxyAgent(proxyUrl), WIFLIX_FREE_PROXY_TIMEOUT,
+        );
+        console.log(
+          `[WIFLIX SEARCH] OK via free proxy ${proxyUrl} (${i + 1}/${candidates.length})`,
+        );
+        return res;
+      } catch {
+        wiflixDeadProxies.add(proxyUrl);
+        wiflixProxyAgentCache.delete(proxyUrl);
+      }
+    }
+    console.log(`[WIFLIX SEARCH] ${candidates.length} free proxies echoues, fallback CF Workers`);
+  }
+
+  // --- Phase 2: CF Workers fallback — stateless single POST (h_check only) ---
+  return makeRequestWithCorsFallback(searchUrl, {
+    method: "POST",
+    data: pdata,
+    headers: { ...headers, cookie: `h_check=${WIFLIX_H_CHECK}` },
+    timeout,
+  });
 }
 
 // Initial fetch + 5-min refresh
@@ -1886,14 +2407,14 @@ module.exports = {
   ENABLE_WIFLIX_PROXY,
   darkiworld_premium,
 
-  // Darkino 403 cooldown (expose getter/setter since it's mutable)
+  // Darkino cooldowns (Redis-backed, cluster-wide)
   DARKINO_403_COOLDOWN_MS,
-  get darkino403CooldownUntil() {
-    return darkino403CooldownUntil;
-  },
-  set darkino403CooldownUntil(val) {
-    darkino403CooldownUntil = val;
-  },
+  DARKINO_5XX_COOLDOWN_MS,
+  DARKINO_NETERR_COOLDOWN_MS,
+  getDarkinoCooldownRemainingMs,
+  armDarkinoCooldown,
+  recordDarkinoNetFailure,
+  resetDarkinoNetFailures,
 
   // Cpasmal
   CPASMAL_BASE_URL,
@@ -1913,9 +2434,14 @@ module.exports = {
   // Request helpers
   makeRequestWithCorsFallback,
   makeWiflixRequest,
+  makeWiflixSearchRequest,
   makeCoflixRequest,
+  classifyCloudflare429,
   makeLecteurVideoRequest,
   makeAnimeSamaRequest,
+  makeCinestreamRequest,
+  make1j1fRequest,
+  makeCpasmalRequest,
 
   // SOCKS5 proxies
   PROXIES,

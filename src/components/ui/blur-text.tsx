@@ -45,6 +45,9 @@ const BlurText: React.FC<BlurTextProps> = ({
 }) => {
     const elements = animateBy === 'words' ? text.split(' ') : text.split('');
     const [inView, setInView] = useState(false);
+    // will-change est posé uniquement pendant l'animation (one-shot) puis
+    // relâché — évite de garder un layer GPU par mot pour toute la vie de la page.
+    const [animDone, setAnimDone] = useState(false);
     const ref = useRef<HTMLParagraphElement>(null);
 
     useEffect(() => {
@@ -64,7 +67,7 @@ const BlurText: React.FC<BlurTextProps> = ({
 
     const defaultFrom = useMemo(
         () =>
-            direction === 'top' ? { filter: 'blur(10px)', opacity: 0, y: -50 } : { filter: 'blur(10px)', opacity: 0, y: 50 },
+            direction === 'top' ? { filter: 'blur(8px)', opacity: 0, y: -50 } : { filter: 'blur(8px)', opacity: 0, y: 50 },
         [direction]
     );
 
@@ -105,10 +108,17 @@ const BlurText: React.FC<BlurTextProps> = ({
                         initial={fromSnapshot}
                         animate={inView ? animateKeyframes : fromSnapshot}
                         transition={spanTransition}
-                        onAnimationComplete={index === elements.length - 1 ? onAnimationComplete : undefined}
+                        onAnimationComplete={
+                            index === elements.length - 1
+                                ? () => {
+                                    setAnimDone(true);
+                                    onAnimationComplete?.();
+                                }
+                                : undefined
+                        }
                         style={{
                             display: 'inline-block',
-                            willChange: 'transform, filter, opacity'
+                            willChange: inView && !animDone ? 'transform, filter, opacity' : 'auto'
                         }}
                     >
                         {segment === ' ' ? '\u00A0' : segment}

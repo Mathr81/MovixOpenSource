@@ -30,11 +30,10 @@ const mdComponents = {
     );
   },
   pre: ({ children }: any) => <>{children}</>,
-  a: ({ href, children }: any) => (
-    <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline break-all">
-      {children}
-    </a>
-  ),
+  a: ({ href, children }: any) => {
+    if (!href || !/^https?:\/\//i.test(href)) return <span className="text-blue-400 break-all">{children}</span>;
+    return <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline break-all">{children}</a>;
+  },
   ul: ({ children }: any) => <ul className="list-disc list-inside ml-2 my-1">{children}</ul>,
   ol: ({ children }: any) => <ol className="list-decimal list-inside ml-2 my-1">{children}</ol>,
   blockquote: ({ children }: any) => (

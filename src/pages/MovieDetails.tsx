@@ -3239,7 +3239,7 @@ const MovieDetails = (): JSX.Element => {
                       <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
                       <div className="flex items-center gap-2">
                         <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                        <p className="text-gray-300 text-lg font-bold">{movie.vote_average.toFixed(1)}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                        <p className="text-gray-300 text-lg font-bold">{movie.vote_average != null ? movie.vote_average.toFixed(1) : 'N/A'}<span className="text-sm font-normal text-gray-400">/10</span></p>
                       </div>
                     </div>
 

@@ -1762,7 +1762,7 @@ const AdminComments: React.FC = () => {
                                     <Badge variant="rejected" className="bg-red-500/20 text-red-400 border-red-500/30">
                                         {viewComment.moderation_reason}
                                     </Badge>
-                                    <span className="text-[10px] text-white/40">par Gemini AI</span>
+                                    <span className="text-[10px] text-white/40">{t('admin.generatedByGemini')}</span>
                                 </div>
                                 {viewComment.moderation_details && (
                                     <p className="text-xs text-white/60">

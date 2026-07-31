@@ -161,12 +161,15 @@ function buildWrappedProgress({ totalMinutes, uniqueTitles, totalSessions, total
  */
 function extractWrappedFields(data) {
     if (!data) return null;
+    const releaseDate = data.release_date || data.first_air_date || null;
     return {
         title: data.title || data.name,
         poster_path: data.poster_path,
+        backdrop_path: data.backdrop_path || null,
         genres: (data.genres || []).map(g => typeof g === 'string' ? g : g.name),
         vote_average: data.vote_average || null,
-        runtime: data.runtime || data.episode_run_time?.[0] || null
+        runtime: data.runtime || data.episode_run_time?.[0] || null,
+        release_year: releaseDate ? parseInt(String(releaseDate).slice(0, 4)) || null : null
     };
 }
 
@@ -640,19 +643,29 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
                     return pct;
                 } catch { /* fallback to SQL */ }
             }
-            // Expensive SQL — runs once per 30 min then cached for all users/workers
-            const pctT0 = Date.now();
-            const [allUsersStats] = await pool.execute(`
-                SELECT user_id, ROUND(SUM(watch_duration) / 60) as total
-                FROM wrapped_viewing_data WHERE year = ?
-                GROUP BY user_id ORDER BY total DESC
-            `, [year]);
-            _sqlTimings['percentile'] = Date.now() - pctT0;
-            console.log(`[Wrapped][PERF] 📊 Percentile: SQL in ${_sqlTimings['percentile']}ms (${allUsersStats.length} users)`);
-            redisSet(pctCacheKey, JSON.stringify(allUsersStats), PERCENTILE_CACHE_TTL);
-            const totalUsers = allUsersStats.length;
-            const userRank = allUsersStats.findIndex(u => u.user_id === userId) + 1;
-            return totalUsers > 1 ? Math.round(((totalUsers - userRank) / totalUsers) * 100) : 99;
+            // Cache froid : ne JAMAIS bloquer la réponse. On renvoie null et on
+            // réchauffe le cache en arrière-plan pour les prochains appels.
+            _sqlTimings['percentile'] = 0;
+            setImmediate(async () => {
+                try {
+                    // Single-flight cluster-wide : un seul worker lance le scan
+                    if (redisReady()) {
+                        const lock = await redis.set(`${PERCENTILE_CACHE_PREFIX}${year}:lock`, '1', 'EX', 300, 'NX');
+                        if (!lock) return;
+                    }
+                    const t0 = Date.now();
+                    const [allUsersStats] = await pool.execute(`
+                        SELECT user_id, ROUND(SUM(watch_duration) / 60) as total
+                        FROM wrapped_viewing_data WHERE year = ?
+                        GROUP BY user_id ORDER BY total DESC
+                    `, [year]);
+                    redisSet(pctCacheKey, JSON.stringify(allUsersStats), PERCENTILE_CACHE_TTL);
+                    console.log(`[Wrapped][PERF] 📊 Percentile warmup (background): ${Date.now() - t0}ms (${allUsersStats.length} users)`);
+                } catch (e) {
+                    console.warn('[Wrapped] Percentile warmup failed:', e.message);
+                }
+            });
+            return null;
         }
 
         // ── 1. Fire ALL queries in parallel (user-scoped + percentile) ──────────
@@ -667,6 +680,9 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
             [dailyActivity],
             [firstWatch],
             [lastWatch],
+            [recordDayRows],
+            [weekdayRows],
+            [rewatchRows],
             percentile
         ] = await Promise.all([
             // 1. Viewing Stats
@@ -693,6 +709,7 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
                     content_type,
                     ROUND(SUM(watch_duration) / 60) as duration
                 FROM wrapped_viewing_data ${whereClause}
+                AND content_type != 'live-tv'
                 GROUP BY content_id, content_type
                 ORDER BY duration DESC LIMIT 10
             `, queryParams)),
@@ -730,6 +747,7 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
             timedQuery('firstWatch', () => pool.execute(`
                 SELECT content_title, content_type, content_id, created_at
                 FROM wrapped_viewing_data ${whereClause}
+                AND content_type != 'live-tv'
                 ORDER BY created_at ASC LIMIT 1
             `, queryParams)),
 
@@ -737,8 +755,43 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
             timedQuery('lastWatch', () => pool.execute(`
                 SELECT content_title, content_type, content_id, created_at
                 FROM wrapped_viewing_data ${whereClause}
+                AND content_type != 'live-tv'
                 ORDER BY created_at DESC LIMIT 1
             `, queryParams)),
+
+            // 9a. Jour record (journée avec le plus de visionnage)
+            timedQuery('recordDay', () => pool.execute(`
+                SELECT DATE(created_at) as day, ROUND(SUM(watch_duration) / 60) as minutes
+                FROM wrapped_viewing_data ${whereClause}
+                GROUP BY DATE(created_at) ORDER BY minutes DESC LIMIT 1
+            `, queryParams)),
+
+            // 9b. Répartition par jour de semaine (DAYOFWEEK MySQL : 1=dimanche … 7=samedi)
+            timedQuery('weekdayStats', () => pool.execute(`
+                SELECT DAYOFWEEK(created_at) as dow, ROUND(SUM(watch_duration) / 60) as minutes
+                FROM wrapped_viewing_data ${whereClause}
+                GROUP BY dow
+            `, queryParams)),
+
+            // 9c. Rewatch champion : film revu sur ≥3 jours distincts, ou même épisode revu sur ≥2 jours
+            timedQuery('rewatch', () => pool.execute(`
+                SELECT content_id, content_type, content_title, distinct_days FROM (
+                    SELECT content_id, content_type,
+                        COALESCE(MAX(NULLIF(content_title, '')), MAX(content_title)) as content_title,
+                        COUNT(DISTINCT DATE(created_at)) as distinct_days
+                    FROM wrapped_viewing_data ${whereClause} AND content_type = 'movie'
+                    GROUP BY content_id, content_type
+                    HAVING distinct_days >= 3
+                    UNION ALL
+                    SELECT content_id, content_type,
+                        COALESCE(MAX(NULLIF(content_title, '')), MAX(content_title)) as content_title,
+                        COUNT(DISTINCT DATE(created_at)) as distinct_days
+                    FROM wrapped_viewing_data ${whereClause}
+                    AND content_type IN ('tv', 'anime') AND season_number IS NOT NULL AND episode_number IS NOT NULL
+                    GROUP BY content_id, content_type, season_number, episode_number
+                    HAVING distinct_days >= 2
+                ) rw ORDER BY distinct_days DESC LIMIT 1
+            `, [...queryParams, ...queryParams])),
 
             // 10. Percentile (Redis-cached 30min, SQL fallback)
             fetchPercentile()
@@ -759,15 +812,13 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
         const progress = buildWrappedProgress({ totalMinutes, uniqueTitles, totalSessions, totalActiveDays });
 
         if (!progress.isEligible) {
-            console.log(`[Wrapped][PERF] Not enough data yet â€” total ${Date.now() - _t.start}ms`);
+            console.log(`[Wrapped][PERF] Not enough data yet — total ${Date.now() - _t.start}ms`);
             return res.json({
                 success: true,
                 wrapped: null,
                 progress,
-                message: "Pas encore assez de donnÃ©es pour dÃ©bloquer ce Wrapped."
+                message: "Pas encore assez de données pour débloquer ce Wrapped."
             });
-            console.log(`[Wrapped][PERF] No data — total ${Date.now() - _t.start}ms`);
-            return res.json({ success: true, wrapped: null, message: "Pas encore de données pour cette année." });
         }
 
         // ── 2. TMDB enrichment (parallel, Redis-cached) ────────────────────────
@@ -861,8 +912,8 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
             return arr.map(c => {
                 const k = `${c.content_type}:${c.content_id}`;
                 const d = tmdbCache.get(k);
-                if (!d) return { ...c, content_title: c.content_title || `${c.content_type} #${c.content_id}`, poster_path: c.poster_path || null, genres: [], vote_average: null };
-                return { ...c, content_title: d.title || c.content_title, poster_path: d.poster_path || c.poster_path || null, genres: d.genres || [], vote_average: d.vote_average || null };
+                if (!d) return { ...c, content_title: c.content_title || `${c.content_type} #${c.content_id}`, poster_path: c.poster_path || null, backdrop_path: null, genres: [], vote_average: null, release_year: null };
+                return { ...c, content_title: d.title || c.content_title, poster_path: d.poster_path || c.poster_path || null, backdrop_path: d.backdrop_path || null, genres: d.genres || [], vote_average: d.vote_average || null, release_year: d.release_year || null };
             });
         }
         const enrichedTopContent = applyTMDB(topContent);
@@ -941,9 +992,6 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
         const topShowTitle = topShow ? topShow.content_title : null;
         const topShowType = topShow ? topShow.content_type : null;
 
-        const secondShow = enrichedTopContent[1] || null;
-        const secondShowTitle = secondShow ? secondShow.content_title : null;
-
         // Peak / lowest month
         const peakMonth = monthlyStats[0] || { month: 1, duration: 0 };
         const lowestMonth = monthlyStats[monthlyStats.length - 1] || peakMonth;
@@ -964,6 +1012,47 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
         const moviePercent = movieStats ? Math.round((parseInt(movieStats.duration) / totalMinutes) * 100) : 0;
         const tvPercent    = tvStats    ? Math.round((parseInt(tvStats.duration)    / totalMinutes) * 100) : 0;
 
+        // Jour record / weekday / rewatch
+        const recordDayRow = recordDayRows[0] || null;
+        const recordDay = recordDayRow
+            ? { date: recordDayRow.day, minutes: parseInt(recordDayRow.minutes) }
+            : null;
+
+        const weekdayMap = new Array(7).fill(0); // index 0 = dimanche … 6 = samedi
+        weekdayRows.forEach(r => { weekdayMap[r.dow - 1] = parseInt(r.minutes); });
+        const weekday = weekdayMap.map((minutes, i) => ({ dow: i + 1, minutes }));
+
+        const rewatchRow = rewatchRows[0] || null;
+
+        // Âge ciné : année médiane de sortie, pondérée par le temps de visionnage (top 10)
+        const datedItems = enrichedForGenres.filter(c => c.release_year);
+        let watchAgeYear = null;
+        if (datedItems.length >= 5) {
+            const sortedByYear = [...datedItems].sort((a, b) => a.release_year - b.release_year);
+            const totalWeight = sortedByYear.reduce((s, c) => s + parseInt(c.duration), 0);
+            let acc = 0;
+            for (const c of sortedByYear) {
+                acc += parseInt(c.duration);
+                if (acc >= totalWeight / 2) { watchAgeYear = c.release_year; break; }
+            }
+        }
+
+        let rewatchData = null;
+        if (rewatchRow) {
+            let rwTitle = rewatchRow.content_title;
+            if (!rwTitle) {
+                const cached = tmdbCache.get(`${rewatchRow.content_type}:${rewatchRow.content_id}`);
+                if (cached) rwTitle = cached.title;
+                else {
+                    try {
+                        const d = await fetchTMDBDetails(rewatchRow.content_id, rewatchRow.content_type);
+                        rwTitle = d?.title || null;
+                    } catch { /* slide skippée si pas de titre */ }
+                }
+            }
+            if (rwTitle) rewatchData = { title: rwTitle, type: rewatchRow.content_type, count: parseInt(rewatchRow.distinct_days) };
+        }
+
         _t.computeEnd = Date.now();
         console.log(`[Wrapped][PERF] 🧮 Compute stats: ${_t.computeEnd - _t.computeStart}ms`);
 
@@ -972,23 +1061,24 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
         const persona = determinePersona({
             totalHours, uniqueTitles, dominantPercent, dominantType,
             animePercent, moviePercent, tvPercent, isExplorer, isLoyal, isBinger,
-            topShowType, topShowHours, isNightOwl
+            topShowType, topShowHours, isNightOwl, isEarlyBird,
+            topGenres, avgSessionMinutes, longestStreak, totalSessions, percentile
         });
 
         const slides = generateSlides({
             totalMinutes, totalHours, totalDays, totalDurationLabel, uniqueTitles,
             topShowTitle, topShowHours, topShowMinutes, topShowDurationLabel, topShowType,
-            secondShowTitle, secondShow,
             dominantType, dominantPercent,
             peakMonth, lowestMonth, monthNames,
             animePercent, moviePercent, tvPercent,
             isExplorer, isLoyal, isBinger,
             enrichedTopContent, typeStats, persona,
-            year,
+            year, userId,
             percentile, peakHour, isNightOwl, isEarlyBird,
             longestStreak, totalActiveDays,
             firstWatchData, lastWatchData,
-            topGenres, avgSessionMinutes
+            topGenres, avgSessionMinutes, totalSessions,
+            recordDay, rewatchData, watchAgeYear, topPages, weekday
         });
 
         _t.slidesEnd = Date.now();
@@ -1016,6 +1106,9 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
                     durationLabel: formatDurationShort(mins),
                     tmdbId: c.content_type !== 'live-tv' ? parseInt(c.content_id) : null,
                     poster_path: c.poster_path,
+                    backdrop_path: c.backdrop_path || null,
+                    year: c.release_year || null,
+                    vote_average: c.vote_average || null,
                     genres: c.genres || []
                 };
             }),
@@ -1040,7 +1133,11 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
                 date: lastWatchData.created_at,
                 tmdbId: lastWatchData.content_type !== 'live-tv' ? parseInt(lastWatchData.content_id) : null
             } : null,
-            topPages: topPages.map(p => ({ page: p.page_name, minutes: parseInt(p.duration) }))
+            topPages: topPages.map(p => ({ page: p.page_name, minutes: parseInt(p.duration) })),
+            recordDay,
+            weekday,
+            rewatch: rewatchData,
+            watchAgeYear
         };
 
         // ── 6. Store in Redis cache (fire-and-forget) ───────────────────────────
@@ -1062,6 +1159,51 @@ router.get('/generate/:year', verifyToken, generateRateLimit, async (req, res) =
 // === FONCTIONS DE GÉNÉRATION TEMPLATES ===
 // ============================================
 
+// ─── Sélection déterministe (hash FNV-1a) ───────────────────────────────────
+// Même Wrapped à chaque ouverture pour un même user/année (screenshots stables).
+function fnv1aHash(str) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+}
+
+function seededShuffle(array, seedStr) {
+    const arr = [...array];
+    let seed = fnv1aHash(seedStr);
+    for (let i = arr.length - 1; i > 0; i--) {
+        seed = Math.imul(seed ^ (seed >>> 15), 0x01000193) >>> 0;
+        const j = seed % (i + 1);
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+// ─── Personas par genre dominant (genre #1 ≥ 30% du temps) ──────────────────
+const GENRE_PERSONAS = [
+    { keys: ['horreur', 'horror', 'épouvante'], persona: { id: 'horror', title: 'L\'Accro aux Frissons', emoji: '👻', subtitle: 'Tu dors la lumière allumée, et alors ?', description: 'L\'horreur, c\'est ton terrain de jeu.', color: '#B71C1C' } },
+    { keys: ['thriller', 'crime', 'mystère', 'mystery', 'policier'], persona: { id: 'thriller', title: 'Le Profiler', emoji: '🕵️', subtitle: 'Tu résous l\'enquête avant le générique', description: 'Le suspense, tu carbures à ça.', color: '#37474F' } },
+    { keys: ['romance'], persona: { id: 'romance', title: 'Le Grand Romantique', emoji: '💘', subtitle: 'Tu crois encore au grand amour', description: 'Une belle histoire et tu fonds.', color: '#EC407A' } },
+    { keys: ['comédie', 'comedy'], persona: { id: 'comedy', title: 'Le Roi du Rire', emoji: '😎', subtitle: 'La vie est trop courte pour le drame', description: 'Tu choisis toujours l\'option qui fait marrer.', color: '#FBC02D' } },
+    { keys: ['science-fiction', 'science fiction', 'sci-fi', 'fantastique', 'fantasy'], persona: { id: 'scifi', title: 'Le Voyageur', emoji: '🚀', subtitle: 'Tu vis mieux dans d\'autres mondes', description: 'Plus à l\'aise dans le futur qu\'au présent.', color: '#7E57C2' } },
+    { keys: ['documentaire', 'documentary'], persona: { id: 'documentary', title: 'L\'Éternel Curieux', emoji: '🔬', subtitle: 'Tu apprends un truc par épisode', description: 'Le réel te passionne plus que la fiction.', color: '#00897B' } },
+    { keys: ['action', 'aventure', 'adventure'], persona: { id: 'action', title: 'L\'Accro à l\'Adrénaline', emoji: '💥', subtitle: 'Plus ça explose, plus t\'es content', description: 'Tu carbures aux poursuites et aux gros boums.', color: '#F4511E' } },
+    { keys: ['drame', 'drama'], persona: { id: 'drama', title: 'L\'Âme Sensible', emoji: '🎭', subtitle: 'Tu chiales et t\'assumes', description: 'Les belles histoires, ça te remue.', color: '#5C6BC0' } },
+    { keys: ['animation', 'familial', 'family'], persona: { id: 'animation', title: 'Le Grand Enfant', emoji: '🎨', subtitle: 'L\'animation, c\'est pas que pour les petits', description: 'Ton âme d\'enfant se porte très bien.', color: '#26A69A' } },
+];
+
+function matchGenrePersona(topGenres) {
+    const top = Array.isArray(topGenres) && topGenres[0];
+    if (!top || top.percent < 30 || !top.name) return null;
+    const name = top.name.toLowerCase();
+    for (const g of GENRE_PERSONAS) {
+        if (g.keys.some(k => name.includes(k))) return g.persona;
+    }
+    return null;
+}
+
 /**
  * Détermine la personnalité de visionnage de l'utilisateur
  * Basé sur des règles de classification (comme le ML de Spotify)
@@ -1070,201 +1212,56 @@ function determinePersona(data) {
     const {
         totalHours, uniqueTitles, dominantPercent, dominantType,
         animePercent, moviePercent, tvPercent, isExplorer, isLoyal, isBinger,
-        topShowType, topShowHours, isNightOwl
+        topShowType, topShowHours, isNightOwl, isEarlyBird,
+        topGenres, avgSessionMinutes, longestStreak, totalSessions, percentile
     } = data;
 
-    // Personas par priorité (le premier qui matche gagne)
     const personas = [
-        // --- PERSONAS EXTRÊMES (basés sur l'intensité) ---
-        {
-            condition: totalHours > 1000,
-            persona: {
-                id: 'legend',
-                title: 'La Légende Vivante',
-                emoji: '👑',
-                subtitle: 'Tu as littéralement vécu sur Movix cette année',
-                description: 'Plus de 1000 heures. On devrait te payer à ce stade.',
-                color: '#FFD700'
-            }
-        },
-        {
-            condition: totalHours > 500,
-            persona: {
-                id: 'marathon',
-                title: 'Le Marathonien Ultime',
-                emoji: '🏃‍♂️',
-                subtitle: 'Ton canapé a une empreinte permanente de toi',
-                description: 'Tu as transformé le binge-watching en sport olympique.',
-                color: '#FF6B35'
-            }
-        },
-        // --- NIGHT OWL ---
-        {
-            condition: isNightOwl && totalHours > 100,
-            persona: {
-                id: 'night-owl',
-                title: 'L\'Oiseau de Nuit',
-                emoji: '🦉',
-                subtitle: 'La nuit, tous les écrans sont gris... sauf le tien',
-                description: 'Tu fais tes meilleures sessions entre minuit et 5h.',
-                color: '#1A237E'
-            }
-        },
-        // --- PERSONAS PAR TYPE DOMINANT ---
-        {
-            condition: animePercent > 80,
-            persona: {
-                id: 'weeb-supreme',
-                title: 'Weeb Suprême',
-                emoji: '⛩️',
-                subtitle: 'Tu penses en sous-titres à ce stade',
-                description: 'Plus de 80% d\'anime. Tu es officiellement plus japonais que français.',
-                color: '#E91E63'
-            }
-        },
-        {
-            condition: animePercent > 50,
-            persona: {
-                id: 'otaku',
-                title: 'L\'Otaku Assumé',
-                emoji: '🍜',
-                subtitle: 'Ton cœur bat au rythme des openings',
-                description: 'Les animes ne sont pas une phase, c\'est un mode de vie.',
-                color: '#9C27B0'
-            }
-        },
-        {
-            condition: moviePercent > 70 && uniqueTitles > 50,
-            persona: {
-                id: 'critic',
-                title: 'Le Critique',
-                emoji: '🎬',
-                subtitle: 'Tu as un avis sur tout, et il est probablement juste',
-                description: 'Tu pourrais écrire pour les Cahiers du Cinéma.',
-                color: '#2196F3'
-            }
-        },
-        {
-            condition: moviePercent > 70,
-            persona: {
-                id: 'cinephile',
-                title: 'Le Cinéphile',
-                emoji: '🎥',
-                subtitle: 'Le 7ème art coule dans tes veines',
-                description: 'Les films, c\'est ta religion.',
-                color: '#3F51B5'
-            }
-        },
-        {
-            condition: tvPercent > 70 && isBinger,
-            persona: {
-                id: 'binger',
-                title: 'Le Binge-Watcher Pro',
-                emoji: '📺',
-                subtitle: '"Encore un épisode" est ton mantra',
-                description: 'Tu ne regardes pas les séries, tu les dévores.',
-                color: '#4CAF50'
-            }
-        },
-        {
-            condition: tvPercent > 50,
-            persona: {
-                id: 'series-addict',
-                title: 'L\'Accro aux Séries',
-                emoji: '📡',
-                subtitle: 'Tu connais plus de personnages fictifs que de vraies personnes',
-                description: 'Les séries sont ta deuxième famille.',
-                color: '#009688'
-            }
-        },
-        // --- PERSONAS PAR COMPORTEMENT ---
-        {
-            condition: isExplorer && uniqueTitles > 100,
-            persona: {
-                id: 'explorer-elite',
-                title: 'L\'Explorateur d\'Élite',
-                emoji: '🧭',
-                subtitle: 'Tu as vu des trucs dont personne n\'a entendu parler',
-                description: 'Plus de 100 titres ! Tu es la définition de la curiosité.',
-                color: '#FF9800'
-            }
-        },
-        {
-            condition: isExplorer,
-            persona: {
-                id: 'explorer',
-                title: 'L\'Explorateur',
-                emoji: '🔍',
-                subtitle: 'Toujours en quête de la prochaine pépite',
-                description: 'Tu préfères découvrir que revoir.',
-                color: '#FFC107'
-            }
-        },
-        {
-            condition: isLoyal && topShowHours > 50,
-            persona: {
-                id: 'superfan',
-                title: 'Le Superfan',
-                emoji: '💜',
-                subtitle: 'Tu as trouvé TON truc et tu t\'y tiens',
-                description: 'La loyauté, c\'est ta plus grande qualité.',
-                color: '#673AB7'
-            }
-        },
-        {
-            condition: isLoyal,
-            persona: {
-                id: 'comfort-watcher',
-                title: 'L\'Amateur de Confort',
-                emoji: '🛋️',
-                subtitle: 'Pourquoi changer une équipe qui gagne ?',
-                description: 'Tu remates tes classiques, et c\'est très bien comme ça.',
-                color: '#795548'
-            }
-        }
+        // --- Intensité ---
+        { condition: totalHours > 1000, persona: { id: 'legend', title: 'La Légende Vivante', emoji: '👑', subtitle: 'T\'as carrément habité sur Movix', description: 'Plus de 1000h. On devrait te salarier.', color: '#FFD700' } },
+        { condition: totalHours > 500, persona: { id: 'marathon', title: 'Le Marathonien Ultime', emoji: '🏃', subtitle: 'Ton canapé a pris ta forme', description: 'T\'as fait du binge un sport olympique.', color: '#FF6B35' } },
+        { condition: percentile != null && percentile >= 99 && totalHours > 200, persona: { id: 'elite-1pct', title: 'Le Top 1%', emoji: '💎', subtitle: 'Dans le club très fermé', description: 'Tu regardes plus que 99% des gens ici. Respect.', color: '#00E5FF' } },
+        // --- Rythme ---
+        { condition: isNightOwl && totalHours > 100, persona: { id: 'night-owl', title: 'L\'Oiseau de Nuit', emoji: '🦉', subtitle: 'La nuit, ton écran est le seul allumé', description: 'Tes meilleures sessions ? Entre minuit et 5h.', color: '#1A237E' } },
+        { condition: isEarlyBird && totalHours > 100, persona: { id: 'early-bird', title: 'Le Lève-tôt', emoji: '🌅', subtitle: 'Un épisode avant le café', description: 'Tu lances Movix quand les autres dorment encore.', color: '#FF8A65' } },
+        // --- Type dominant ---
+        { condition: animePercent > 80, persona: { id: 'weeb-supreme', title: 'Weeb Suprême', emoji: '⛩️', subtitle: 'Tu penses en sous-titres', description: '+80% d\'anime. T\'es plus à Tokyo qu\'à Paris.', color: '#E91E63' } },
+        { condition: animePercent > 50, persona: { id: 'otaku', title: 'L\'Otaku Assumé', emoji: '🍜', subtitle: 'Ton cœur bat au rythme des openings', description: 'L\'anime, c\'est pas une phase, c\'est un mode de vie.', color: '#9C27B0' } },
+        { condition: moviePercent > 70 && uniqueTitles > 50, persona: { id: 'critic', title: 'Le Critique', emoji: '🎬', subtitle: 'Un avis sur tout, et souvent le bon', description: 'Tu pourrais noter des films pour de vrai.', color: '#2196F3' } },
+        { condition: moviePercent > 70, persona: { id: 'cinephile', title: 'Le Cinéphile', emoji: '🎥', subtitle: 'Le 7e art coule dans tes veines', description: 'Les films, c\'est ta religion.', color: '#3F51B5' } },
+        { condition: tvPercent > 70 && isBinger, persona: { id: 'binger', title: 'Le Binge-Watcher Pro', emoji: '📺', subtitle: '"Encore un épisode" = ton mantra', description: 'Tu regardes pas les séries, tu les dévores.', color: '#4CAF50' } },
+        { condition: tvPercent > 50, persona: { id: 'series-addict', title: 'L\'Accro aux Séries', emoji: '📡', subtitle: 'Plus de persos fictifs que d\'amis (gentiment)', description: 'Les séries, c\'est ta deuxième famille.', color: '#009688' } },
     ];
 
-    // Chercher le premier persona qui matche
     for (const p of personas) {
-        if (p.condition === true) {
-            return p.persona;
-        }
+        if (p.condition === true) return p.persona;
     }
 
-    // Persona par défaut basé sur le type dominant
+    // --- Genre dominant (si ≥30% du temps) ---
+    const genrePersona = matchGenrePersona(topGenres);
+    if (genrePersona) return genrePersona;
+
+    // --- Comportement ---
+    const behaviorPersonas = [
+        { condition: isExplorer && uniqueTitles > 100, persona: { id: 'explorer-elite', title: 'L\'Explorateur d\'Élite', emoji: '🧭', subtitle: 'Tu connais des trucs que personne connaît', description: '+100 titres. La curiosité incarnée.', color: '#FF9800' } },
+        { condition: isExplorer, persona: { id: 'explorer', title: 'L\'Explorateur', emoji: '🔍', subtitle: 'Toujours en chasse de la prochaine pépite', description: 'Tu préfères découvrir que revoir.', color: '#FFC107' } },
+        { condition: totalSessions > 50 && avgSessionMinutes < 25, persona: { id: 'snacker', title: 'Le Grignoteur', emoji: '🍿', subtitle: 'Tu mates par petites bouchées', description: 'Sessions courtes mais souvent. Le snacking version streaming.', color: '#FF7043' } },
+        { condition: longestStreak >= 14, persona: { id: 'streak-machine', title: 'La Machine', emoji: '⚙️', subtitle: 'Aucun jour off', description: 'T\'enchaînes les jours sans jamais lâcher.', color: '#607D8B' } },
+        { condition: isLoyal && topShowHours > 50, persona: { id: 'superfan', title: 'Le Superfan', emoji: '💜', subtitle: 'T\'as trouvé TON truc, tu lâches plus', description: 'La loyauté, c\'est ta signature.', color: '#673AB7' } },
+        { condition: isLoyal, persona: { id: 'comfort-watcher', title: 'L\'Amateur de Confort', emoji: '🛋️', subtitle: 'Pourquoi changer une équipe qui gagne ?', description: 'Tu remates tes classiques, et c\'est très bien.', color: '#795548' } },
+        { condition: dominantPercent < 45, persona: { id: 'omnivore', title: 'Le Touche-à-tout', emoji: '🎲', subtitle: 'Films, séries, anime : tu prends tout', description: 'Aucune case te résume. L\'équilibre parfait.', color: '#26C6DA' } },
+    ];
+
+    for (const p of behaviorPersonas) {
+        if (p.condition === true) return p.persona;
+    }
+
+    // --- Défauts par type dominant ---
     const defaultPersonas = {
-        'anime': {
-            id: 'anime-fan',
-            title: 'L\'Anime Fan',
-            emoji: '✨',
-            subtitle: 'Tu apprécies l\'art de l\'animation japonaise',
-            description: 'Un équilibre sain d\'anime dans ta vie.',
-            color: '#E91E63'
-        },
-        'movie': {
-            id: 'movie-lover',
-            title: 'L\'Amoureux du Cinéma',
-            emoji: '🍿',
-            subtitle: 'Rien ne vaut un bon film',
-            description: 'Tu sais apprécier une bonne histoire.',
-            color: '#2196F3'
-        },
-        'tv': {
-            id: 'tv-enthusiast',
-            title: 'L\'Enthousiaste des Séries',
-            emoji: '📺',
-            subtitle: 'Les séries font partie de ta routine',
-            description: 'Un épisode par jour éloigne le médecin.',
-            color: '#4CAF50'
-        },
-        'live-tv': {
-            id: 'live-watcher',
-            title: 'Le Téléspectateur',
-            emoji: '📡',
-            subtitle: 'Tu restes connecté à l\'actualité',
-            description: 'La TV en direct, c\'est ton truc.',
-            color: '#607D8B'
-        }
+        'anime': { id: 'anime-fan', title: 'L\'Anime Fan', emoji: '✨', subtitle: 'L\'animation japonaise te parle', description: 'Un bel équilibre d\'anime dans ta vie.', color: '#E91E63' },
+        'movie': { id: 'movie-lover', title: 'L\'Amoureux du Cinéma', emoji: '🍿', subtitle: 'Rien ne vaut un bon film', description: 'Tu sais apprécier une bonne histoire.', color: '#2196F3' },
+        'tv': { id: 'tv-enthusiast', title: 'L\'Enthousiaste des Séries', emoji: '📺', subtitle: 'Les séries rythment ta routine', description: 'Un épisode par jour éloigne le médecin.', color: '#4CAF50' },
+        'live-tv': { id: 'live-watcher', title: 'Le Téléspectateur', emoji: '📡', subtitle: 'Toujours branché sur le direct', description: 'La TV en direct, c\'est ton truc.', color: '#607D8B' }
     };
 
     return defaultPersonas[dominantType.content_type] || defaultPersonas['movie'];
@@ -1294,255 +1291,427 @@ function formatDurationShort(minutes) {
 }
 
 /**
- * Génère les slides du Wrapped avec des templates "à trous"
- * Écrit comme un copywriter Spotify le ferait
+ * Génère les slides du Wrapped v2
  */
 function generateSlides(data) {
     const {
         totalMinutes, totalHours, totalDays, totalDurationLabel, uniqueTitles,
-        topShowTitle, topShowHours, topShowMinutes, topShowDurationLabel, topShowType,
-        secondShowTitle, secondShow,
+        topShowTitle, topShowHours, topShowMinutes, topShowDurationLabel,
         dominantType, dominantPercent,
         peakMonth, lowestMonth, monthNames,
-        animePercent, moviePercent, tvPercent,
-        isExplorer, isLoyal, isBinger,
-        enrichedTopContent, typeStats, persona,
-        year,
-        // New data
+        enrichedTopContent, persona,
+        year, userId,
         percentile, peakHour, isNightOwl, isEarlyBird,
         longestStreak, totalActiveDays,
-        firstWatchData, lastWatchData,
-        topGenres, avgSessionMinutes
+        firstWatchData,
+        topGenres, avgSessionMinutes,
+        isExplorer, isBinger,
+        recordDay, rewatchData, watchAgeYear, topPages, weekday
     } = data;
 
     const slides = [];
+    const seed = `${userId}:${year}`;
+    const shortLabel = formatDurationShort(totalMinutes);
+    // Variante seedée par user+slide : chaque utilisateur tombe sur une formulation
+    // différente, mais stable d'une ouverture à l'autre (screenshots reproductibles).
+    const pick = (key, variants) => variants[fnv1aHash(`${seed}:${key}`) % variants.length];
 
-    // === SLIDE 1: INTRO / HOOK ===
+    // === 1. INTRO ===
     const introTemplates = [
         {
+            condition: totalHours > 500,
+            title: pick('intro-t', [`${year}, hors catégorie.`, `${year}, niveau final.`]),
+            subtitle: 'On a recompté trois fois, c\'est réel.',
+            texts: [
+                `${totalDurationLabel} de visionnage, soit ${totalDays} jours complets devant un écran. T'es plus un utilisateur, t'es un pilier de Movix.`,
+                `${totalDurationLabel} cette année. Des séries entières sont nées et mortes pendant que toi, t'étais là.`,
+                `${totalDurationLabel} au compteur. Ton canapé devrait être classé monument historique.`
+            ],
+            highlight: `${totalDays} jours`
+        },
+        {
+            condition: totalHours > 300,
+            title: pick('intro-t', [`${year}, du très lourd.`, `${year}, régime intensif.`]),
+            subtitle: 'Et c\'est peu de le dire.',
+            texts: [
+                `${totalDurationLabel} sur Movix, soit ${totalDays} jours non-stop. Le canapé a officiellement pris ta forme.`,
+                `${totalDurationLabel} de visionnage. Certains font des marathons. Toi, t'as couru toute l'année.`,
+                `${totalDurationLabel} cette année. Quelque part entre la passion et le record du monde.`
+            ],
+            highlight: `${totalDays} jours`
+        },
+        {
             condition: totalHours > 200,
-            title: `${year}, c'était intense.`,
-            subtitle: 'Genre, vraiment intense.',
-            text: `Tu as passé ${totalDurationLabel} sur Movix. C'est ${totalDays} jours complets. On espère que t'avais des snacks.`,
+            title: `${year}, t'as tout donné.`,
+            subtitle: 'Et on a tout vu.',
+            texts: [
+                `${totalDurationLabel} sur Movix cette année. Soit ${totalDays} jours non-stop. À ce stade, c'est plus un hobby, c'est un mode de vie.`,
+                `${totalDurationLabel} de visionnage, ${totalDays} jours pleins. T'as pas regardé une année, t'en as vécu deux.`,
+                `${totalDurationLabel} au total. Si regarder était un sport, t'aurais une fédération à ton nom.`
+            ],
             highlight: `${totalDays} jours`
         },
         {
             condition: totalHours > 100,
-            title: `${year} ? Tu l'as bien remplie.`,
-            subtitle: 'Et ton historique aussi.',
-            text: `${totalDurationLabel} de contenu. C'est plus que certains jobs à temps partiel.`,
-            highlight: `${formatDurationShort(totalMinutes)}`
+            title: pick('intro-t', [`${year}, bien rempli.`, `${year}, sacré rythme.`]),
+            subtitle: 'Et ton historique le prouve.',
+            texts: [
+                `${totalDurationLabel} de visionnage. Genre, plus que certains mi-temps de boulot. Validé.`,
+                `${totalDurationLabel} cette année. T'as trouvé ton rythme de croisière, et il est soutenu.`,
+                `${totalDurationLabel} sur Movix. Une vraie deuxième vie, bien remplie.`
+            ],
+            highlight: shortLabel
         },
         {
             condition: totalHours > 50,
-            title: `Pas mal, ${year}.`,
-            subtitle: 'Pas mal du tout.',
-            text: `${totalDurationLabel} de streaming. Tu sais ce que tu veux.`,
-            highlight: `${formatDurationShort(totalMinutes)}`
+            title: `Solide, ${year}.`,
+            subtitle: 'Vraiment solide.',
+            texts: [
+                `${totalDurationLabel} sur Movix. Tu sais ce que t'aimes, et tu fonces.`,
+                `${totalDurationLabel} de visionnage. Pas d'excès, pas de manque : l'équilibre du connaisseur.`,
+                `${totalDurationLabel} cette année. Régulier, précis, efficace.`
+            ],
+            highlight: shortLabel
+        },
+        {
+            condition: totalHours > 20,
+            title: pick('intro-t', [`${year}, tranquille.`, `${year}, en finesse.`]),
+            subtitle: 'Mais efficace.',
+            texts: [
+                `${totalDurationLabel} bien choisies. Toi, tu regardes pas beaucoup — tu regardes bien.`,
+                `${totalDurationLabel} au compteur. La qualité avant la quantité, toujours.`,
+                `${totalDurationLabel} cette année. Chaque session compte, rien au hasard.`
+            ],
+            highlight: shortLabel
         },
         {
             condition: true,
-            title: `${year} s'est bien passée.`,
-            subtitle: 'On a les preuves.',
-            text: `${totalDurationLabel} ensemble cette année. C'est un bon début.`,
-            highlight: `${formatDurationShort(totalMinutes)}`
+            title: `${year}, avec toi.`,
+            subtitle: 'Et c\'est déjà pas mal.',
+            texts: [
+                `${totalDurationLabel} ensemble cette année. Le début d'une belle histoire.`,
+                `${totalDurationLabel} passées ici. On espère que c'était que du bon.`
+            ],
+            highlight: shortLabel
         }
     ];
-    slides.push({ type: 'intro', ...introTemplates.find(t => t.condition) });
+    const introTpl = introTemplates.find(t => t.condition);
+    slides.push({ type: 'intro', title: introTpl.title, subtitle: introTpl.subtitle, text: pick('intro', introTpl.texts), highlight: introTpl.highlight });
 
-    // === SLIDE 2: TOP 1 ===
-    if (topShowTitle) {
-        const top1Templates = [
-            {
-                condition: topShowHours > 100,
-                title: `"${topShowTitle}"`,
-                subtitle: 'Ton obsession de l\'année',
-                text: `${topShowDurationLabel} dessus. À ce stade, tu pourrais écrire la suite toi-même.`,
-                highlight: `#1`,
-                subtext: 'C\'est un peu gênant, mais on adore.'
-            },
-            {
-                condition: topShowHours > 50,
-                title: `"${topShowTitle}"`,
-                subtitle: 'Ton coup de cœur absolu',
-                text: `${topShowDurationLabel}. Tu l'as regardé, rerererereregardé, et tu recommencerais.`,
-                highlight: `#1`,
-                subtext: 'Fan numéro 1 ? C\'est toi.'
-            },
-            {
-                condition: topShowHours > 20,
-                title: `"${topShowTitle}"`,
-                subtitle: 'Ta grande histoire d\'amour',
-                text: `${topShowDurationLabel} ensemble. C'est plus que certaines relations.`,
-                highlight: `#1`,
-                subtext: 'Et on ne juge pas.'
-            },
-            {
-                condition: true,
-                title: `"${topShowTitle}"`,
-                subtitle: 'Ton préféré de l\'année',
-                text: `${topShowDurationLabel} passées dessus. Un classique dans ton cœur.`,
-                highlight: `#1`,
-                subtext: ''
-            }
-        ];
-        slides.push({ type: 'top1', ...top1Templates.find(t => t.condition) });
-    }
-
-    // === SLIDE 3: TOP 5 ===
-    if (enrichedTopContent.length >= 3) {
-        const top5Text = enrichedTopContent.slice(0, 5).map((c, i) => 
-            `${i + 1}. ${c.content_title}`
-        ).join('\n');
-        
-        slides.push({
-            type: 'top5',
-            title: 'Ton Top 5',
-            subtitle: 'Ceux qui ont marqué ton année',
-            text: top5Text,
-            highlight: `${uniqueTitles} titres au total`,
-            subtext: uniqueTitles > 50 ? 'Tu es incollable.' : ''
-        });
-    }
-
-    // === SLIDE 4: PERSONNALITÉ / VIBE ===
-    const typeLabel = {
-        'anime': 'les animes',
-        'movie': 'les films',
-        'tv': 'les séries',
-        'live-tv': 'la TV en direct'
-    };
-
-    const vibeTemplates = [
-        {
-            condition: dominantPercent > 80,
-            title: persona.title,
-            subtitle: persona.subtitle,
-            text: `${dominantPercent}% de ton temps sur ${typeLabel[dominantType.content_type]}. Tu sais ce que tu aimes, et tu assumes.`,
-            highlight: persona.emoji,
-            subtext: persona.description
-        },
-        {
-            condition: dominantPercent > 50,
-            title: persona.title,
-            subtitle: persona.subtitle,
-            text: `Ta vibe ? Principalement ${typeLabel[dominantType.content_type]}, avec une touche de variété.`,
-            highlight: persona.emoji,
-            subtext: persona.description
-        },
-        {
-            condition: true,
-            title: persona.title,
-            subtitle: persona.subtitle,
-            text: `Tu es éclectique. Un peu de tout, c'est ton style.`,
-            highlight: persona.emoji,
-            subtext: persona.description
-        }
-    ];
-    slides.push({ type: 'persona', ...vibeTemplates.find(t => t.condition) });
-
-    // === SLIDE 5: MOIS LE PLUS ACTIF ===
+    // === 2. TIMELINE (remplace peak-month) ===
     const peakMonthMinutes = parseInt(peakMonth.duration);
-    const peakMonthHours = Math.round(peakMonthMinutes / 60);
-    const peakMonthDurationLabel = formatDuration(peakMonthMinutes);
-    
-    const monthTemplates = [
-        {
-            condition: peakMonthHours > 50,
-            title: monthNames[peakMonth.month],
-            subtitle: 'Ton mois de folie',
-            text: `${peakMonthDurationLabel} en un seul mois. Il s'est passé quoi ? Rupture ? Vacances ? Les deux ?`,
-            highlight: `🔥`,
-            subtext: 'On ne juge pas, on constate.'
-        },
-        {
-            condition: peakMonthHours > 20,
-            title: monthNames[peakMonth.month],
-            subtitle: 'Ton mois le plus actif',
-            text: `${peakMonthDurationLabel}. Tu étais dans ta bulle, et c'était bien.`,
-            highlight: `📅`,
-            subtext: ''
-        },
-        {
-            condition: true,
-            title: monthNames[peakMonth.month],
-            subtitle: 'Là où tout s\'est joué',
-            text: `Ton pic de l'année. ${peakMonthDurationLabel} de pur bonheur.`,
-            highlight: `✨`,
-            subtext: ''
-        }
-    ];
-    slides.push({ type: 'peak-month', ...monthTemplates.find(t => t.condition) });
+    const peakMonthLabel = formatDuration(peakMonthMinutes);
+    const peakName = monthNames[peakMonth.month];
+    const lowestName = monthNames[lowestMonth.month];
+    const avgMonthlyMinutes = totalMinutes / 12;
+    const peakRatio = avgMonthlyMinutes > 0 ? peakMonthMinutes / avgMonthlyMinutes : 1;
+    let timelineText;
+    if (peakMonth.month === lowestMonth.month) {
+        timelineText = `${peakName}, ton pic absolu : ${peakMonthLabel} en un seul mois.`;
+    } else if (peakRatio >= 3) {
+        timelineText = pick('timeline', [
+            `${peakName} a tout écrasé : ${peakMonthLabel} à lui seul. Il s'est passé un truc en ${peakName.toLowerCase()}, avoue.`,
+            `${peakMonthLabel} rien qu'en ${peakName.toLowerCase()}. Le reste de l'année regardait de loin.`,
+            `${peakName} en mode rouleau compresseur (${peakMonthLabel}), pendant que ${lowestName.toLowerCase()} comptait les jours.`
+        ]);
+    } else {
+        timelineText = pick('timeline', [
+            `${peakName} en feu (${peakMonthLabel}), ${lowestName.toLowerCase()} fantôme. Chacun son rythme.`,
+            `${peakName} au sommet avec ${peakMonthLabel}, ${lowestName.toLowerCase()} en mode avion. L'année a eu ses saisons.`,
+            `Gros pic en ${peakName.toLowerCase()} (${peakMonthLabel}), calme plat en ${lowestName.toLowerCase()}. Une année avec du relief.`
+        ]);
+    }
+    slides.push({
+        type: 'timeline',
+        title: 'Ton année en courbe',
+        subtitle: `${peakName}, ton mois fort`,
+        text: timelineText,
+        highlight: '📈',
+        subtext: peakMonthMinutes > 3000 ? pick('timeline-s', ['On constate, on ne juge pas.', 'Aucun jugement. Beaucoup de respect.']) : ''
+    });
 
-    // === SLIDE 6: TOP GENRES ===
+    // === 3. TOP GENRES ===
     if (topGenres && topGenres.length >= 2) {
         const topGenreNames = topGenres.slice(0, 3).map(g => g.name).join(', ');
         slides.push({
             type: 'top-genres',
-            title: 'Tes genres préférés',
+            title: pick('genres-t', ['Tes genres de prédilection', 'Ton ADN de spectateur', 'Ta palette de l\'année']),
             subtitle: topGenreNames,
             text: topGenres.length >= 3
-                ? `${topGenres[0].name} domine avec ${topGenres[0].percent}% de ton temps. Suivi par ${topGenres[1].name} et ${topGenres[2].name}.`
-                : `${topGenres[0].name} domine avec ${topGenres[0].percent}% de ton temps.`,
+                ? pick('genres', [
+                    `${topGenres[0].name} mène la danse avec ${topGenres[0].percent}% de ton temps. Juste derrière : ${topGenres[1].name} et ${topGenres[2].name}.`,
+                    `${topGenres[0].name} en tête (${topGenres[0].percent}% de ton temps), talonné par ${topGenres[1].name} et ${topGenres[2].name}. Le trio gagnant.`,
+                    `Ton podium des genres : ${topGenres[0].name} (${topGenres[0].percent}%), puis ${topGenres[1].name} et ${topGenres[2].name}. Une signature bien à toi.`
+                ])
+                : `${topGenres[0].name} mène la danse avec ${topGenres[0].percent}% de ton temps.`,
             highlight: '🎭',
-            subtext: topGenres.length > 5 ? `Et aussi : ${topGenres.slice(5).map(g => g.name).join(', ')}` : ''
+            subtext: ''
         });
     }
 
-    // === SLIDE 7: LISTENING CLOCK (Quand tu regardes) ===
+    // === 4. TOP 1 (le quiz client s'insère juste avant côté frontend) ===
+    if (topShowTitle) {
+        const top1Templates = [
+            {
+                condition: topShowHours > 200,
+                subtitle: 'Ton année lui appartient',
+                texts: [
+                    `${topShowDurationLabel} dessus. C'est plus du visionnage, c'est une colocation.`,
+                    `${topShowDurationLabel} passées ensemble. Vous devriez officialiser, là.`,
+                    `${topShowDurationLabel} sur ce titre. Tu pourrais doubler les personnages de mémoire.`
+                ],
+                subtext: 'Iconique. Légèrement inquiétant. Surtout iconique.'
+            },
+            {
+                condition: topShowHours > 100,
+                subtitle: 'Ton obsession de l\'année',
+                texts: [
+                    `${topShowDurationLabel} dessus. Tu pourrais en écrire la suite les yeux fermés.`,
+                    `${topShowDurationLabel} passées dessus. Les acteurs eux-mêmes l'ont moins vu que toi.`,
+                    `${topShowDurationLabel} sur ce titre. À ce niveau, c'est plus un programme, c'est un membre de la famille.`
+                ],
+                subtext: 'Un peu gênant. Beaucoup iconique.'
+            },
+            {
+                condition: topShowHours > 50,
+                subtitle: 'Ton grand gagnant',
+                texts: [
+                    `${topShowDurationLabel} ensemble. Vous êtes officiellement en couple.`,
+                    `${topShowDurationLabel} dessus. Le genre de fidélité qui se fait rare.`,
+                    `${topShowDurationLabel} passées dessus. Coup de cœur confirmé, et largement assumé.`
+                ],
+                subtext: 'Fan n°1 ? C\'est toi.'
+            },
+            {
+                condition: topShowHours > 20,
+                subtitle: 'Ta grande histoire de l\'année',
+                texts: [
+                    `${topShowDurationLabel} dessus. Plus que certaines vraies relations.`,
+                    `${topShowDurationLabel} ensemble. Une belle histoire, sans drama (enfin, sauf à l'écran).`,
+                    `${topShowDurationLabel} passées dessus. Vous deux, c'était évident.`
+                ],
+                subtext: 'On ne juge pas.'
+            },
+            {
+                condition: true,
+                subtitle: 'Ton préféré de l\'année',
+                texts: [
+                    `${topShowDurationLabel} passées dessus. Un classique gravé dans ton cœur.`,
+                    `${topShowDurationLabel} dessus. Le titre qui a gagné ton année, tout simplement.`
+                ],
+                subtext: ''
+            }
+        ];
+        const tpl = top1Templates.find(t => t.condition);
+        slides.push({ type: 'top1', title: `"${topShowTitle}"`, subtitle: tpl.subtitle, text: pick('top1', tpl.texts), highlight: '#1', subtext: tpl.subtext });
+    }
+
+    // === 5. TOP 5 ===
+    if (enrichedTopContent.length >= 3) {
+        const top5Text = enrichedTopContent.slice(0, 5).map((c, i) => `${i + 1}. ${c.content_title}`).join('\n');
+        slides.push({
+            type: 'top5',
+            title: 'Ton Top 5',
+            subtitle: pick('top5-s', ['Le casting de ton année', 'Tes têtes d\'affiche', 'Le grand palmarès']),
+            text: top5Text,
+            highlight: `${uniqueTitles} titres en tout`,
+            subtext: uniqueTitles > 200
+                ? pick('top5-x', ['Encyclopédie vivante.', 'Une vidéothèque entière à toi tout seul.'])
+                : uniqueTitles > 50 ? 'Incollable.' : ''
+        });
+    }
+
+    // === 6. REWATCH (conditionnelle) ===
+    if (rewatchData) {
+        const rwTexts = rewatchData.count >= 5
+            ? [
+                `${rewatchData.count} fois sur "${rewatchData.title}" cette année. Tu connais les répliques avant les acteurs.`,
+                `T'es revenu ${rewatchData.count} fois sur "${rewatchData.title}". C'est plus un rewatch, c'est un pèlerinage.`
+            ]
+            : rewatchData.count >= 3
+                ? [
+                    `T'es revenu ${rewatchData.count} fois sur "${rewatchData.title}". Le confort a un nom.`,
+                    `${rewatchData.count} visites à "${rewatchData.title}" cette année. Quand on aime, on recompte pas.`
+                ]
+                : [
+                    `Deux fois sur "${rewatchData.title}" cette année. Quand c'est bon, c'est bon.`,
+                    `"${rewatchData.title}", vu et revu. Certaines histoires méritent une deuxième séance.`
+                ];
+        slides.push({
+            type: 'rewatch',
+            title: 'Ton revenant',
+            subtitle: rewatchData.type === 'movie' ? 'Le film qui te lâche pas' : 'L\'épisode que tu relances en boucle',
+            text: pick('rewatch', rwTexts),
+            highlight: `×${rewatchData.count}`,
+            subtext: pick('rewatch-s', ['Les classiques, ça se respecte.', 'La valeur sûre, c\'est sacré.'])
+        });
+    }
+
+    // === 7. RECORD DAY (conditionnelle, > 3h) ===
+    if (recordDay && recordDay.minutes > 180) {
+        const recordDate = new Date(recordDay.date);
+        const recordDateLabel = recordDate.toLocaleDateString('fr-FR', { day: 'numeric', month: 'long' });
+        const recordLabel = formatDuration(recordDay.minutes);
+        const recordTpl = recordDay.minutes > 480
+            ? {
+                title: 'Ta journée hors norme',
+                texts: [
+                    `${recordLabel} en une seule journée. Une performance. La médaille arrive par la poste.`,
+                    `${recordLabel} d'affilée ce jour-là. Le soleil s'est levé et couché sans toi.`,
+                    `${recordLabel} en 24h. On appelle plus ça une journée, on appelle ça un festival.`
+                ],
+                subtext: 'Journée rentrée dans la légende.'
+            }
+            : recordDay.minutes > 300
+                ? {
+                    title: 'Ta journée légendaire',
+                    texts: [
+                        `${recordLabel} en une seule journée. On sait pas ce qui s'est passé, mais c'était du sérieux.`,
+                        `${recordLabel} ce jour-là. Pluie dehors ou grosse flemme : dans tous les cas, bien joué.`,
+                        `${recordLabel} en un jour. La définition même du jour parfait.`
+                    ],
+                    subtext: 'Journée certifiée canapé.'
+                }
+                : {
+                    title: 'Ta plus grosse journée',
+                    texts: [
+                        `${recordLabel} en une journée. Ton record perso de l'année.`,
+                        `${recordLabel} ce jour-là. Une après-midi bien investie.`
+                    ],
+                    subtext: ''
+                };
+        slides.push({
+            type: 'record-day',
+            title: recordTpl.title,
+            subtitle: `Le ${recordDateLabel}`,
+            text: pick('record', recordTpl.texts),
+            highlight: formatDurationShort(recordDay.minutes),
+            subtext: recordTpl.subtext
+        });
+    }
+
+    // === 8. LISTENING CLOCK (+ weekday rendu côté front) ===
     const hourLabel = (h) => `${h}h`;
     const clockTemplates = [
         {
             condition: isNightOwl,
-            title: 'Le mode nocturne',
-            subtitle: `Tu es le plus actif vers ${hourLabel(peakHour)}`,
-            text: 'Pendant que le monde dort, toi tu mates. Tes yeux rouges ne mentent pas.',
+            title: 'Team nuit',
+            subtitle: `Ton pic : ${hourLabel(peakHour)}`,
+            texts: [
+                `Pendant que le monde dort, toi tu lances un épisode. Les cernes, c'est le prix de la passion.`,
+                `Tes meilleures sessions commencent quand les autres éteignent. La nuit te réussit.`,
+                `Minuit passé, un épisode de plus. Le club des noctambules te salue.`
+            ],
             highlight: '🌙',
             subtext: 'Les meilleures sessions, c\'est la nuit.'
         },
         {
             condition: isEarlyBird,
-            title: 'Lève-tôt, regarde tôt',
-            subtitle: `Ton pic d'activité : ${hourLabel(peakHour)}`,
-            text: 'Tu lances un épisode avant même que le café soit prêt. Respect.',
+            title: 'Team matin',
+            subtitle: `Ton pic : ${hourLabel(peakHour)}`,
+            texts: [
+                `Un épisode avant même le café. Respect total.`,
+                `Toi, tu commences la journée par un générique. Et franchement, c'est une bonne routine.`
+            ],
             highlight: '🌅',
+            subtext: ''
+        },
+        {
+            condition: peakHour >= 18 && peakHour <= 23,
+            title: 'Team prime time',
+            subtitle: `Ton pic : ${hourLabel(peakHour)}`,
+            texts: [
+                `${hourLabel(peakHour)}, le canapé t'appelle, et tu réponds toujours présent. La grande tradition de la soirée écran.`,
+                `Le soir venu, c'est ton moment. ${hourLabel(peakHour)} pétantes, et c'est parti.`,
+                `Ta journée se termine toujours pareil : ${hourLabel(peakHour)}, plaid, lecture. La routine parfaite.`
+            ],
+            highlight: '🛋️',
+            subtext: ''
+        },
+        {
+            condition: peakHour >= 12 && peakHour < 18,
+            title: 'Team après-midi',
+            subtitle: `Ton pic : ${hourLabel(peakHour)}`,
+            texts: [
+                `C'est en pleine après-midi que tu lances le plus souvent Movix. La pause de ${hourLabel(peakHour)}, c'est sacré.`,
+                `${hourLabel(peakHour)} : l'heure où ta journée fait une pause et où Movix prend le relais.`
+            ],
+            highlight: '☀️',
             subtext: ''
         },
         {
             condition: true,
             title: `${hourLabel(peakHour)}, ton heure de pointe`,
-            subtitle: 'Ton horloge de visionnage',
-            text: `C'est à ${hourLabel(peakHour)} que tu lances le plus souvent Movix. On connaît tes habitudes maintenant.`,
+            subtitle: 'Ton horloge Movix',
+            texts: [
+                `C'est vers ${hourLabel(peakHour)} que tu lances Movix le plus souvent. On connaît tes habitudes maintenant.`,
+                `${hourLabel(peakHour)}, ton rendez-vous quotidien. La ponctualité, c'est une qualité.`
+            ],
             highlight: '⏰',
             subtext: ''
         }
     ];
-    slides.push({ type: 'listening-clock', ...clockTemplates.find(t => t.condition) });
+    const clockTpl = clockTemplates.find(t => t.condition);
+    slides.push({ type: 'listening-clock', title: clockTpl.title, subtitle: clockTpl.subtitle, text: pick('clock', clockTpl.texts), highlight: clockTpl.highlight, subtext: clockTpl.subtext });
 
-    // === SLIDE 8: STREAK ===
+    // === 9. STREAK (durées réelles : mois/semaines calculés, pas d'à-peu-près) ===
     if (longestStreak >= 3) {
+        const streakMonths = Math.floor(longestStreak / 30);
+        const streakWeeks = Math.floor(longestStreak / 7);
         const streakTemplates = [
             {
+                condition: longestStreak >= 90,
+                title: `${longestStreak} jours d'affilée`,
+                subtitle: `${streakMonths} mois sans lâcher`,
+                texts: [
+                    `${longestStreak} jours consécutifs, soit ${streakMonths} mois pleins sans en rater un seul. C'est plus de la constance, c'est un serment.`,
+                    `${longestStreak} jours d'affilée. Des saisons entières ont commencé et fini pendant ta série.`
+                ],
+                highlight: '🏆',
+                subtext: `Sur ${totalActiveDays} jours actifs cette année.`
+            },
+            {
+                condition: longestStreak >= 60,
+                title: `${longestStreak} jours d'affilée`,
+                subtitle: `${streakMonths} mois complets, jour après jour`,
+                texts: [
+                    `${longestStreak} jours consécutifs, soit ${streakMonths} mois entiers sans interruption. C'est plus une habitude, c'est un mode de vie.`,
+                    `${longestStreak} jours d'affilée. Le soleil a eu plus de jours off que toi.`,
+                    `${longestStreak} jours sans en manquer un. ${streakMonths} mois de fidélité absolue, ça se signe quelque part ?`
+                ],
+                highlight: '🔥',
+                subtext: `Sur ${totalActiveDays} jours actifs cette année.`
+            },
+            {
                 condition: longestStreak >= 30,
-                title: `${longestStreak} jours de suite`,
-                subtitle: 'Un mois complet non-stop',
-                text: `Ta plus longue série de visionnage : ${longestStreak} jours consécutifs. On appelle ça de la détermination.`,
+                title: `${longestStreak} jours d'affilée`,
+                subtitle: 'Un mois entier non-stop',
+                texts: [
+                    `Ta plus longue série : ${longestStreak} jours consécutifs. On appelle ça une légende.`,
+                    `${longestStreak} jours sans interruption. Un mois complet de rendez-vous quotidien.`
+                ],
                 highlight: '🔥',
                 subtext: `Sur ${totalActiveDays} jours actifs cette année.`
             },
             {
                 condition: longestStreak >= 14,
-                title: `${longestStreak} jours d'affilée`,
-                subtitle: 'Streak impressionnant',
-                text: `Deux semaines sans lâcher Movix. Tu as une discipline de fer (pour le streaming en tout cas).`,
+                title: `${longestStreak} jours non-stop`,
+                subtitle: `${streakWeeks} semaines sans lâcher`,
+                texts: [
+                    `${streakWeeks} semaines sans lâcher Movix. Discipline de fer (pour le streaming au moins).`,
+                    `${longestStreak} jours d'affilée. La régularité d'une montre suisse, le plaisir en plus.`
+                ],
                 highlight: '⚡',
-                subtext: `${totalActiveDays} jours d'activité au total.`
+                subtext: `${totalActiveDays} jours actifs au total.`
             },
             {
                 condition: longestStreak >= 7,
                 title: `${longestStreak} jours non-stop`,
-                subtitle: 'Une semaine de dédi',
-                text: `Ta meilleure série : ${longestStreak} jours sans interruption. C'est de la constance.`,
+                subtitle: 'Une semaine de dévotion',
+                texts: [
+                    `${longestStreak} jours sans interruption. Ça, c'est de la constance.`,
+                    `Une semaine entière sans rater un jour. Le rituel était bien rodé.`
+                ],
                 highlight: '💪',
                 subtext: ''
             },
@@ -1550,124 +1719,250 @@ function generateSlides(data) {
                 condition: true,
                 title: `${longestStreak} jours de streak`,
                 subtitle: 'Ta meilleure série',
-                text: `${longestStreak} jours de visionnage consécutifs. Pas mal comme streak.`,
+                texts: [
+                    `${longestStreak} jours consécutifs. Pas mal du tout.`,
+                    `${longestStreak} jours d'affilée. Une jolie petite série.`
+                ],
                 highlight: '🎯',
                 subtext: ''
             }
         ];
-        slides.push({ type: 'streak', ...streakTemplates.find(t => t.condition) });
+        const streakTpl = streakTemplates.find(t => t.condition);
+        slides.push({ type: 'streak', title: streakTpl.title, subtitle: streakTpl.subtitle, text: pick('streak', streakTpl.texts), highlight: streakTpl.highlight, subtext: streakTpl.subtext });
     }
 
-    // === SLIDE 9: FUN FACT ===
-    const funFacts = [];
-    
-    if (totalHours > 24) {
-        const equivalent = Math.floor(totalHours / 2); // Un film moyen = 2h
-        funFacts.push({
-            title: 'En d\'autres termes...',
-            subtitle: '',
-            text: `Tu aurais pu regarder ${equivalent} films de suite. Ou dormir ${totalDays} jours. Tu as fait un choix.`,
-            highlight: '🤔',
-            subtext: 'Le bon choix.'
-        });
-    } else if (totalMinutes > 30) {
-        funFacts.push({
-            title: 'En d\'autres termes...',
-            subtitle: '',
-            text: `${totalDurationLabel} de streaming. C'est déjà un bon début pour cette année.`,
-            highlight: '🤔',
-            subtext: 'Et ce n\'est que le début.'
+    // === 10. PAGES TIME (conditionnelle, ≥ 60 min hors live-tv) ===
+    const pageLabels = {
+        'home': 'la page d\'accueil', 'movies': 'les films', 'tv-shows': 'les séries',
+        'movie-details': 'les fiches films', 'tv-details': 'les fiches séries',
+        'wishboard': 'le wishboard', 'watchparty': 'les watchparties', 'anime': 'les animes'
+    };
+    const browsePages = (topPages || []).filter(p => p.page_name !== 'live-tv' && pageLabels[p.page_name]);
+    const browseTotal = browsePages.reduce((s, p) => s + parseInt(p.duration), 0);
+    if (browsePages.length > 0 && browseTotal >= 60) {
+        const topPage = browsePages[0];
+        const browseLabel = formatDuration(browseTotal);
+        const pageTexts = {
+            'home': [
+                `${browseLabel} à scroller la page d'accueil. Hésiter, re-scroller, hésiter encore : un art de vivre.`,
+                `${browseLabel} sur la home avant de te décider. Le choix, c'est toute une aventure.`
+            ],
+            'movie-details': [
+                `${browseLabel} à éplucher les fiches films. Toi, tu lances jamais rien sans avoir lu le dossier complet.`,
+                `${browseLabel} sur les fiches. Synopsis, note, casting : rien ne t'échappe avant le premier clic.`
+            ],
+            'tv-details': [
+                `${browseLabel} à éplucher les fiches séries. Toi, tu lances jamais rien sans avoir lu le dossier complet.`,
+                `${browseLabel} sur les fiches. Synopsis, note, saisons : rien ne t'échappe avant le premier clic.`
+            ],
+            'wishboard': [
+                `${browseLabel} sur ton wishboard. Collectionner les envies, c'est déjà la moitié du plaisir.`,
+                `${browseLabel} à organiser ta liste. Ta pile « à voir » est une œuvre en soi.`
+            ],
+            'watchparty': [
+                `${browseLabel} en watchparty. Regarder seul ? Très peu pour toi.`,
+                `${browseLabel} passées à mater à plusieurs. Le cinéma, c'est mieux accompagné.`
+            ]
+        };
+        const genericTexts = [
+            `${browseLabel} à naviguer sur Movix, surtout sur ${pageLabels[topPage.page_name]}. L'art de choisir, c'est tout un sport.`,
+            `${browseLabel} de balade dans le catalogue, ${pageLabels[topPage.page_name]} en tête. Flâner, c'est déjà regarder un peu.`
+        ];
+        slides.push({
+            type: 'pages-time',
+            title: 'Là où tu traînes',
+            subtitle: 'Avant même de lancer un titre',
+            text: pick('pages', pageTexts[topPage.page_name] || genericTexts),
+            highlight: formatDurationShort(browseTotal),
+            subtext: pick('pages-s', ['L\'indécision, on connaît.', 'Le lèche-vitrine version streaming.'])
         });
     }
-    
-    if (isExplorer && uniqueTitles > 30) {
-        funFacts.push({
-            title: 'L\'algorithme t\'adore',
-            subtitle: '',
-            text: `${uniqueTitles} titres différents. Tu rends notre job de recommandation vraiment difficile (et intéressant).`,
-            highlight: '🧠',
+
+    // === 11. WATCH AGE (conditionnelle, paliers d'époque) ===
+    if (watchAgeYear) {
+        const ageTpl = watchAgeYear >= year - 2
+            ? {
+                title: 'Toujours sur la hype',
+                texts: [
+                    `La moitié de ton temps sur des titres tout frais. T'es la hype incarnée.`,
+                    `Tu regardes ce qui vient de sortir, point. Toujours au courant avant tout le monde.`
+                ]
+            }
+            : watchAgeYear < 2000
+                ? {
+                    title: `Ton cœur vit en ${watchAgeYear}`,
+                    texts: [
+                        `La moitié de ton temps sur des titres d'avant ${watchAgeYear}. Le grain de l'ancien, le charme du classique : du patrimoine à l'état pur.`,
+                        `Ton année médiane : ${watchAgeYear}. Pendant que tout le monde court après les nouveautés, toi tu sirotes les classiques.`
+                    ]
+                }
+                : watchAgeYear < 2015
+                    ? {
+                        title: `Ton cœur vit en ${watchAgeYear}`,
+                        texts: [
+                            `La moitié de ton temps sur des titres d'avant ${watchAgeYear}. La nostalgie te va bien.`,
+                            `${watchAgeYear}, ton point d'équilibre. Cette époque-là avait quelque chose, pas vrai ?`
+                        ]
+                    }
+                    : {
+                        title: `Ton cœur vit en ${watchAgeYear}`,
+                        texts: [
+                            `Entre deux époques : la moitié de ton visionnage date d'avant ${watchAgeYear}. Le meilleur des deux mondes.`,
+                            `${watchAgeYear} en année médiane. Ni tout neuf, ni vintage : juste ce qui te plaît.`
+                        ]
+                    };
+        slides.push({
+            type: 'watch-age',
+            title: ageTpl.title,
+            subtitle: 'Ton âge ciné',
+            text: pick('age', ageTpl.texts),
+            highlight: String(watchAgeYear),
             subtext: ''
         });
     }
 
+    // === 12. FUN FACTS (pool élargi, sélection seedée — 1, +1 si > 50h) ===
+    const funFacts = [];
+    if (totalHours > 24) {
+        const equivalent = Math.floor(totalHours / 2);
+        funFacts.push({
+            title: 'En vrai...', subtitle: '',
+            text: pick('ff-eq', [
+                `T'aurais pu enchaîner ${equivalent} films. Ou dormir ${totalDays} jours. T'as fait un choix.`,
+                `${totalDurationLabel}, c'est ${equivalent} films bout à bout. Ou ${Math.max(2, Math.floor(totalHours / 12))} vols Paris-Tokyo. T'as choisi le canapé, et on comprend.`
+            ]),
+            highlight: '🤔', subtext: 'Le bon.'
+        });
+    } else if (totalMinutes > 30) {
+        funFacts.push({ title: 'En vrai...', subtitle: '', text: `${totalDurationLabel} de streaming. Joli début pour cette année.`, highlight: '🤔', subtext: 'Et c\'est que le début.' });
+    }
+    if (isExplorer && uniqueTitles > 30) {
+        funFacts.push({
+            title: 'L\'algo t\'adore', subtitle: '',
+            text: pick('ff-explo', [
+                `${uniqueTitles} titres différents. Tu rends nos recommandations folles (dans le bon sens).`,
+                `${uniqueTitles} titres explorés cette année. Notre catalogue te dit merci pour la visite guidée.`
+            ]),
+            highlight: '🧠', subtext: ''
+        });
+    }
     if (isBinger && topShowTitle) {
         const percentOfTotal = totalMinutes > 0 ? Math.round((topShowMinutes / totalMinutes) * 100) : 0;
         funFacts.push({
-            title: 'Confession time',
-            subtitle: '',
-            text: `"${topShowTitle}" représente ${percentOfTotal}% de ton temps total. C'est de l'engagement.`,
-            highlight: '💍',
-            subtext: 'Ou de l\'obsession. Mais qui compte ?'
+            title: 'Petite confession', subtitle: '',
+            text: pick('ff-binge', [
+                `"${topShowTitle}" = ${percentOfTotal}% de ton temps total. Ça, c'est de l'engagement.`,
+                `${percentOfTotal}% de ton année entière sur "${topShowTitle}". Un placement assumé.`
+            ]),
+            highlight: '💍', subtext: 'Ou de l\'obsession. On compte pas.'
         });
     }
-
-    // Percentile fun fact
-    if (percentile >= 90) {
-        funFacts.push({
-            title: `Top ${100 - percentile}% des viewers`,
-            subtitle: 'Tu es dans l\'élite',
-            text: `Tu regardes plus que ${percentile}% des utilisateurs Movix. On devrait te donner un badge.`,
-            highlight: '🏆',
-            subtext: ''
-        });
+    if (percentile != null && percentile >= 90) {
+        funFacts.push({ title: `Top ${100 - percentile}% des viewers`, subtitle: 'Carrément l\'élite', text: `Tu regardes plus que ${percentile}% des gens sur Movix. Médaille méritée.`, highlight: '🏆', subtext: '' });
     }
-
-    // Session length fun fact
     if (avgSessionMinutes > 90) {
         funFacts.push({
-            title: 'Sessions marathon',
-            subtitle: '',
-            text: `En moyenne, tes sessions durent ${avgSessionMinutes} minutes. Tu ne fais pas les choses à moitié.`,
-            highlight: '🍿',
-            subtext: 'Netflix and actually chill.'
+            title: 'Sessions marathon', subtitle: '',
+            text: pick('ff-sess', [
+                `Tes sessions durent ${formatDuration(avgSessionMinutes)} en moyenne. Tu fais pas les choses à moitié.`,
+                `${formatDuration(avgSessionMinutes)} par session en moyenne. Quand tu t'installes, c'est pas pour cinq minutes.`
+            ]),
+            highlight: '🍿', subtext: 'Le confort avant tout.'
         });
     }
-
-    // First watch of the year fun fact
+    if (Array.isArray(weekday) && weekday.length > 0) {
+        const topDow = weekday.reduce((a, b) => (b.minutes > a.minutes ? b : a), weekday[0]);
+        if (topDow && topDow.minutes >= 120) {
+            const dayNames = ['', 'dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+            const dayName = dayNames[topDow.dow];
+            funFacts.push({
+                title: `Le ${dayName}, c'est sacré`, subtitle: '',
+                text: pick('ff-dow', [
+                    `Ton jour le plus chargé de l'année : le ${dayName}. ${formatDuration(topDow.minutes)} rien que sur ce créneau hebdo.`,
+                    `S'il fallait te chercher un jour précis, ce serait le ${dayName} : ${formatDuration(topDow.minutes)} cumulées dessus cette année.`
+                ]),
+                highlight: '📅', subtext: ''
+            });
+        }
+    }
+    if (totalActiveDays > 100) {
+        const activePct = Math.min(100, Math.round((totalActiveDays / 365) * 100));
+        funFacts.push({
+            title: `${totalActiveDays} jours actifs`, subtitle: '',
+            text: pick('ff-days', [
+                `T'as lancé Movix ${totalActiveDays} jours cette année — ${activePct}% de tes journées. La fidélité, la vraie.`,
+                `${totalActiveDays} jours avec au moins une session. Presque ${activePct}% de l'année passée ensemble.`
+            ]),
+            highlight: '📆', subtext: ''
+        });
+    }
     if (firstWatchData) {
         const firstDate = new Date(firstWatchData.created_at);
         const dayOfYear = Math.ceil((firstDate - new Date(firstDate.getFullYear(), 0, 1)) / (1000 * 60 * 60 * 24));
         if (dayOfYear <= 3) {
-            funFacts.push({
-                title: 'Pas de temps à perdre',
-                subtitle: '',
-                text: `Ton premier visionnage de ${year} ? "${firstWatchData.content_title}", dès le ${dayOfYear === 1 ? '1er' : dayOfYear + 'ème'} janvier. Tu n'as pas attendu longtemps.`,
-                highlight: '🎆',
-                subtext: ''
-            });
+            funFacts.push({ title: 'Aucune minute à perdre', subtitle: '', text: `Ton premier visionnage de ${year} ? "${firstWatchData.content_title}", dès le ${dayOfYear === 1 ? '1er' : dayOfYear + 'e'} janvier. T'as pas traîné.`, highlight: '🎆', subtext: '' });
         }
     }
-
     if (funFacts.length > 0) {
-        // Pick 1-2 fun facts
-        const shuffled = funFacts.sort(() => 0.5 - Math.random());
-        slides.push({ type: 'fun-fact', ...shuffled[0] });
-        if (shuffled.length > 1 && totalHours > 50) {
-            slides.push({ type: 'fun-fact', ...shuffled[1] });
+        const picked = seededShuffle(funFacts, seed);
+        slides.push({ type: 'fun-fact', ...picked[0] });
+        if (picked.length > 1 && totalHours > 50) {
+            slides.push({ type: 'fun-fact', ...picked[1] });
         }
     }
 
-    // === SLIDE 10: DETAILED STATS ===
+    // === 13. PERSONA — révélation climax (avant-dernier acte) ===
+    const typeLabel = { 'anime': 'les animes', 'movie': 'les films', 'tv': 'les séries', 'live-tv': 'la TV en direct' };
+    const vibeTemplates = [
+        {
+            condition: dominantPercent > 80,
+            texts: [
+                `${dominantPercent}% de ton temps sur ${typeLabel[dominantType.content_type]}. Tu sais ce que t'aimes, et tu assumes à fond.`,
+                `${typeLabel[dominantType.content_type]} à ${dominantPercent}% de ton temps : un choix clair, net et totalement assumé.`
+            ]
+        },
+        {
+            condition: dominantPercent > 50,
+            texts: [
+                `Ta vibe ? Surtout ${typeLabel[dominantType.content_type]}, avec ce qu'il faut de variété.`,
+                `${typeLabel[dominantType.content_type]} en majorité, le reste en exploration. Le bon dosage.`
+            ]
+        },
+        {
+            condition: true,
+            texts: [
+                `Toi, c'est un peu de tout. L'équilibre, le vrai.`,
+                `Films, séries, animes : tu refuses de choisir, et t'as bien raison.`
+            ]
+        }
+    ];
     slides.push({
-        type: 'detailed-stats',
-        title: 'Tes Statistiques',
-        subtitle: 'En détail',
-        text: 'Le résumé complet de ton année.',
-        highlight: '📊',
-        subtext: ''
+        type: 'persona',
+        title: persona.title,
+        subtitle: persona.subtitle,
+        text: pick('persona', vibeTemplates.find(t => t.condition).texts),
+        highlight: persona.emoji,
+        subtext: persona.description
     });
 
-    // === SLIDE 8: CLOSING ===
+    // === 14. DETAILED STATS ===
+    slides.push({ type: 'detailed-stats', title: 'Tes stats', subtitle: 'En détail', text: 'Le récap complet de ton année.', highlight: '📊', subtext: '' });
+
+    // === 15. CLOSING (rendu générique de fin côté front) ===
     slides.push({
         type: 'closing',
-        title: `C'était ${year}.`,
-        subtitle: 'Avec toi.',
-        text: `${totalDurationLabel}. ${uniqueTitles} titres. 1 seul toi. Merci d'avoir passé cette année sur Movix.`,
+        title: pick('closing-t', [`On remet ça en ${year + 1} ?`, `${year}, c'est dans la boîte.`]),
+        subtitle: pick('closing-st', ['Nous, on est partants.', 'Clap de fin.']),
+        text: pick('closing', [
+            `${totalDurationLabel}. ${uniqueTitles} titres. 1 seul toi. Merci d'avoir passé l'année sur Movix.`,
+            `${totalDurationLabel} de visionnage, ${uniqueTitles} titres traversés, et une année qui te ressemble. Merci d'avoir été là.`
+        ]),
         highlight: '💜',
-        subtext: 'À l\'année prochaine ?'
+        subtext: pick('closing-s', ['Cette année était validée.', 'On garde ta place au chaud.', 'Même heure, même canapé ?'])
     });
 
     return slides;
 }
+
 
 module.exports = { router, initWrappedRoutes, initTables };

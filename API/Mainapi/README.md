@@ -69,6 +69,16 @@ Le fichier `API/Mainapi/.env.example` est la référence complète. En pratique,
 
 Certaines intégrations sont très spécifiques à des sources données, par exemple les cookies `DARKIWORLD_*`, `FSTREAM_LOGIN_*` ou `XTREAM_*`.
 
+## Source téléchargements (Darkino)
+
+La source téléchargements (`routes/darkiworld.js` + `utils/darkiworldSqlite.js`) lit des snapshots SQLite locaux au lieu de scraper à chaud : `mirror.sqlite`, `darkino.sqlite` et `links_small.sqlite`. Ces fichiers ne sont pas versionnés — il faut les récupérer et les extraire dans `darkino-backups/` :
+
+1. Télécharger l'archive : https://pixeldrain.com/u/n2M1s1MA
+2. Extraire les `.sqlite` dans `API/Mainapi/darkino-backups/`
+3. (Optionnel) pointer `DARKIWORLD_SQLITE_DIR` vers un autre dossier absolu — ex Pterodactyl : `/home/container/darkino-backups`
+
+Sans ces fichiers, chaque décodage de lien renvoie `sqlite_miss` (le fallback live hydracker ne s'active que si `HYDRACKER_LIVE_ENABLED=true`).
+
 ## Points d'entrée utiles
 
 - auth et profils : `routes/authRoutes.js`, `routes/sessions.js`, `routes/profiles.js`

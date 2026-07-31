@@ -90,6 +90,61 @@ if (cluster.isPrimary ?? cluster.isMaster) {
 ╚═══════════════════════════════════════════════════════╝
   `);
 
+  // === WORKER RECYCLE (anti-leak mitigation) ================================
+  // Root cause of the multi-day RSS climb is not yet confirmed. Recycling each
+  // worker one-by-one on a long interval caps how far any slow leak can grow
+  // before that worker's memory is reclaimed by a fresh fork. Each worker gets
+  // the same graceful 'shutdown' message the SIGTERM path sends, so in-flight
+  // requests drain via server.close() first; the cluster.on('exit') handler
+  // above then forks the replacement.
+  //
+  // Tunables (env):
+  //   WORKER_RECYCLE_INTERVAL_MS  default 12h   — set 0 to disable entirely
+  //   WORKER_RECYCLE_STAGGER_MS   default 5min  — gap between each worker so
+  //                                               capacity never drops hard
+  const WORKER_RECYCLE_INTERVAL_MS = (() => {
+    const raw = process.env.WORKER_RECYCLE_INTERVAL_MS;
+    if (raw === undefined || raw === '') return 12 * 60 * 60 * 1000;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 12 * 60 * 60 * 1000;
+  })();
+  const WORKER_RECYCLE_STAGGER_MS =
+    parseInt(process.env.WORKER_RECYCLE_STAGGER_MS, 10) || (5 * 60 * 1000);
+
+  if (WORKER_RECYCLE_INTERVAL_MS > 0) {
+    console.log(
+      `🔁 Worker recycle: every ${Math.round(WORKER_RECYCLE_INTERVAL_MS / 3600000)}h, ` +
+      `stagger ${Math.round(WORKER_RECYCLE_STAGGER_MS / 60000)}min`,
+    );
+    const recycleTimer = setInterval(() => {
+      if (isShuttingDown) return;
+      const workers = Object.values(cluster.workers || {});
+      if (workers.length === 0) return;
+      console.log(`🔁 Worker recycle cycle starting — ${workers.length} workers`);
+      workers.forEach((worker, idx) => {
+        setTimeout(() => {
+          if (isShuttingDown || worker.isDead()) return;
+          try {
+            console.log(`🔁 Recycling worker pid=${worker.process.pid}`);
+            worker.send('shutdown');
+            // Force-kill fallback if the worker's graceful 15s server.close +
+            // resource cleanup hasn't exited it within 35s.
+            setTimeout(() => {
+              try {
+                if (!worker.isDead()) worker.kill('SIGKILL');
+              } catch (_) { /* ignore */ }
+            }, 35000);
+          } catch (e) {
+            console.warn(`🔁 Recycle worker ${worker.process?.pid} failed: ${e.message}`);
+          }
+        }, idx * WORKER_RECYCLE_STAGGER_MS);
+      });
+    }, WORKER_RECYCLE_INTERVAL_MS);
+    recycleTimer.unref();
+  } else {
+    console.log('🔁 Worker recycle disabled (WORKER_RECYCLE_INTERVAL_MS=0)');
+  }
+
   // Le master ne fait RIEN d'autre — pas de require express, mysql, redis, etc.
   return;
 }
@@ -101,12 +156,79 @@ if (cluster.isPrimary ?? cluster.isMaster) {
 process.env.UV_THREADPOOL_SIZE = 8; // 8 threads libuv par worker (6 workers x 8 = 48 threads total)
 
 const http = require('http');
+const https = require('https');
+const v8 = require('v8');
+const path = require('path');
 const { app, appReady } = require('./app');
 const { redis } = require('./config/redis');
 const { shutdownCycleTLS, refreshProxyScrapeProxies } = require('./utils/proxyManager');
 const { getPool } = require('./mysqlPool');
 
 const PORT = 25565;
+
+// ===========================================================================
+// === MEMORY DIAGNOSTICS (worker) ===========================================
+// ===========================================================================
+// The cluster RSS climbs continuously over multi-day uptime with no confirmed
+// root cause yet. These hooks gather the evidence:
+//   - Periodic [memstats] line — feed it to a graph to see the leak slope and
+//     which segment (heap vs external/arrayBuffers vs sockets) is growing.
+//   - SIGUSR2 → v8 heap snapshot on disk — open in Chrome DevTools, compare two
+//     snapshots taken hours apart to find the retained object class.
+//     Trigger:  kill -USR2 <worker-pid>
+//
+// Both are read-only and effectively free; safe to keep in production.
+const MEMORY_LOG_INTERVAL_MS = parseInt(process.env.MEMORY_LOG_INTERVAL_MS, 10) || (5 * 60 * 1000);
+const HEAPDUMP_DIR = process.env.HEAPDUMP_DIR || os.tmpdir();
+
+function fmtMB(n) {
+  return `${(Number(n || 0) / 1024 / 1024).toFixed(1)}MB`;
+}
+
+// http.globalAgent.sockets is keyed by `host:port` — its key count is the
+// number of distinct upstream origins currently holding live sockets. A
+// climbing count points at keep-alive socket pool churn.
+function countAgentHosts(agent, prop) {
+  try {
+    return agent && agent[prop] ? Object.keys(agent[prop]).length : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function logMemoryUsage() {
+  const m = process.memoryUsage();
+  console.log(
+    `[memstats] pid=${process.pid} uptime=${Math.round(process.uptime())}s ` +
+    `rss=${fmtMB(m.rss)} heapTotal=${fmtMB(m.heapTotal)} heapUsed=${fmtMB(m.heapUsed)} ` +
+    `external=${fmtMB(m.external)} arrayBuffers=${fmtMB(m.arrayBuffers)} ` +
+    `httpHosts=${countAgentHosts(http.globalAgent, 'sockets')}/` +
+    `${countAgentHosts(http.globalAgent, 'freeSockets')} ` +
+    `httpsHosts=${countAgentHosts(https.globalAgent, 'sockets')}/` +
+    `${countAgentHosts(https.globalAgent, 'freeSockets')}`,
+  );
+}
+
+const memoryLogTimer = setInterval(logMemoryUsage, MEMORY_LOG_INTERVAL_MS);
+memoryLogTimer.unref();
+
+// SIGUSR2 — write a heap snapshot. nodemon also uses SIGUSR2, but production
+// runs node directly so there is no conflict here.
+process.on('SIGUSR2', () => {
+  const snapshotPath = path.join(
+    HEAPDUMP_DIR,
+    `heap-${process.pid}-${Date.now()}.heapsnapshot`,
+  );
+  try {
+    const start = Date.now();
+    v8.writeHeapSnapshot(snapshotPath);
+    console.warn(
+      `[heapdump] pid=${process.pid} written ${snapshotPath} in ${Date.now() - start}ms`,
+    );
+  } catch (e) {
+    console.error(`[heapdump] pid=${process.pid} failed: ${e.message}`);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // startServer — create HTTP server with retry logic
@@ -142,7 +264,6 @@ const startServer = async (retries = 3) => {
   // Backlog increased to 4096 to handle burst connections
   server.listen(PORT, '0.0.0.0', 4096, () => {
     console.log(`Serveur démarré sur le port ${PORT} - Process ${process.pid}`);
-    console.log(`Proxy service available at http://localhost:${PORT}/proxy/`);
     console.log(`Keep-Alive configuré: timeout=${server.keepAliveTimeout}ms, max=1000`);
     console.log(`Performance tuning: UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE}, RequestTimeout=${server.requestTimeout}ms`);
   });
@@ -167,6 +288,7 @@ let activeServer = null;
 startServer().then((server) => {
   activeServer = server;
   console.log(`✅ Worker ${process.pid} - Serveur démarré sur le port ${PORT}`);
+  logMemoryUsage(); // baseline [memstats] line at boot
 }).catch((error) => {
   console.error(`❌ Worker ${process.pid} - Échec du démarrage:`, error);
   process.exit(1);

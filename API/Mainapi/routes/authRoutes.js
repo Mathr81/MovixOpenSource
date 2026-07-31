@@ -346,6 +346,13 @@ async function finalizeResolvedSession(req, {
     fallbackResolvedProvider
   );
 
+  // Si le pseudo provider (Discord/Google) viole la policy (trop long, contient
+  // des caractères de contrôle/zero-width), on remonte un flag pour que le
+  // frontend force l'user à le changer via POST /api/auth/username.
+  const { isProfileNameValid } = require('../utils/syncPolicy');
+  const currentUsername = authData?.userProfile?.username;
+  const requiresUsernameChange = !isProfileNameValid(currentUsername);
+
   return {
     success: true,
     sessionId,
@@ -358,6 +365,7 @@ async function finalizeResolvedSession(req, {
       linkProvider: linkedTarget?.provider || null,
     },
     authData,
+    requiresUsernameChange,
   };
 }
 
@@ -607,6 +615,10 @@ router.get('/links', async (req, res) => {
       || (isSupportedProvider(resolvedProviderCandidate) ? resolvedProviderCandidate : null)
       || (auth.userType === 'bip39' ? 'bip39' : null);
 
+    const { isProfileNameValid } = require('../utils/syncPolicy');
+    const currentUsername = authData?.userProfile?.username;
+    const requiresUsernameChange = !isProfileNameValid(currentUsername);
+
     return res.status(200).json({
       success: true,
       account: {
@@ -618,6 +630,8 @@ router.get('/links', async (req, res) => {
         manageWithProvider: accountProvider,
       },
       links: getProviderStatusMap(records),
+      requiresUsernameChange,
+      currentUsername: currentUsername || null,
     });
   } catch (error) {
     console.error('Error getting account links:', error);
@@ -724,6 +738,79 @@ router.delete('/links/:provider', async (req, res) => {
   } catch (error) {
     console.error('Error unlinking account:', error);
     return res.status(500).json({ success: false, error: 'Erreur lors de la suppression de la liaison' });
+  }
+});
+
+// POST /username — l'user met à jour son pseudo (auth.userProfile.username)
+// quand le pseudo provider (Discord/Google) dépasse 32 caractères ou contient
+// des caractères dangereux. Le frontend appelle ça après affichage de la
+// modale bloquante. Met aussi à jour le profil par défaut si son nom matchait
+// l'ancien username (pour garder la cohérence visuelle).
+router.post('/username', authRateLimit, async (req, res) => {
+  try {
+    const auth = await getAuthIfValid(req);
+    if (!auth || !['oauth', 'bip39'].includes(auth.userType)) {
+      return res.status(401).json({ success: false, error: 'Non autorisé' });
+    }
+
+    const { validateProfileName, SyncPolicyError } = require('../utils/syncPolicy');
+    let cleanedName;
+    try {
+      cleanedName = validateProfileName(req.body?.username);
+    } catch (e) {
+      if (e instanceof SyncPolicyError) {
+        return res.status(e.status).json({ success: false, error: e.message, code: e.code });
+      }
+      throw e;
+    }
+
+    const { readUserData, writeUserData } = getSyncModule();
+    const userData = await readUserData(auth.userType, auth.userId) || {};
+
+    let parsedAuth = null;
+    if (typeof userData.auth === 'string') {
+      try { parsedAuth = JSON.parse(userData.auth); } catch { parsedAuth = null; }
+    }
+    if (!parsedAuth || !parsedAuth.userProfile) {
+      // Pas de userProfile stocké : on en crée un minimal pour porter le nom.
+      parsedAuth = {
+        ...(parsedAuth || {}),
+        userProfile: {
+          id: String(auth.userId),
+          provider: auth.userType === 'bip39' ? 'bip39' : (parsedAuth?.provider || 'oauth'),
+          username: cleanedName,
+          createdAt: new Date().toISOString(),
+        },
+      };
+    } else {
+      const oldUsername = parsedAuth.userProfile.username;
+      parsedAuth.userProfile = { ...parsedAuth.userProfile, username: cleanedName };
+      // Met aussi à jour le nom du profil par défaut si l'user n'a jamais
+      // renommé son profil (sinon on ne touche pas — il a fait un choix conscient).
+      if (Array.isArray(userData.profiles) && typeof oldUsername === 'string') {
+        const defaultProfile = userData.profiles.find((p) => p && p.isDefault);
+        if (defaultProfile && defaultProfile.name === oldUsername) {
+          defaultProfile.name = cleanedName;
+        }
+      }
+    }
+
+    userData.auth = JSON.stringify(parsedAuth);
+    userData.lastUpdated = Date.now();
+
+    const success = await writeUserData(auth.userType, auth.userId, userData);
+    if (!success) {
+      return res.status(500).json({ success: false, error: 'Impossible de sauvegarder le nouveau pseudo' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      username: cleanedName,
+      authData: parsedAuth,
+    });
+  } catch (error) {
+    console.error('Error updating username:', error);
+    return res.status(500).json({ success: false, error: 'Erreur lors de la mise à jour du pseudo' });
   }
 });
 

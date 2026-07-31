@@ -130,7 +130,7 @@ const Header: React.FC = () => {
         { name: t('nav.settings'), path: '/settings', icon: <Settings size={20} />, color: 'gray', desc: t('nav.settingsDesc') },
         { name: t('nav.helpHub'), path: '/help', icon: <HelpCircle size={20} />, color: 'indigo', desc: t('nav.helpHubDesc') },
         { name: t('nav.github'), path: 'https://github.com/movixcorp/MovixOpenSource', icon: <Github size={20} />, color: 'gray', desc: t('nav.githubDesc'), external: true },
-        { name: t('footer.ourUrls'), path: 'https://movix.health', icon: <ExternalLink size={20} />, color: 'gray', desc: t('nav.officialLinksDesc'), external: true },
+        { name: t('footer.ourUrls'), path: 'https://movix.online', icon: <ExternalLink size={20} />, color: 'gray', desc: t('nav.officialLinksDesc'), external: true },
       ]
     },
   ].filter(g => g.items.length > 0), [t, isVip]);

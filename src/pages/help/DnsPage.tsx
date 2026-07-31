@@ -21,7 +21,7 @@ const EXTERNAL_RESOURCES: Array<{
     href: 'https://developers.cloudflare.com/1.1.1.1/setup/',
   },
   { labelKey: 'helpDns.otherChangeTonDns', href: 'https://changetondns.fr/' },
-  { labelKey: 'helpDns.otherMirrorsMovixHealth', href: 'https://movix.health' },
+  { labelKey: 'helpDns.otherMirrorsMovixHealth', href: 'https://movix.online' },
   { labelKey: 'helpDns.otherMirrors', href: 'https://rentry.co/movix' },
   {
     labelKey: 'helpDns.otherTelegram',

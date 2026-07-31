@@ -201,9 +201,12 @@ async function searchCoflixByTitle(title, mediaType, releaseYear) {
 
     return filteredResults;
   } catch (error) {
-    console.error(
-      `Erreur lors de la recherche sur Coflix pour ${title}: ${deps.formatCoflixError(error)}`,
-    );
+    // Global coflix.band 429 is announced once by makeCoflixRequest's cooldown — don't spam per title.
+    if (!error?.coflixSiteRateLimited) {
+      console.error(
+        `Erreur lors de la recherche sur Coflix pour ${title}: ${deps.formatCoflixError(error)}`,
+      );
+    }
     throw error;
   }
 }
@@ -680,7 +683,7 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
             (ep) => parseInt(ep.number) === parseInt(episodeNumber),
           );
           if (episode && episode.links) {
-            episodeUrl = episode.links.startsWith("https://coflix.date")
+            episodeUrl = episode.links.startsWith("https://coflix.trade")
               ? `${episode.links}`
               : episode.links;
           }
@@ -688,7 +691,7 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
       }
 
       if (!episodeUrl) {
-        episodeUrl = `https://coflix.date/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
+        episodeUrl = `https://coflix.trade/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
       }
 
       try {

@@ -38,7 +38,7 @@ const Footer: React.FC = () => {
             <h3 className="text-white text-lg font-semibold mb-4">{t('footer.information')}</h3>
             <div className="space-y-6">
               <a
-                href="https://movix.health"
+                href="https://movix.online"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex flex-row items-center gap-3 text-gray-50 font-medium opacity-75 transition-all hover:opacity-100"
@@ -245,7 +245,7 @@ const Footer: React.FC = () => {
             <p className="mt-1">
               {t('footer.madeWith')} ❤️ {t('footer.by')}{" "}
               <a
-                href="https://t.me/movix_site"
+                href="https://mysticsaba.com/"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-indigo-400 hover:text-indigo-300 transition-colors duration-200"

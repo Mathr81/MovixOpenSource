@@ -17,6 +17,8 @@ const { verifyAccessKey, invalidateVipCache } = require('../checkVip');
 const { ANIME_SAMA_CACHE_DIR } = require('../utils/cacheManager');
 const { createRedisRateLimitStore } = require('../utils/redisRateLimitStore');
 const { logDownloadLinkAction } = require('../utils/downloadLinksHistory');
+const { resolveAdminIdentity } = require('../utils/adminIdentity');
+const { readUserData } = require('./sync');
 
 function parseAccessKeyExpiresAt(value) {
   if (value === undefined || value === null || value === '') {
@@ -147,11 +149,15 @@ router.get('/links/:type/:id', async (req, res) => {
       });
     }
 
-    // Parser les liens JSON
-    const result = rows.map(row => ({
-      ...row,
-      links: typeof row.links === 'string' ? JSON.parse(row.links) : row.links
-    }));
+    // Parser les liens JSON. On retire le stamp `added_by` (identité de
+    // l'uploader) car cet endpoint est PUBLIC — pas de fuite d'IDs.
+    const result = rows.map(row => {
+      const parsed = typeof row.links === 'string' ? JSON.parse(row.links) : row.links;
+      return {
+        ...row,
+        links: Array.isArray(parsed) ? parsed.map(stripLinkOwner) : parsed
+      };
+    });
 
     res.json({
       success: true,
@@ -262,6 +268,44 @@ router.get('/check-vip', async (req, res) => {
  * Add or update streaming links
  * Body: { type: 'movie'|'tv', id: string, links: array, season?: number, episode?: number }
  */
+/**
+ * Streaming links live in the `links` JSON column as either a plain URL string
+ * (legacy / scraper-added) or an object ({ url, isVip, label, language, ... }).
+ * Links added through the admin panel are stamped with `added_by` (same shape as
+ * download links) so deletion can be scoped: an uploader may only remove the
+ * streaming links they added; a full admin may remove any. Un-stamped links
+ * (legacy strings/objects) have no owner and are therefore admin-only.
+ */
+function streamingLinkUrl(link) {
+  return typeof link === 'string' ? link : (link && link.url) || JSON.stringify(link);
+}
+
+function stampStreamingLink(link, { adminId, userType }) {
+  const obj = typeof link === 'string' ? { url: link } : { ...link };
+  obj.added_at = new Date().toISOString();
+  obj.added_by = { id: String(adminId), auth_type: userType === 'bip39' ? 'bip-39' : 'oauth' };
+  return obj;
+}
+
+function ownsStreamingLink(link, admin) {
+  const stamp = link && typeof link === 'object' ? link.added_by : null;
+  if (!stamp) return false;
+  const myAuthType = admin.userType === 'bip39' ? 'bip-39' : 'oauth';
+  return String(stamp.id) === String(admin.userId) && stamp.auth_type === myAuthType;
+}
+
+function canModifyStreamingLink(link, admin) {
+  return admin.role === 'admin' || ownsStreamingLink(link, admin);
+}
+
+// Removes the `added_by` owner stamp before returning links on the PUBLIC
+// endpoint, so uploader user IDs are not leaked to anonymous visitors.
+function stripLinkOwner(link) {
+  if (!link || typeof link !== 'object') return link;
+  const { added_by, ...rest } = link;
+  return rest;
+}
+
 router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
   try {
     const { type, id, links, season, episode } = req.body;
@@ -294,8 +338,9 @@ router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
         [id]
       );
 
-      let finalLinks = links;
-      let movieUrlsToLog = links.map(l => typeof l === 'string' ? l : l.url || JSON.stringify(l));
+      const stampOpts = { adminId: req.admin.userId, userType: req.admin.userType };
+      let finalLinks = links.map(l => stampStreamingLink(l, stampOpts));
+      let movieUrlsToLog = links.map(streamingLinkUrl);
       if (existing.length > 0 && existing[0].links) {
         // Parse existing links
         const existingLinks = typeof existing[0].links === 'string'
@@ -303,17 +348,14 @@ router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
           : existing[0].links;
 
         // Merge with new links, avoiding duplicates
-        const existingUrls = new Set(existingLinks.map(link =>
-          typeof link === 'string' ? link : link.url || JSON.stringify(link)
-        ));
+        const existingUrls = new Set(existingLinks.map(streamingLinkUrl));
 
-        const newLinksToAdd = links.filter(link => {
-          const url = typeof link === 'string' ? link : link.url || JSON.stringify(link);
-          return !existingUrls.has(url);
-        });
+        const newLinksToAdd = links.filter(link => !existingUrls.has(streamingLinkUrl(link)));
 
-        finalLinks = [...existingLinks, ...newLinksToAdd];
-        movieUrlsToLog = newLinksToAdd.map(l => typeof l === 'string' ? l : l.url || JSON.stringify(l));
+        // Keep existing links untouched (preserve their original owner stamp);
+        // only the freshly added ones get stamped with the current uploader.
+        finalLinks = [...existingLinks, ...newLinksToAdd.map(l => stampStreamingLink(l, stampOpts))];
+        movieUrlsToLog = newLinksToAdd.map(streamingLinkUrl);
       }
 
       // Log each new streaming link as 'added' in history (for leaderboard scoring)
@@ -359,8 +401,9 @@ router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
         [id, season, episode]
       );
 
-      let finalLinks = links;
-      let streamingUrlsToLog = links.map(l => typeof l === 'string' ? l : l.url || JSON.stringify(l));
+      const stampOpts = { adminId: req.admin.userId, userType: req.admin.userType };
+      let finalLinks = links.map(l => stampStreamingLink(l, stampOpts));
+      let streamingUrlsToLog = links.map(streamingLinkUrl);
       if (existing.length > 0 && existing[0].links) {
         // Parse existing links
         const existingLinks = typeof existing[0].links === 'string'
@@ -368,17 +411,14 @@ router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
           : existing[0].links;
 
         // Merge with new links, avoiding duplicates
-        const existingUrls = new Set(existingLinks.map(link =>
-          typeof link === 'string' ? link : link.url || JSON.stringify(link)
-        ));
+        const existingUrls = new Set(existingLinks.map(streamingLinkUrl));
 
-        const newLinksToAdd = links.filter(link => {
-          const url = typeof link === 'string' ? link : link.url || JSON.stringify(link);
-          return !existingUrls.has(url);
-        });
+        const newLinksToAdd = links.filter(link => !existingUrls.has(streamingLinkUrl(link)));
 
-        finalLinks = [...existingLinks, ...newLinksToAdd];
-        streamingUrlsToLog = newLinksToAdd.map(l => typeof l === 'string' ? l : l.url || JSON.stringify(l));
+        // Keep existing links untouched (preserve their original owner stamp);
+        // only the freshly added ones get stamped with the current uploader.
+        finalLinks = [...existingLinks, ...newLinksToAdd.map(l => stampStreamingLink(l, stampOpts))];
+        streamingUrlsToLog = newLinksToAdd.map(streamingLinkUrl);
       }
 
       // Log each new streaming link as 'added' in history (for leaderboard scoring)
@@ -439,12 +479,18 @@ router.post('/admin/links', isUploaderOrAdmin, async (req, res) => {
 
 /**
  * DELETE /admin/links
- * Delete streaming links
- * Body: { type: 'movie'|'tv', id: string, season?: number, episode?: number }
+ * Delete streaming links from a movie / TV episode.
+ * Body: { type, id, season?, episode?, url? }
+ *  - With `url`: delete that single link (ownership enforced — uploaders may
+ *    only delete a link they added; admins may delete any).
+ *  - Without `url`: delete every link the caller is allowed to remove
+ *    (uploader → only their own links; admin → all). Links belonging to other
+ *    uploaders are preserved. Clears the `links` array in place — the film /
+ *    episode row itself is kept (so download_links and other columns survive).
  */
 router.delete('/admin/links', isUploaderOrAdmin, async (req, res) => {
   try {
-    const { type, id, season, episode } = req.body;
+    const { type, id, season, episode, url } = req.body;
 
     // Validation
     if (!type || !id) {
@@ -458,118 +504,96 @@ router.delete('/admin/links', isUploaderOrAdmin, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Type invalide. Utilisez "movie" ou "tv"' });
     }
 
+    if (type === 'tv' && (season === undefined || season === null || episode === undefined || episode === null)) {
+      return res.status(400).json({ success: false, error: 'Pour les séries, season et episode sont requis' });
+    }
+
     const pool = getPool();
 
+    // Load the current links array for the targeted movie / episode.
+    let existing;
     if (type === 'movie') {
-      // Fetch existing links for history logging before deletion
-      const [existingFilmRows] = await pool.execute('SELECT links FROM films WHERE id = ?', [id]);
-      if (existingFilmRows.length > 0 && existingFilmRows[0].links) {
-        const existingLinks = typeof existingFilmRows[0].links === 'string'
-          ? JSON.parse(existingFilmRows[0].links)
-          : existingFilmRows[0].links;
-        for (const link of (existingLinks || [])) {
-          const url = typeof link === 'string' ? link : link.url || JSON.stringify(link);
-          try {
-            await logDownloadLinkAction({
-              adminId: req.admin.userId,
-              userType: req.admin.userType,
-              action: 'removed',
-              mediaType: 'movie',
-              tmdbId: id,
-              season: null,
-              episode: null,
-              linkUrl: url,
-              linkType: 'streaming',
-            });
-          } catch (e) {
-            console.error('Failed to log streaming link removal:', e);
-          }
-        }
-      }
-
-      const [result] = await pool.execute('DELETE FROM films WHERE id = ?', [id]);
-
-      if (result.affectedRows === 0) {
+      const [rows] = await pool.execute('SELECT links FROM films WHERE id = ?', [id]);
+      if (rows.length === 0) {
         return res.status(404).json({ success: false, error: 'Film non trouvé' });
       }
-
-      res.json({
-        success: true,
-        message: 'Film supprimé avec succès',
-        type: 'movie',
-        id
-      });
-
+      existing = rows[0].links
+        ? (typeof rows[0].links === 'string' ? JSON.parse(rows[0].links) : rows[0].links)
+        : [];
     } else {
-      // Pour les séries
-      // Fetch existing links for history logging before deletion
-      let fetchQuery, fetchParams;
-      if (season && episode) {
-        fetchQuery = 'SELECT links, season_number, episode_number FROM series WHERE series_id = ? AND season_number = ? AND episode_number = ?';
-        fetchParams = [id, season, episode];
-      } else if (season) {
-        fetchQuery = 'SELECT links, season_number, episode_number FROM series WHERE series_id = ? AND season_number = ?';
-        fetchParams = [id, season];
-      } else {
-        fetchQuery = 'SELECT links, season_number, episode_number FROM series WHERE series_id = ?';
-        fetchParams = [id];
+      const [rows] = await pool.execute(
+        'SELECT links FROM series WHERE series_id = ? AND season_number = ? AND episode_number = ?',
+        [id, season, episode]
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ success: false, error: 'Épisode non trouvé' });
       }
-      const [existingSeriesRows] = await pool.execute(fetchQuery, fetchParams);
-      for (const row of existingSeriesRows) {
-        if (!row.links) continue;
-        const existingLinks = typeof row.links === 'string' ? JSON.parse(row.links) : row.links;
-        for (const link of (existingLinks || [])) {
-          const url = typeof link === 'string' ? link : link.url || JSON.stringify(link);
-          try {
-            await logDownloadLinkAction({
-              adminId: req.admin.userId,
-              userType: req.admin.userType,
-              action: 'removed',
-              mediaType: 'tv',
-              tmdbId: id,
-              season: row.season_number,
-              episode: row.episode_number,
-              linkUrl: url,
-              linkType: 'streaming',
-            });
-          } catch (e) {
-            console.error('Failed to log streaming link removal:', e);
-          }
-        }
-      }
-
-      let query, params;
-
-      if (season && episode) {
-        // Supprimer un épisode spécifique
-        query = 'DELETE FROM series WHERE series_id = ? AND season_number = ? AND episode_number = ?';
-        params = [id, season, episode];
-      } else if (season) {
-        // Supprimer toute une saison
-        query = 'DELETE FROM series WHERE series_id = ? AND season_number = ?';
-        params = [id, season];
-      } else {
-        // Supprimer toute la série
-        query = 'DELETE FROM series WHERE series_id = ?';
-        params = [id];
-      }
-
-      const [result] = await pool.execute(query, params);
-
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ success: false, error: 'Aucune donnée trouvée à supprimer' });
-      }
-
-      res.json({
-        success: true,
-        message: `${result.affectedRows} épisode(s) supprimé(s) avec succès`,
-        type: 'tv',
-        id,
-        ...(season && { season }),
-        ...(episode && { episode }),
-        deletedCount: result.affectedRows
-      });
+      existing = rows[0].links
+        ? (typeof rows[0].links === 'string' ? JSON.parse(rows[0].links) : rows[0].links)
+        : [];
     }
+    existing = Array.isArray(existing) ? existing : [];
+
+    let remaining;
+    let removed;
+    if (url) {
+      // Single-link delete.
+      const target = existing.find(l => streamingLinkUrl(l) === url);
+      if (!target) {
+        return res.status(404).json({ success: false, error: 'Lien non trouvé' });
+      }
+      if (!canModifyStreamingLink(target, req.admin)) {
+        return res.status(403).json({ success: false, error: 'Vous ne pouvez supprimer que les liens que vous avez ajoutés' });
+      }
+      remaining = existing.filter(l => streamingLinkUrl(l) !== url);
+      removed = [target];
+    } else {
+      // Bulk delete, scoped to what the caller owns.
+      removed = existing.filter(l => canModifyStreamingLink(l, req.admin));
+      remaining = existing.filter(l => !canModifyStreamingLink(l, req.admin));
+      if (removed.length === 0) {
+        return res.status(403).json({ success: false, error: 'Aucun lien vous appartenant à supprimer' });
+      }
+    }
+
+    const remainingJson = JSON.stringify(remaining);
+    if (type === 'movie') {
+      await pool.execute('UPDATE films SET links = ? WHERE id = ?', [remainingJson, id]);
+    } else {
+      await pool.execute(
+        'UPDATE series SET links = ? WHERE series_id = ? AND season_number = ? AND episode_number = ?',
+        [remainingJson, id, season, episode]
+      );
+    }
+
+    // History logging (leaderboard scoring) for each removed link.
+    for (const link of removed) {
+      try {
+        await logDownloadLinkAction({
+          adminId: req.admin.userId,
+          userType: req.admin.userType,
+          action: 'removed',
+          mediaType: type,
+          tmdbId: id,
+          season: type === 'tv' ? Number(season) : null,
+          episode: type === 'tv' ? Number(episode) : null,
+          linkUrl: streamingLinkUrl(link),
+          linkType: 'streaming',
+        });
+      } catch (e) {
+        console.error('Failed to log streaming link removal:', e);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${removed.length} lien(s) supprimé(s)`,
+      type,
+      id,
+      ...(type === 'tv' && { season, episode }),
+      removedCount: removed.length,
+      totalCount: remaining.length,
+    });
 
   } catch (error) {
     console.error('Error deleting streaming links:', error);
@@ -606,6 +630,16 @@ router.put('/admin/links', isUploaderOrAdmin, async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Pour les séries, season et episode sont requis'
+      });
+    }
+
+    // Full-array replacement would let an uploader overwrite (and thereby delete)
+    // links added by other uploaders, bypassing the per-link ownership check.
+    // Reserve it for full admins; uploaders add via POST and remove via DELETE.
+    if (req.admin.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Les uploaders ne peuvent pas remplacer les liens en masse. Supprimez uniquement vos propres liens.'
       });
     }
 
@@ -661,6 +695,47 @@ router.put('/admin/links', isUploaderOrAdmin, async (req, res) => {
   }
 });
 
+/**
+ * GET /admin/streaming-links/:type/:id  (authed)
+ * Like the public GET /links but KEEPS the `added_by` owner stamp, so the admin
+ * panel can hide the delete button on links the current uploader doesn't own.
+ */
+router.get('/admin/streaming-links/:type/:id', isUploaderOrAdmin, async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const { season, episode } = req.query;
+
+    if (!['movie', 'tv'].includes(type)) {
+      return res.status(400).json({ success: false, error: 'Type must be movie or tv' });
+    }
+
+    const pool = getPool();
+    let links = [];
+    if (type === 'movie') {
+      const [rows] = await pool.execute('SELECT links FROM films WHERE id = ?', [id]);
+      links = rows[0]?.links
+        ? (typeof rows[0].links === 'string' ? JSON.parse(rows[0].links) : rows[0].links)
+        : [];
+    } else {
+      if (season == null || episode == null) {
+        return res.status(400).json({ success: false, error: 'season and episode are required for tv' });
+      }
+      const [rows] = await pool.execute(
+        'SELECT links FROM series WHERE series_id = ? AND season_number = ? AND episode_number = ?',
+        [id, Number(season), Number(episode)]
+      );
+      links = rows[0]?.links
+        ? (typeof rows[0].links === 'string' ? JSON.parse(rows[0].links) : rows[0].links)
+        : [];
+    }
+
+    res.json({ success: true, links: Array.isArray(links) ? links : [] });
+  } catch (error) {
+    console.error('Error fetching streaming links (admin):', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch streaming links' });
+  }
+});
+
 // === ADMIN ROUTES - VIP KEY MANAGEMENT ===
 
 /**
@@ -682,6 +757,173 @@ router.get('/admin/check', isUploaderOrAdmin, async (req, res) => {
   } catch (error) {
     console.error('Admin check error:', error);
     res.status(500).json({ success: false, error: 'Erreur lors de la vérification admin' });
+  }
+});
+
+// =====================================
+// TEAM MANAGEMENT (admins + uploaders) — admin only
+// =====================================
+
+// Normalises an incoming auth type to the DB enum used by the admins table.
+const normalizeAdminAuthType = (raw) => {
+  const v = String(raw || '').toLowerCase();
+  if (v === 'bip39' || v === 'bip-39') return 'bip-39';
+  if (v === 'oauth') return 'oauth';
+  return null;
+};
+
+/**
+ * GET /admin/admins
+ * List every admin + uploader with their resolved identity (first Movix
+ * profile name/avatar).
+ */
+router.get('/admin/admins', isAdmin, async (req, res) => {
+  try {
+    const pool = getPool();
+    const [rows] = await pool.execute('SELECT * FROM admins ORDER BY created_at ASC');
+    const members = await Promise.all(rows.map(async (r) => {
+      const identity = await resolveAdminIdentity(r.user_id, r.auth_type, { preferProfile: true });
+      return {
+        id: r.id,
+        userId: r.user_id,
+        authType: r.auth_type,
+        role: r.role || 'admin',
+        username: identity.username,
+        avatar: identity.avatar,
+        createdAt: r.created_at,
+      };
+    }));
+    res.json({ success: true, members });
+  } catch (error) {
+    console.error('Error listing admins:', error);
+    res.status(500).json({ success: false, error: 'Erreur lors de la récupération de l\'équipe' });
+  }
+});
+
+/**
+ * POST /admin/admins
+ * Add an uploader by their bip39 / oauth user id. Admin only.
+ * Body: { userId, authType: 'oauth' | 'bip39' }
+ */
+router.post('/admin/admins', isAdmin, async (req, res) => {
+  try {
+    const cleanUserId = String(req.body?.userId || '').trim();
+    const normAuth = normalizeAdminAuthType(req.body?.authType);
+    if (!cleanUserId || !normAuth) {
+      return res.status(400).json({ success: false, error: 'userId et authType (oauth ou bip39) requis' });
+    }
+
+    // Confirm the target account actually exists before granting rights.
+    // readUserData returns {} (not null) for a missing file, so check for the
+    // markers a real account always has: at least one profile, or an auth blob.
+    const userType = normAuth === 'bip-39' ? 'bip39' : 'oauth';
+    let userData = null;
+    try {
+      userData = await readUserData(userType, cleanUserId);
+    } catch {
+      userData = null;
+    }
+    const userExists = !!userData && (
+      (Array.isArray(userData.profiles) && userData.profiles.length > 0) || !!userData.auth
+    );
+    if (!userExists) {
+      return res.status(404).json({ success: false, error: 'Aucun utilisateur trouvé avec cet identifiant' });
+    }
+
+    const pool = getPool();
+    // user_id is globally UNIQUE in the admins table.
+    const [existing] = await pool.execute('SELECT id, role FROM admins WHERE user_id = ?', [cleanUserId]);
+    if (existing.length > 0) {
+      return res.status(409).json({ success: false, error: 'Cet utilisateur est déjà admin ou uploader' });
+    }
+
+    await pool.execute(
+      "INSERT INTO admins (user_id, auth_type, role) VALUES (?, ?, 'uploader')",
+      [cleanUserId, normAuth]
+    );
+
+    const identity = await resolveAdminIdentity(cleanUserId, normAuth, { preferProfile: true });
+    res.status(201).json({
+      success: true,
+      member: {
+        userId: cleanUserId,
+        authType: normAuth,
+        role: 'uploader',
+        username: identity.username,
+        avatar: identity.avatar,
+      },
+    });
+  } catch (error) {
+    if (error && error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ success: false, error: 'Cet utilisateur est déjà admin ou uploader' });
+    }
+    console.error('Error adding uploader:', error);
+    res.status(500).json({ success: false, error: 'Erreur lors de l\'ajout de l\'uploader' });
+  }
+});
+
+/**
+ * DELETE /admin/admins/:id
+ * Remove an uploader. Admin only. Admins cannot be removed through this route
+ * (guards against accidental / malicious privilege removal).
+ */
+router.delete('/admin/admins/:id', isAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ success: false, error: 'ID invalide' });
+    }
+    const pool = getPool();
+    const [rows] = await pool.execute('SELECT * FROM admins WHERE id = ?', [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Membre introuvable' });
+    }
+    if ((rows[0].role || 'admin') !== 'uploader') {
+      return res.status(403).json({ success: false, error: 'Seuls les uploaders peuvent être retirés ici' });
+    }
+    await pool.execute('DELETE FROM admins WHERE id = ?', [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error removing uploader:', error);
+    res.status(500).json({ success: false, error: 'Erreur lors du retrait de l\'uploader' });
+  }
+});
+
+/**
+ * GET /admin/team/history?userId=&authType=&page=&limit=
+ * Paginated add/remove action history (streaming + download links) for a given
+ * admin / uploader, so an admin can audit what someone uploaded or deleted.
+ * Admin only.
+ */
+router.get('/admin/team/history', isAdmin, async (req, res) => {
+  try {
+    const userId = String(req.query.userId || '').trim();
+    const normAuth = normalizeAdminAuthType(req.query.authType);
+    if (!userId || !normAuth) {
+      return res.status(400).json({ success: false, error: 'userId et authType requis' });
+    }
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '30'), 10) || 30));
+    const offset = (page - 1) * limit;
+
+    const pool = getPool();
+    const [rows] = await pool.execute(
+      `SELECT action, link_type, media_type, tmdb_id, season, episode, link_url, changed_at
+       FROM download_links_history
+       WHERE admin_id = ? AND admin_auth_type = ?
+       ORDER BY changed_at DESC
+       LIMIT ? OFFSET ?`,
+      [userId, normAuth, limit, offset]
+    );
+    const [countRows] = await pool.execute(
+      'SELECT COUNT(*) AS total FROM download_links_history WHERE admin_id = ? AND admin_auth_type = ?',
+      [userId, normAuth]
+    );
+    const total = countRows[0]?.total || 0;
+    res.json({ success: true, history: rows, total, hasMore: total > offset + rows.length });
+  } catch (error) {
+    console.error('Error fetching team history:', error);
+    res.status(500).json({ success: false, error: 'Erreur lors de la récupération de l\'historique' });
   }
 });
 
@@ -998,6 +1240,28 @@ function mergeDownloadLinks(existing, incoming, { adminId, userType, fullSeason 
   return { merged: [...existingLinks, ...toAdd], added: toAdd };
 }
 
+/**
+ * Ownership check for download links. Each link is stamped with the uploader
+ * that added it (`added_by = { id, auth_type }`, see mergeDownloadLinks).
+ * Returns true only when the stamp matches the current admin's identity.
+ * Links with no `added_by` (legacy, added before attribution existed) are
+ * treated as not-owned.
+ */
+function ownsDownloadLink(link, admin) {
+  const stamp = link && link.added_by;
+  if (!stamp) return false;
+  const myAuthType = admin.userType === 'bip39' ? 'bip-39' : 'oauth';
+  return String(stamp.id) === String(admin.userId) && stamp.auth_type === myAuthType;
+}
+
+/**
+ * Authorises a delete/edit on a single download link. Full admins may modify
+ * any link; uploaders may only modify the links they uploaded themselves.
+ */
+function canModifyDownloadLink(link, admin) {
+  return admin.role === 'admin' || ownsDownloadLink(link, admin);
+}
+
 router.post('/admin/download-links', isUploaderOrAdmin, async (req, res) => {
   try {
     const { type, id, links, season, episode, fullSeason } = req.body;
@@ -1131,11 +1395,15 @@ router.delete('/admin/download-links', isUploaderOrAdmin, async (req, res) => {
         : [];
     }
 
-    const before = existing.length;
-    const remaining = existing.filter(l => l.url !== url);
-    if (remaining.length === before) {
+    const target = existing.find(l => l.url === url);
+    if (!target) {
       return res.status(404).json({ success: false, error: 'Link not found' });
     }
+    // Uploaders may only delete links they uploaded; admins may delete any.
+    if (!canModifyDownloadLink(target, req.admin)) {
+      return res.status(403).json({ success: false, error: 'Vous ne pouvez supprimer que les liens que vous avez ajoutés' });
+    }
+    const remaining = existing.filter(l => l.url !== url);
 
     const remainingJson = JSON.stringify(remaining);
     if (type === 'movie') {
@@ -1209,6 +1477,10 @@ router.put('/admin/download-links', isUploaderOrAdmin, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Link not found' });
     }
     const original = existing[idx];
+    // Uploaders may only edit links they uploaded; admins may edit any.
+    if (!canModifyDownloadLink(original, req.admin)) {
+      return res.status(403).json({ success: false, error: 'Vous ne pouvez modifier que les liens que vous avez ajoutés' });
+    }
     existing[idx] = {
       ...original,
       url: String(newLink.url),

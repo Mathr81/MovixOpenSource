@@ -1,8 +1,10 @@
 package com.movix.app.update
 
 import android.app.DownloadManager
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.database.Cursor
 import android.net.Uri
 import android.os.Build
@@ -99,10 +101,18 @@ class UpdateModule(private val reactContext: ReactApplicationContext) :
 
             val dm = reactContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             val dir = reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?.canonicalFile
                 ?: throw IllegalStateException("External files dir unavailable")
             if (!dir.exists()) dir.mkdirs()
 
-            val target = File(dir, fileName)
+            val target = File(dir, fileName).canonicalFile
+            if (
+                target.parentFile != dir ||
+                !target.extension.equals("apk", ignoreCase = true)
+            ) {
+                promise.reject("INVALID_APK_PATH", "Invalid APK destination")
+                return
+            }
             if (target.exists()) target.delete() // avoid stale leftovers of same name
 
             val request = DownloadManager.Request(parsed)
@@ -192,7 +202,7 @@ class UpdateModule(private val reactContext: ReactApplicationContext) :
         try {
             val file = File(filePath)
             if (!file.exists()) {
-                promise.reject("FILE_NOT_FOUND", "File does not exist: $filePath")
+                promise.reject("FILE_NOT_FOUND", "File does not exist")
                 return
             }
             val md = MessageDigest.getInstance("SHA-256")
@@ -216,21 +226,55 @@ class UpdateModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun installApk(filePath: String, promise: Promise) {
         try {
-            val file = File(filePath)
-            if (!file.exists()) {
-                promise.reject("FILE_NOT_FOUND", "APK not found: $filePath")
+            val updateDir = reactContext
+                .getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?.canonicalFile
+                ?: throw IllegalStateException("External files dir unavailable")
+            val file = File(filePath).canonicalFile
+            if (!file.exists() || !file.isFile) {
+                promise.reject("FILE_NOT_FOUND", "APK file not found")
+                return
+            }
+            if (
+                file.parentFile != updateDir ||
+                !file.extension.equals("apk", ignoreCase = true)
+            ) {
+                promise.reject("INVALID_APK_PATH", "Invalid APK path")
                 return
             }
 
             val authority = "${reactContext.packageName}.updateprovider"
             val uri: Uri = FileProvider.getUriForFile(reactContext, authority, file)
 
-            val intent = Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uri, "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                clipData = ClipData.newRawUri("Movix update", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val installers = reactContext.packageManager.queryIntentActivities(
+                intent,
+                PackageManager.MATCH_DEFAULT_ONLY,
+            )
+            if (installers.isEmpty()) {
+                promise.reject("NO_INSTALLER", "No package installer available")
+                return
+            }
+            installers.forEach {
+                reactContext.grantUriPermission(
+                    it.activityInfo.packageName,
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
 
-            reactContext.startActivity(intent)
+            val activity = currentActivity
+            if (activity != null) {
+                activity.startActivity(intent)
+            } else {
+                reactContext.startActivity(
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("INSTALL_ERROR", e.message ?: "unknown", e)

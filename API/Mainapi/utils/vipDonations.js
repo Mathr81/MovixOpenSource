@@ -499,6 +499,7 @@ async function fetchPaygateTemporaryWallet(callbackUrl) {
   const trackingAddress = String(response.data?.address_in || '').trim();
   const temporaryWalletAddress = String(response.data?.polygon_address_in || '').trim();
   const callbackUrlFromGateway = String(response.data?.callback_url || '').trim();
+  const ipnToken = String(response.data?.ipn_token || '').trim();
 
   if (!trackingAddress) {
     throw new Error('PayGate n\'a pas retourné d\'adresse de suivi');
@@ -507,8 +508,25 @@ async function fetchPaygateTemporaryWallet(callbackUrl) {
   return {
     trackingAddress,
     temporaryWalletAddress: temporaryWalletAddress || null,
-    callbackUrl: callbackUrlFromGateway || null
+    callbackUrl: callbackUrlFromGateway || null,
+    ipnToken: ipnToken || null
   };
+}
+
+// Poll officiel PayGate (payment-status.php) via l'ipn_token retourné par
+// wallet.php. Filet de sécurité quand le callback GET de PayGate n'atteint
+// jamais notre serveur (WAF, timeout, outage) — sinon l'invoice reste bloquée
+// en awaiting_payment alors que le paiement est passé.
+async function fetchPaygatePaymentStatus(ipnToken) {
+  const response = await axios.get(
+    'https://api.paygate.to/control/payment-status.php',
+    {
+      params: { ipn_token: ipnToken },
+      timeout: 15000
+    }
+  );
+
+  return response.data || {};
 }
 
 async function normalizePaygatePaidUsdValue(receivedCoin, paidValue) {
@@ -1063,6 +1081,23 @@ async function refreshInvoiceStatus(pool, invoiceInput, options = {}) {
   }
 
   if (isPaygatePaymentMethod(paymentMethod)) {
+    // Fallback officiel PayGate: si le callback n'est jamais arrivé, on
+    // interroge payment-status.php avec l'ipn_token stocké à la création.
+    // Couvre aussi les invoices expirées côté Movix mais payées côté PayGate.
+    if (invoice.status !== 'paid' && invoice.paygate_ipn_token) {
+      try {
+        const statusPayload = await fetchPaygatePaymentStatus(invoice.paygate_ipn_token);
+        if (String(statusPayload?.status || '').trim().toLowerCase() === 'paid') {
+          return markPaygateInvoicePaidFromStatusPoll(pool, invoice, statusPayload, {
+            actorType: options.actorType || 'system',
+            actorId: options.actorId || null
+          });
+        }
+      } catch (error) {
+        // Non-fatal — poll de secours, le callback reste la voie principale.
+      }
+    }
+
     const isExpired = fromSqlDateTime(invoice.expires_at)?.getTime() < Date.now();
     const shouldExpire = invoice.status === 'awaiting_payment' && isExpired;
 
@@ -1089,8 +1124,10 @@ async function refreshInvoiceStatus(pool, invoiceInput, options = {}) {
         options.actorId || null
       );
     } else {
+      // 60s (pas 25s): payment-status.php est doc'd "casual basis only",
+      // on espace les polls PayGate pour éviter le rate limit.
       await pool.execute(
-        'UPDATE vip_invoices SET next_check_at = DATE_ADD(NOW(), INTERVAL 25 SECOND), updated_at = NOW() WHERE id = ?',
+        'UPDATE vip_invoices SET next_check_at = DATE_ADD(NOW(), INTERVAL 60 SECOND), updated_at = NOW() WHERE id = ?',
         [invoice.id]
       );
     }
@@ -1428,10 +1465,10 @@ async function createPaygateVipInvoice(pool, payload, context = {}) {
        vip_key_value, created_by_user_id, created_by_user_type, created_by_session_id,
        created_ip_hash, expires_at, next_check_at, paygate_tracking_address, paygate_temporary_wallet_address,
        paygate_callback_url, paygate_callback_nonce, paygate_checkout_url, paygate_payer_email,
-       paygate_paid_coin, paygate_paid_value, paygate_paid_txid, created_at, updated_at)
+       paygate_ipn_token, paygate_paid_coin, paygate_paid_value, paygate_paid_txid, created_at, updated_at)
       VALUES (?, 'paygate_hosted', 'awaiting_payment', NULL, ?, ?, ?, 0, 0, ?, ?, ?, NULL,
         -1, 0, 0, NULL, '', ?, 1, NULL, 0, NULL, NULL, ?, ?, ?, ?, ?, NOW(),
-        ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NOW(), NOW())`,
+        ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NOW(), NOW())`,
     [
       publicId,
       pack.amountEur,
@@ -1451,7 +1488,8 @@ async function createPaygateVipInvoice(pool, payload, context = {}) {
       paygateWallet.callbackUrl || callbackUrl,
       callbackNonce,
       checkoutUrl,
-      normalizedEmail
+      normalizedEmail,
+      paygateWallet.ipnToken
     ]
   );
 
@@ -1685,6 +1723,109 @@ async function handlePaygateCallback(pool, payload = {}) {
   }
 
   return refreshedInvoice;
+}
+
+// Marque une invoice PayGate payée depuis un poll payment-status.php confirmé.
+// Même seuil (min ratio USD) et mêmes colonnes que handlePaygateCallback, mais
+// sans nonce : l'ipn_token stocké en DB authentifie déjà la requête sortante.
+async function markPaygateInvoicePaidFromStatusPoll(pool, invoiceInput, statusPayload, options = {}) {
+  const baseInvoice = invoiceInput?.id ? invoiceInput : await fetchInvoiceById(pool, invoiceInput);
+  if (!baseInvoice) return null;
+  if (FINAL_STATUSES.has(baseInvoice.status)) return baseInvoice;
+  if (!isPaygatePaymentMethod(getInvoicePaymentMethod(baseInvoice))) return baseInvoice;
+
+  const paidCoin = String(statusPayload?.coin || '').trim().toLowerCase() || null;
+  const paidTxid = String(statusPayload?.txid_out || '').trim() || null;
+  const paidValue = await normalizePaygatePaidUsdValue(paidCoin, statusPayload?.value_coin);
+  const minimumPaidAmount = roundFiat(parseNumber(baseInvoice.amount_usd) * getPaygateMinPaidRatio());
+  const nextStatus = paidValue >= minimumPaidAmount && paidValue > 0 ? 'paid' : 'partial_payment';
+
+  // Idempotence: poll répété sans changement → pas d'UPDATE ni d'event spam.
+  if (
+    baseInvoice.status === nextStatus
+    && roundFiat(parseNumber(baseInvoice.paygate_paid_value)) === paidValue
+    && (paidTxid || null) === (baseInvoice.paygate_paid_txid || null)
+  ) {
+    return baseInvoice;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [rows] = await connection.execute(
+      'SELECT * FROM vip_invoices WHERE id = ? FOR UPDATE',
+      [baseInvoice.id]
+    );
+    const invoice = rows[0];
+    if (!invoice || FINAL_STATUSES.has(invoice.status)) {
+      await connection.commit();
+      return invoice || null;
+    }
+
+    const shouldMarkPaidAt = nextStatus === 'paid' && !invoice.paid_at;
+
+    await connection.execute(
+      `UPDATE vip_invoices
+        SET status = ?,
+            tx_hash = COALESCE(?, tx_hash),
+            paid_at = CASE WHEN ? THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
+            paygate_paid_coin = COALESCE(?, paygate_paid_coin),
+            paygate_paid_value = ?,
+            paygate_paid_txid = COALESCE(?, paygate_paid_txid),
+            next_check_at = DATE_ADD(NOW(), INTERVAL 25 SECOND),
+            updated_at = NOW()
+        WHERE id = ?`,
+      [
+        nextStatus,
+        paidTxid,
+        shouldMarkPaidAt ? 1 : 0,
+        paidCoin,
+        paidValue,
+        paidTxid,
+        invoice.id
+      ]
+    );
+
+    await logVipInvoiceEvent(
+      connection,
+      invoice.id,
+      'invoice_paygate_status_poll',
+      nextStatus === 'paid'
+        ? 'Paiement PayGate confirmé via payment-status.php (callback manqué).'
+        : 'Poll payment-status.php PayGate: montant insuffisant.',
+      {
+        previousStatus: invoice.status,
+        nextStatus,
+        paidCoin,
+        paidValue,
+        paidTxid,
+        minimumPaidAmount
+      },
+      options.actorType || 'system',
+      options.actorId || null
+    );
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  const refreshed = await fetchInvoiceById(pool, baseInvoice.id);
+  if (refreshed?.status === 'paid') {
+    return deliverInvoiceIfReady(
+      pool,
+      refreshed.id,
+      options.actorType || 'system',
+      options.actorId || null,
+      'paygate_status_poll'
+    );
+  }
+
+  return refreshed;
 }
 
 async function handlePayblisIpn(pool, { publicId, body, sourceIp, headerSignature }) {
@@ -2285,6 +2426,18 @@ async function normalizeVipInvoicePaymentMethods(pool) {
     WHERE payment_method IS NOT NULL
   `);
 
+  // payblis_ref_order is written only by createPayblisVipInvoice, so it is the
+  // authoritative marker of a Payblis invoice. Pin payment_method to 'payblis'
+  // here — both to recover rows a previous migration run mislabelled, and to
+  // stop the autobuy catch-all below (which predates the Payblis method) from
+  // rewriting them to 'autobuy' on every restart.
+  await pool.execute(`
+    UPDATE vip_invoices
+    SET payment_method = 'payblis'
+    WHERE payblis_ref_order IS NOT NULL
+      AND (payment_method IS NULL OR payment_method <> 'payblis')
+  `);
+
   await pool.execute(`
     UPDATE vip_invoices
     SET payment_method = LOWER(TRIM(coin))
@@ -2374,7 +2527,7 @@ async function normalizeVipInvoicePaymentMethods(pool) {
     SET autobuy_gateway = COALESCE(NULLIF(autobuy_gateway, ''), payment_method),
         payment_method = 'autobuy'
     WHERE payment_method IS NOT NULL
-      AND payment_method NOT IN ('btc', 'ltc', 'paygate_hosted', 'autobuy')
+      AND payment_method NOT IN ('btc', 'ltc', 'paygate_hosted', 'autobuy', 'payblis')
   `);
 
   await pool.execute(`
@@ -2449,6 +2602,7 @@ async function ensureVipDonationsTables(pool) {
       paygate_callback_nonce VARCHAR(128) DEFAULT NULL,
       paygate_checkout_url TEXT DEFAULT NULL,
       paygate_payer_email VARCHAR(255) DEFAULT NULL,
+      paygate_ipn_token VARCHAR(512) DEFAULT NULL,
       paygate_paid_coin VARCHAR(64) DEFAULT NULL,
       paygate_paid_value DECIMAL(18,8) DEFAULT NULL,
       paygate_paid_txid VARCHAR(255) DEFAULT NULL,
@@ -2536,6 +2690,12 @@ async function ensureVipDonationsTables(pool) {
     'vip_invoices',
     'paygate_payer_email',
     "`paygate_payer_email` VARCHAR(255) DEFAULT NULL AFTER `paygate_checkout_url`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'paygate_ipn_token',
+    "`paygate_ipn_token` VARCHAR(512) DEFAULT NULL AFTER `paygate_payer_email`"
   );
   await ensureColumnExists(
     pool,

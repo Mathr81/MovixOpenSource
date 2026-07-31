@@ -54,7 +54,7 @@ const CaMarchePlusPage: React.FC = () => {
           ctas: [
             {
               labelKey: 'help.caMarchePlus.cause3CtaMovixHealth',
-              href: 'https://movix.health',
+              href: 'https://movix.online',
               external: true,
             },
             {

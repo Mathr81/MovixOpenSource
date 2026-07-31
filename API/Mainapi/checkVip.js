@@ -9,10 +9,15 @@
  */
 
 const { getPool } = require('./mysqlPool');
+const { LruMap } = require('./utils/lruMap');
 
 // Cache en mémoire pour éviter de spammer MySQL à chaque requête
 // TTL de 5 minutes — si une clé est révoquée, il faut max 5 min pour que ça prenne effet
-const vipCache = new Map();
+// LRU-capped because the cache key is the user-supplied `x-access-key` header:
+// without a cap, a spammer sending random header values could grow the map
+// unboundedly within the 5-min cleanup window.
+const VIP_CACHE_MAX_ENTRIES = 5000;
+const vipCache = new LruMap({ max: VIP_CACHE_MAX_ENTRIES });
 const VIP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /**

@@ -25,6 +25,7 @@ import { AlertService } from './services/alertService';
 import NotificationToast from './components/NotificationToast';
 import { NotificationData } from './types/alerts';
 import RedirectPopup from './components/RedirectPopup';
+import RequireUsernameChange from './components/RequireUsernameChange';
 import { TopProgressBar } from './components/TopProgressBar';
 import SmoothScroll from './components/SmoothScroll';
 import AprilFoolsAdminPage from './pages/AprilFoolsAdminPage';
@@ -602,7 +603,16 @@ const PersistenceManager = () => {
       }
     };
 
-    const handleAuthChanged = () => handleStorageChange(null);
+    const handleAuthChanged = () => {
+      // Re-arm the sync gate while ProfileContext.loadProfiles reloads the new
+      // account's profiles + data. Without this, the ~100-500ms window before
+      // the delayed loadProfiles fires lets setItem writes leak to the new
+      // backend with the previous account's stale selected_profile_id → the
+      // backend returns 404 PROFILE_NOT_FOUND or, worse, writes against the
+      // wrong profile if the id collides.
+      isProfileDataLoadingRef.current = true;
+      handleStorageChange(null);
+    };
 
     // Initialize current user info
     currentUserInfo.current = getUserInfo();
@@ -986,8 +996,22 @@ const PersistenceManager = () => {
         const delta = computeObjectPatch(oldVal, newVal);
         if (delta) {
           const existing = progressOpsMapRef.current.get(key) || { delta: { set: {}, remove: [] as string[] } };
-          existing.delta.set = { ...existing.delta.set, ...delta.set };
-          existing.delta.remove = Array.from(new Set([...(existing.delta.remove || []), ...delta.remove]));
+          const newSet = delta.set || {};
+          const newRemove = Array.isArray(delta.remove) ? delta.remove : [];
+          // Newer ops in this delta win over earlier merged ops queued for
+          // the same key. Without this reconciliation, a remove followed by
+          // a set (or vice versa) within the 10s flush window produced a
+          // merged objPatch with BOTH `set.X` and `remove[X]`; the backend
+          // applies sets first then removes, so `remove` always won and the
+          // user's most recent intent (re-set) was silently dropped.
+          existing.delta.set = { ...existing.delta.set, ...newSet };
+          existing.delta.remove = (existing.delta.remove || []).filter(
+            (entryKey: string) => !Object.prototype.hasOwnProperty.call(newSet, entryKey)
+          );
+          for (const entryKey of newRemove) {
+            delete existing.delta.set[entryKey];
+          }
+          existing.delta.remove = Array.from(new Set([...existing.delta.remove, ...newRemove]));
           progressOpsMapRef.current.set(key, existing);
         } else {
           // If cannot diff, fallback to set
@@ -1310,6 +1334,16 @@ const PersistenceManager = () => {
       // older un-replayed ops every cycle. A hard cap on op count prevents
       // unbounded growth across many failed cycles; oldest ops are dropped
       // first since newer ops reflect later state and ops are idempotent.
+      // Drop ops whose keys are no longer in the syncable allowlist. Legacy
+      // outboxes may carry keys removed for security (e.g. `is_vip` per audit
+      // P0); leaving them in causes the next replay to 400 → permanent drop
+      // of the entire outbox, including the legitimate ops we just merged.
+      const isValidSyncOp = (op: unknown): op is Record<string, unknown> & { key: string } => {
+        if (!op || typeof op !== 'object') return false;
+        const candidateKey = (op as { key?: unknown }).key;
+        return typeof candidateKey === 'string' && isSyncableStorageKey(candidateKey);
+      };
+
       try {
         const MAX_OUTBOX_OPS = 10000;
         let mergedOps: Array<Record<string, unknown>> = pending;
@@ -1326,16 +1360,24 @@ const PersistenceManager = () => {
                 && parsed.profileId === userInfo.profileId
                 && Array.isArray(parsed.ops)
                 && parsed.ops.length > 0) {
+              const existingOps = (parsed.ops as unknown[]).filter(isValidSyncOp);
               mergedOps = [
-                ...(parsed.ops as Array<Record<string, unknown>>),
+                ...existingOps,
                 ...pending
               ];
             }
           }
         } catch { /* noop */ }
 
+        mergedOps = mergedOps.filter(isValidSyncOp);
+
         if (mergedOps.length > MAX_OUTBOX_OPS) {
           mergedOps = mergedOps.slice(mergedOps.length - MAX_OUTBOX_OPS);
+        }
+
+        if (mergedOps.length === 0) {
+          try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+          return;
         }
 
         const outboxPayload = {
@@ -1838,7 +1880,7 @@ const EmbedBlockPage = () => (
         {i18n.t('embed.message')}
       </p>
       <a
-        href="https://movix.tax"
+        href="https://movix.date"
         target="_blank"
         rel="noopener noreferrer"
         className="mt-2 inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition sm:py-3 sm:px-6 lg:py-4 lg:px-8"
@@ -1920,6 +1962,7 @@ function App() {
                       <TopProgressBar />
                       <Toaster position="bottom-right" richColors />
                       <DnsBlockBanner />
+                      <RequireUsernameChange />
                     </IntroProvider>
                   </TurnstileProvider>
                 </ProfileProvider>

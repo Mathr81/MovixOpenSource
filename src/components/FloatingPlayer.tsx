@@ -5,6 +5,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { useMiniPlayer } from '../context/MiniPlayerContext';
 import type Hls from 'hls.js';
 import { safePlay } from '../utils/safePlay';
+import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
 
 type HlsCtor = typeof Hls;
 let HlsLib: HlsCtor | null = null;
@@ -100,7 +101,7 @@ const FloatingPlayer: React.FC = () => {
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
-            lowLatencyMode: false,
+            lowLatencyMode: isLowLatencyEnabled('movies'), // mini-lecteur = même scope que films/séries
             backBufferLength: 90,
             maxBufferLength: 30,
             maxMaxBufferLength: 60,

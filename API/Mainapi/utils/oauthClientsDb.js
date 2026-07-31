@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { getPool } = require('../mysqlPool');
+const { redis } = require('../config/redis');
 
 const SCHEMA_PATH = path.join(__dirname, '..', 'exportscripts', 'add_oauth_apps_tables.sql');
 const LEGACY_JSON_PATH = path.join(__dirname, '..', 'data', 'oauth-clients.json');
@@ -206,6 +207,60 @@ function invalidateCache() {
   memCache = { loadedAt: 0, clients: [] };
 }
 
+// ─── Cross-worker cache invalidation (Redis pub/sub) ─────────────────────
+// Movix runs in Node cluster mode (server.js): each worker has its own
+// in-process `memCache`. A DB mutation only reloads the worker that handled
+// it — other workers keep serving stale OAuth clients until they reboot.
+// After every mutation we publish on a Redis channel so all workers reload.
+// Without this, a redirect_uri added to a client after boot is rejected
+// intermittently, depending on which worker the request is routed to.
+
+const CLIENTS_CHANGED_CHANNEL = 'oauth:clients:changed';
+let cacheSubscriber = null;
+
+/** Notify every cluster worker that the oauth_clients table changed. */
+async function publishClientsChanged() {
+  try {
+    await redis.publish(CLIENTS_CHANGED_CHANNEL, String(process.pid));
+  } catch (err) {
+    // The local reloadCache() already ran; cross-worker propagation is
+    // best-effort and self-heals at the next mutation or worker restart.
+    console.warn('[OAuth Clients DB] publishClientsChanged failed:', err.message);
+  }
+}
+
+/** Reload this worker's cache, then broadcast so every other worker reloads. */
+async function reloadCacheAndBroadcast() {
+  await reloadCache();
+  await publishClientsChanged();
+}
+
+/**
+ * Start the per-worker cache subscriber. Call once per worker at boot.
+ * Uses a dedicated connection — in ioredis a connection in subscriber mode
+ * cannot run normal commands. ioredis auto-reconnects and re-subscribes.
+ */
+function startClientsCacheSubscriber() {
+  if (cacheSubscriber) return;
+  cacheSubscriber = redis.duplicate();
+  cacheSubscriber.on('error', (err) => {
+    console.error('[OAuth Clients DB] cache subscriber error:', err.message);
+  });
+  cacheSubscriber.on('message', (channel, message) => {
+    if (channel !== CLIENTS_CHANGED_CHANNEL) return;
+    reloadCache()
+      .then(() => console.log(`[OAuth Clients DB] cache reloaded (pub/sub from pid ${message})`))
+      .catch((err) => console.error('[OAuth Clients DB] reloadCache after pub/sub failed:', err.message));
+  });
+  cacheSubscriber.subscribe(CLIENTS_CHANGED_CHANNEL, (err) => {
+    if (err) {
+      console.error('[OAuth Clients DB] subscribe failed:', err.message);
+      return;
+    }
+    console.log('[OAuth Clients DB] cache subscriber ready on', CLIENTS_CHANGED_CHANNEL);
+  });
+}
+
 // ─── Stats helpers ───────────────────────────────────────────────────────
 
 async function recordEvent(clientId, eventType, userId, metadata) {
@@ -334,6 +389,9 @@ module.exports = {
   ensureTables,
   migrateLegacyJsonIfNeeded,
   reloadCache,
+  reloadCacheAndBroadcast,
+  publishClientsChanged,
+  startClientsCacheSubscriber,
   getCachedClients,
   invalidateCache,
   recordEvent,

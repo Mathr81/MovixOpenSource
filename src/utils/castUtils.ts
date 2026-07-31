@@ -1,5 +1,4 @@
 // Utility functions for Chromecast and AirPlay functionality
-import { buildApiProxyUrl } from '../config/runtime';
 
 // AirPlay interfaces
 export interface AirPlayMediaInfo {
@@ -256,16 +255,13 @@ export const prepareCastMediaInfo = (
   mediaUrl: string,
   title: string,
   poster?: string,
-  currentTime: number = 0
+  currentTime: number = 0,
+  streamType: string = 'BUFFERED'
 ): CastMediaInfo => {
   // Detect media type
   const mediaType = detectMediaType(mediaUrl);
 
-  // Handle darkibox.com URLs with proxy
-  let castUrl = mediaUrl;
-  if (mediaUrl.includes('darkibox.com')) {
-    castUrl = buildApiProxyUrl(mediaUrl);
-  }
+  const castUrl = mediaUrl;
 
   // Set appropriate content type based on media type
   let contentType: string;
@@ -280,7 +276,7 @@ export const prepareCastMediaInfo = (
   const mediaInfo: CastMediaInfo = {
     contentId: castUrl,
     contentType: contentType,
-    streamType: 'BUFFERED',
+    streamType,
     metadata: {
       metadataType: 1, // Movie metadata
       title: title,
@@ -344,16 +340,10 @@ export const prepareVideoForAirPlay = (
   // The caller should set video.src directly and destroy HLS.js instance
   if (useNativePlayback && mediaUrl) {
     console.log('[AirPlay] Setting up native playback for AirPlay');
-    
-    // Apply proxy if needed
-    let finalUrl = mediaUrl;
-    if (mediaUrl.includes('darkibox.com')) {
-      finalUrl = buildApiProxyUrl(mediaUrl);
-    }
-    
+
     // For Safari, we can set src directly for both HLS and MP4
     // Safari has native HLS support
-    video.src = finalUrl;
+    video.src = mediaUrl;
   }
   
   console.log('[AirPlay] Video element prepared successfully');
@@ -762,9 +752,10 @@ export const loadMediaOnCastWithFallback = async (
   autoplay: boolean = true,
   subtitles: CastSubtitleTrack[] = [],
   enableSubtitlesInitially: boolean = false,
+  streamType: string = 'BUFFERED',
 ): Promise<void> => {
   const contentTypes = getCastContentTypes(mediaUrl);
-  const baseMediaInfo = prepareCastMediaInfo(mediaUrl, title, poster, currentTime);
+  const baseMediaInfo = prepareCastMediaInfo(mediaUrl, title, poster, currentTime, streamType);
 
   // Attach external subtitle tracks if any. The Default Media Receiver only
   // handles WebVTT — SRT URLs will land but won't render. We still send them
@@ -1085,11 +1076,7 @@ export const prepareAirPlayMediaInfo = (
   // Detect media type
   const mediaType = detectMediaType(mediaUrl);
 
-  // Handle proxy URLs for AirPlay
-  let airPlayUrl = mediaUrl;
-  if (mediaUrl.includes('darkibox.com')) {
-    airPlayUrl = buildApiProxyUrl(mediaUrl);
-  }
+  const airPlayUrl = mediaUrl;
 
   // For AirPlay, we should avoid modifying M3U8 URLs too much
   // AirPlay handles HLS streams natively and modifying URLs can cause issues

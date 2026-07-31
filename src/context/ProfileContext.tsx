@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import { Profile, ProfileContextType } from '../types/profile';
 import axios from 'axios';
 import { useLocation } from 'react-router-dom';
@@ -70,12 +70,40 @@ async function replayOutboxIfAny(): Promise<void> {
     return;
   }
 
+  // Cross-user guard: if a different account is logged in than the one that
+  // wrote the outbox, do NOT replay. Replaying would POST with the outbox's
+  // userId, the backend would respond 401 "UserId mismatch", and the catch
+  // below would mark the outbox permanently failed → clearing the original
+  // owner's pending writes forever. Keep the outbox idle instead; the 7-day
+  // TTL evicts stale entries, and the original owner can return and replay.
+  const currentUserId = localStorage.getItem('resolved_user_id') || localStorage.getItem('user_id');
+  if (payload.userId && currentUserId && payload.userId !== currentUserId) {
+    console.warn('[outbox] skipping replay — different user logged in than outbox owner');
+    return;
+  }
+
+  // Filter out ops whose keys are no longer syncable. Legacy outboxes may
+  // contain keys removed from the allowlist after a backend security update
+  // (e.g. `is_vip` per audit P0). Without filtering, the backend rejects the
+  // whole batch with 400 INVALID_SYNC_KEY → replayOutboxIfAny treats 400 as
+  // permanent → outbox is dropped, taking legitimate co-batched ops with it.
+  const validOps = payload.ops.filter((op): op is Record<string, unknown> & { key: string } => {
+    if (!op || typeof op !== 'object') return false;
+    const candidateKey = (op as { key?: unknown }).key;
+    return typeof candidateKey === 'string' && isSyncableStorageKey(candidateKey);
+  });
+
+  if (validOps.length === 0) {
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+
   try {
     await axios.post(`${API_URL}/api/sync`, {
       userType: payload.userType,
       profileId: payload.profileId,
       userId: payload.userId,
-      ops: payload.ops
+      ops: validOps
     }, {
       headers: { Authorization: `Bearer ${authToken}` }
     });
@@ -121,6 +149,50 @@ async function replayOutboxIfAny(): Promise<void> {
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 
+// Per-device record of which profiles have been confirmed to hold server-side
+// data on a prior load. Used by loadProfileData to detect the "server returned
+// empty for a profile that previously had data" scenario (corrupted profile
+// file, transient backend bug, partial response) and preserve local state
+// instead of wiping it. NOT synced — prefixed to fall outside the syncable
+// allowlist and not in PROFILE_LOAD_PRESERVED_KEYS removal path.
+const KNOWN_PROFILE_DATA_KEY = '__movix_known_profile_data';
+
+interface KnownProfileDataMap {
+  [profileId: string]: number;
+}
+
+function readKnownProfileData(): KnownProfileDataMap {
+  try {
+    const raw = localStorage.getItem(KNOWN_PROFILE_DATA_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed as KnownProfileDataMap;
+  } catch {
+    return {};
+  }
+}
+
+function markProfileHasData(profileId: string) {
+  try {
+    const current = readKnownProfileData();
+    current[profileId] = Date.now();
+    localStorage.setItem(KNOWN_PROFILE_DATA_KEY, JSON.stringify(current));
+  } catch { /* noop — markers are best-effort */ }
+}
+
+function hasLocalSyncableContent(): boolean {
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (!isSyncableStorageKey(key)) continue;
+    const value = localStorage.getItem(key);
+    if (typeof value !== 'string') continue;
+    if (value.trim() === '' || value === '[]' || value === '{}') continue;
+    return true;
+  }
+  return false;
+}
+
 const ProfileContext = createContext<ProfileContextType | undefined>(undefined);
 
 interface ProfileProviderProps {
@@ -132,6 +204,12 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const location = useLocation();
+
+  // Dedupes the two useEffects below (mount timer + auth_changed listener)
+  // that can both call loadProfiles within ~500ms of each other. Without
+  // this guard, two concurrent GET /api/profiles → loadProfileData chains
+  // race the wipe-and-restore against in-flight user writes.
+  const loadProfilesInFlightRef = useRef(false);
 
   // Check if we're on a watch route - if so, disable profile data loading (but allow sync)
   const isWatchRoute = location.pathname.startsWith('/watch/');
@@ -160,6 +238,8 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
 
   // Load profiles from server
   const loadProfiles = async () => {
+    if (loadProfilesInFlightRef.current) return;
+    loadProfilesInFlightRef.current = true;
     try {
       setIsLoading(true);
       const authToken = localStorage.getItem('auth_token');
@@ -225,6 +305,7 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
     } catch (error) {
       console.error('Error loading profiles:', error);
     } finally {
+      loadProfilesInFlightRef.current = false;
       setIsLoading(false);
       // Libère la garde anti-sync (App.tsx l'init à true au boot pour bloquer
       // tout push pendant la fenêtre où des composants pourraient écrire des
@@ -385,7 +466,31 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
           )
         ) as Record<string, string>;
 
+        const serverHasData = Object.keys(profileEntries).length > 0;
+        const known = readKnownProfileData();
+        const profileWasKnownToHaveData = Object.prototype.hasOwnProperty.call(known, profileId);
+
+        // Wipe guard: if the server returns an empty profile for a profile
+        // we previously confirmed had data on this device, AND we still have
+        // local syncable content, do NOT wipe. A transient backend error or
+        // corrupted profile file would otherwise silently destroy the user's
+        // local state. Preserve local; the next sync push will restore the
+        // server side from localStorage.
+        if (!serverHasData && profileWasKnownToHaveData && hasLocalSyncableContent()) {
+          console.warn(
+            `[sync] Server returned empty profile ${profileId} that previously held data — preserving local state`
+          );
+          window.dispatchEvent(new CustomEvent('sync_storage_updated'));
+          refreshVipState();
+          return;
+        }
+
         applyProfileEntriesToLocalStorage(profileEntries);
+
+        if (serverHasData) {
+          markProfileHasData(profileId);
+        }
+
         window.dispatchEvent(new CustomEvent('sync_storage_updated'));
         refreshVipState();
 

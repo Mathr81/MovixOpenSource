@@ -8,6 +8,7 @@ import { Button } from '../components/ui/button';
 import { discordAuth } from '../services/discordAuth';
 import { googleAuth } from '../services/googleAuth';
 import { broadcastAuthChange, clearPendingAuthAction, clearStoredAuthSession, setPendingAuthAuthorize } from '../utils/accountAuth';
+import { useProfile } from '../context/ProfileContext';
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 const DEFAULT_AVATAR = 'https://as2.ftcdn.net/v2/jpg/05/89/93/27/1000_F_589932782_vQAEAZhHnq1QCGu5ikwrYaQD0Mmurm0N.webp';
@@ -201,27 +202,23 @@ const FAKE_NOT_REQUESTED_FALLBACK: string[] = [
 
 const FakePermissionsTeasingCard: React.FC = () => {
   const { t } = useTranslation();
-  // Charge la liste traduite via returnObjects (i18next), avec fallback en
-  // dur si la clé n'existe pas (ex : bundle de traduction incomplet).
   const fakeListRaw = t('oauthAuthorize.fakeNotRequested', { returnObjects: true });
   const fakeList = Array.isArray(fakeListRaw) && fakeListRaw.length > 0
     ? (fakeListRaw as string[])
     : FAKE_NOT_REQUESTED_FALLBACK;
-  // useMemo sur la longueur — évite que les changements de référence du
-  // tableau retourné par t() repick une nouvelle ligne à chaque re-render.
   const randomIdx = useMemo(
     () => Math.floor(Math.random() * fakeList.length),
     [fakeList.length],
   );
   const randomFake = fakeList[randomIdx] ?? '';
   return (
-    <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5">
-      <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+    <div>
+      <p className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
         🚫 {t('oauthAuthorize.fakeNotRequestedTitle', 'Ce que Movix ne demande pas')}
       </p>
-      <div className="mt-2 flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2">
-        <span className="shrink-0 text-red-400/70 leading-none">✗</span>
-        <p className="min-w-0 flex-1 text-sm text-gray-300 leading-snug">{randomFake}</p>
+      <div className="mt-2 flex items-start gap-2.5">
+        <span className="mt-0.5 shrink-0 text-red-400/70 leading-none">✗</span>
+        <p className="min-w-0 flex-1 text-sm italic text-gray-300 leading-snug">{randomFake}</p>
       </div>
     </div>
   );
@@ -243,18 +240,18 @@ interface PermissionsAccordionProps {
 const PermissionsAccordion: React.FC<PermissionsAccordionProps> = ({ requestedScopes, label }) => {
   const [isOpen, setIsOpen] = useState(false);
   return (
-    <div className="rounded-xl border border-white/10 bg-black/20">
+    <div>
       <button
         type="button"
         onClick={() => setIsOpen((v) => !v)}
         aria-expanded={isOpen}
-        className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left transition-colors hover:bg-white/[0.02] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40 rounded-xl"
+        className="flex w-full items-center justify-between gap-2 rounded-lg py-1 text-left transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
       >
         <div className="flex items-center gap-2">
-          <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+          <p className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
             {label}
           </p>
-          <span className="rounded-md border border-white/10 bg-white/5 px-1.5 py-0.5 text-[0.6rem] font-medium text-gray-300">
+          <span className="rounded-full bg-white/10 px-2 py-0.5 text-[0.6rem] font-semibold text-gray-200">
             {requestedScopes.length}
           </span>
         </div>
@@ -279,17 +276,15 @@ const PermissionsAccordion: React.FC<PermissionsAccordionProps> = ({ requestedSc
             }}
             className="overflow-hidden"
           >
-            <div className="space-y-1.5 px-3 pb-3 pt-1">
+            <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
               {requestedScopes.map((scopeItem) => {
                 const Icon = scopeItem.icon;
                 return (
                   <div
                     key={scopeItem.scope}
-                    className="flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2"
+                    className="flex min-w-0 items-center gap-2.5 rounded-lg bg-white/[0.04] px-2.5 py-2"
                   >
-                    <div className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-red-200">
-                      <Icon className="h-3.5 w-3.5" />
-                    </div>
+                    <Icon className="h-3.5 w-3.5 shrink-0 text-red-300" />
                     <p className="min-w-0 truncate text-sm font-medium text-white">
                       {scopeItem.title}
                     </p>
@@ -315,6 +310,9 @@ const OAuthAuthorizePage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const authToken = localStorage.getItem('auth_token');
   const accountIdentity = useMemo(() => getStoredIdentity(), []);
+  const { currentProfile } = useProfile();
+  const displayName = currentProfile?.name || accountIdentity?.username || 'Movix';
+  const displayAvatar = currentProfile?.avatar || accountIdentity?.avatar || DEFAULT_AVATAR;
   const returnTo = `${location.pathname}${location.search}`;
   const isAlreadyConnected = Boolean(authToken);
 
@@ -505,48 +503,42 @@ const OAuthAuthorizePage: React.FC = () => {
 
   return (
     <div className="min-h-[100svh] overflow-x-hidden bg-[radial-gradient(circle_at_top,_rgba(239,68,68,0.18),_transparent_35%),linear-gradient(180deg,_#050505,_#0b0b10_45%,_#111827)] text-white">
-      <div className="mx-auto flex min-h-[100svh] w-full max-w-6xl items-center justify-center overflow-y-auto px-3 py-3 sm:px-4 sm:py-4 lg:overflow-hidden">
+      <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-10">
         <motion.div
           initial={{ opacity: 0, y: 18 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.45, ease: 'easeOut' }}
-          className="grid w-full gap-4 lg:grid-cols-[1.25fr_0.75fr]"
+          className="grid gap-5 lg:grid-cols-[1.5fr_1fr] lg:items-start"
         >
-          <section className="rounded-3xl border border-white/10 bg-white/5 p-4 shadow-2xl backdrop-blur-md sm:p-5">
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div className="space-y-1.5">
-                <div className="inline-flex items-center gap-2.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 shadow-lg shadow-black/20">
-                  <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-full border border-white/10 bg-black/30">
-                    <img src={MOVIX_LOGO_SRC} alt="Movix" className="h-5 w-5 object-contain" />
-                  </span>
-                  <span className="text-left">
-                    <span className="block text-[0.6rem] font-semibold uppercase tracking-[0.35em] text-red-200/80">
-                      Movix
-                    </span>
-                    <span className="block text-xs font-medium text-white">OAuth</span>
-                  </span>
-                </div>
-                <p className="text-[0.65rem] font-semibold uppercase tracking-[0.35em] text-red-300/80">
-                  {t('oauthAuthorize.eyebrow')}
-                </p>
-                <h1 className="text-xl font-semibold tracking-tight text-white sm:text-2xl">
-                  {t('oauthAuthorize.title')}
-                </h1>
-                <p className="max-w-2xl text-sm leading-5 text-gray-300">
-                  {t('oauthAuthorize.subtitle')}
-                </p>
+          <section className="min-w-0 rounded-3xl border border-white/10 bg-white/[0.04] p-5 shadow-xl backdrop-blur sm:p-7">
+            <div className="flex items-start justify-between gap-3">
+              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5">
+                <img src={MOVIX_LOGO_SRC} alt="Movix" className="h-4 w-4 object-contain" />
+                <span className="text-xs font-medium text-white">Movix OAuth</span>
               </div>
-              <div className="hidden rounded-2xl border border-red-500/30 bg-red-500/10 p-2 text-red-200 lg:block">
-                <ShieldCheck className="h-6 w-6" />
+              <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-2 text-red-200">
+                <ShieldCheck className="h-5 w-5" />
               </div>
             </div>
 
+            <div className="mt-5 space-y-2">
+              <p className="text-[0.65rem] font-semibold uppercase tracking-[0.3em] text-red-300/80">
+                {t('oauthAuthorize.eyebrow')}
+              </p>
+              <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+                {t('oauthAuthorize.title')}
+              </h1>
+              <p className="text-sm leading-relaxed text-gray-300">
+                {t('oauthAuthorize.subtitle')}
+              </p>
+            </div>
+
             {isLoading ? (
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-5 text-sm text-gray-300">
+              <p className="mt-6 text-sm text-gray-400">
                 {t('oauthAuthorize.loading')}
-              </div>
+              </p>
             ) : error ? (
-              <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-100">
+              <div className="mt-6 rounded-2xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-100">
                 <p className="font-medium">{t('oauthAuthorize.errorTitle')}</p>
                 <p className="mt-2 text-red-100/80">{error}</p>
                 {previewClient?.homepageUrl && (
@@ -566,103 +558,105 @@ const OAuthAuthorizePage: React.FC = () => {
                 </Link>
               </div>
             ) : preview ? (
-              <div className="space-y-3">
-                <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-white/5">
-                      {(() => {
-                        // iconUrl est servie par l'API (`/oauth-icons/...`) — préfixée par API_URL.
-                        // logoUrl peut être absolue (legacy) → on l'utilise telle quelle si présente.
-                        const iconSrc = preview.client.iconUrl
-                          ? `${API_URL}${preview.client.iconUrl}`
-                          : preview.client.logoUrl || null;
-                        return iconSrc ? (
-                          <img src={iconSrc} alt={preview.client.clientName} className="h-full w-full object-cover" />
-                        ) : (
-                          <ShieldCheck className="h-5 w-5 text-red-300" />
-                        );
-                      })()}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
-                        {t('oauthAuthorize.appLabel')}
+              <div className="mt-6 space-y-5">
+                <div className="flex items-center gap-4">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-white/5">
+                    {(() => {
+                      const iconSrc = preview.client.iconUrl
+                        ? `${API_URL}${preview.client.iconUrl}`
+                        : preview.client.logoUrl || null;
+                      return iconSrc ? (
+                        <img src={iconSrc} alt={preview.client.clientName} className="h-full w-full object-cover" />
+                      ) : (
+                        <ShieldCheck className="h-5 w-5 text-red-300" />
+                      );
+                    })()}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
+                      {t('oauthAuthorize.appLabel')}
+                    </p>
+                    <h2 className="truncate text-lg font-semibold text-white">
+                      {preview.client.clientName}
+                    </h2>
+                    {preview.client.description && (
+                      <p className="line-clamp-2 text-xs leading-snug text-gray-400">
+                        {preview.client.description}
                       </p>
-                      <h2 className="text-lg font-semibold text-white">
-                        {preview.client.clientName}
-                      </h2>
-                      {preview.client.description && (
-                        <p className="text-xs leading-4 text-gray-300">
-                          {preview.client.description}
-                        </p>
-                      )}
-                    </div>
-                    {preview.client.homepageUrl && (
-                      <a
-                        href={preview.client.homepageUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-white transition hover:bg-white/10"
-                      >
-                        {t('oauthAuthorize.visitSite')}
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
                     )}
                   </div>
+                  {preview.client.homepageUrl && (
+                    <a
+                      href={preview.client.homepageUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label={t('oauthAuthorize.visitSite')}
+                      className="hidden shrink-0 items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white transition hover:bg-white/10 sm:inline-flex"
+                    >
+                      {t('oauthAuthorize.visitSite')}
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  )}
                 </div>
 
-                <div className="grid gap-2.5 sm:grid-cols-2">
-                  <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-                    <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+                <div className="h-px bg-white/[0.06]" />
+
+                <dl className="grid gap-4 text-sm sm:grid-cols-2">
+                  <div className="min-w-0">
+                    <dt className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
                       {t('oauthAuthorize.redirectLabel')}
-                    </p>
-                    <p className="mt-1 text-sm font-medium text-white">
+                    </dt>
+                    <dd className="mt-1.5 truncate font-medium text-white">
                       {redirectHost || preview.request.redirectUri}
-                    </p>
+                    </dd>
                   </div>
-                  <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
-                    <p className="text-[0.65rem] uppercase tracking-[0.25em] text-gray-400">
+                  <div className="min-w-0">
+                    <dt className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
                       {t('oauthAuthorize.tokenLabel')}
-                    </p>
-                    <p className="mt-1 text-sm font-medium text-white">
+                    </dt>
+                    <dd className="mt-1.5 font-medium text-white">
                       {formatTokenLifetime(preview.request.accessTokenExpiresInMs, t)}
-                    </p>
+                    </dd>
                   </div>
-                </div>
+                </dl>
+
+                <div className="h-px bg-white/[0.06]" />
 
                 <PermissionsAccordion requestedScopes={requestedScopes} label={t('oauthAuthorize.permissionsLabel')} />
 
                 <FakePermissionsTeasingCard />
 
-
                 {authToken ? (
-                  <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/10 px-3 py-2.5">
-                    <div className="flex items-center gap-3">
+                  <div className="space-y-4 border-t border-white/10 pt-5">
+                    <div className="flex min-w-0 items-center gap-3">
                       <img
-                        src={accountIdentity?.avatar || DEFAULT_AVATAR}
+                        src={displayAvatar}
                         alt=""
-                        className="h-10 w-10 shrink-0 rounded-full border border-white/10 object-cover"
+                        className="h-10 w-10 shrink-0 rounded-full border border-emerald-400/30 object-cover"
                       />
                       <div className="min-w-0 flex-1">
-                        <p className="text-[0.65rem] uppercase tracking-[0.25em] text-emerald-200/80">{t('oauthAuthorize.signedInAs')}</p>
-                        <p className="truncate font-medium text-white">{accountIdentity?.username || t('oauthAuthorize.connectedAccount')}</p>
+                        <p className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-emerald-200/80">
+                          {t('oauthAuthorize.signedInAs')}
+                        </p>
+                        <p className="truncate font-medium text-white">{displayName}</p>
                       </div>
-                      <div className="flex shrink-0 gap-2">
-                        <Button
-                          variant="outline"
-                          onClick={() => handleDecision(false)}
-                          disabled={isSubmitting}
-                          className="border-white/15 bg-transparent px-3 py-1.5 text-sm"
-                        >
-                          {t('oauthAuthorize.deny')}
-                        </Button>
-                        <Button
-                          onClick={() => handleDecision(true)}
-                          disabled={isSubmitting}
-                          className="bg-red-600 px-4 py-1.5 text-sm hover:bg-red-700"
-                        >
-                          {isSubmitting ? t('oauthAuthorize.processing') : t('oauthAuthorize.approve')}
-                        </Button>
-                      </div>
+                    </div>
+                    <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                      <Button
+                        variant="outline"
+                        onClick={() => handleDecision(false)}
+                        disabled={isSubmitting}
+                        className="border-white/15 bg-transparent sm:w-auto"
+                      >
+                        {t('oauthAuthorize.deny')}
+                      </Button>
+                      <Button
+                        onClick={() => handleDecision(true)}
+                        disabled={isSubmitting}
+                        className="bg-red-600 hover:bg-red-700 sm:w-auto sm:min-w-[10rem]"
+                      >
+                        {isSubmitting ? t('oauthAuthorize.processing') : t('oauthAuthorize.approve')}
+                      </Button>
                     </div>
                   </div>
                 ) : (
@@ -679,43 +673,41 @@ const OAuthAuthorizePage: React.FC = () => {
             ) : null}
           </section>
 
-          <aside className="rounded-3xl border border-white/10 bg-black/25 p-4 shadow-2xl backdrop-blur-md">
-            <p className="text-[0.65rem] font-semibold uppercase tracking-[0.35em] text-gray-400">
+          <aside className="min-w-0 rounded-3xl border border-white/10 bg-white/[0.02] p-5 shadow-xl backdrop-blur sm:p-6">
+            <p className="text-[0.6rem] font-semibold uppercase tracking-[0.3em] text-gray-400">
               {isAlreadyConnected ? t('oauthAuthorize.connectedAccount') : t('oauthAuthorize.connectMovix')}
             </p>
             {isAlreadyConnected ? (
-              <div className="mt-2.5 rounded-2xl border border-emerald-400/20 bg-emerald-500/10 p-3.5">
-                <div className="flex items-center gap-3">
+              <>
+                <div className="mt-4 flex items-center gap-3">
                   <img
-                    src={accountIdentity?.avatar || DEFAULT_AVATAR}
-                    alt={accountIdentity?.username || 'Movix'}
-                    className="h-10 w-10 rounded-full border border-white/10 object-cover"
+                    src={displayAvatar}
+                    alt={displayName}
+                    className="h-12 w-12 shrink-0 rounded-full border border-emerald-400/30 object-cover"
                   />
                   <div className="min-w-0">
-                    <p className="text-[0.65rem] uppercase tracking-[0.28em] text-emerald-200/80">
+                    <p className="text-[0.6rem] font-semibold uppercase tracking-[0.28em] text-emerald-200/80">
                       {t('oauthAuthorize.signedInAs')}
                     </p>
-                    <p className="truncate text-base font-semibold text-white">
-                      {accountIdentity?.username || t('oauthAuthorize.connectedAccount')}
-                    </p>
+                    <p className="truncate text-base font-semibold text-white">{displayName}</p>
                   </div>
                 </div>
 
-                <h2 className="mt-3 text-lg font-semibold text-white">
-                  {t('oauthAuthorize.notYouPrompt', { username: accountIdentity?.username || t('oauthAuthorize.connectedAccount') })}
+                <h2 className="mt-5 text-lg font-semibold text-white">
+                  {t('oauthAuthorize.notYouPrompt', { username: displayName })}
                 </h2>
-                <p className="mt-1.5 text-sm leading-5 text-emerald-50/80">
+                <p className="mt-1.5 text-sm leading-5 text-gray-300">
                   {t('oauthAuthorize.switchAccountDescription')}
                 </p>
 
                 <Button
                   onClick={handleSwitchAccount}
                   disabled={!preview}
-                  className="mt-3 w-full justify-center bg-red-600 hover:bg-red-700"
+                  className="mt-4 w-full justify-center bg-red-600 hover:bg-red-700"
                 >
                   {t('oauthAuthorize.switchAccountCta')}
                 </Button>
-              </div>
+              </>
             ) : (
               <>
                 <h2 className="mt-3 text-xl font-semibold text-white">
@@ -760,11 +752,14 @@ const OAuthAuthorizePage: React.FC = () => {
               </>
             )}
 
-            <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
-              <p className="text-sm font-medium text-white">{t('oauthAuthorize.securityTitle')}</p>
-              <p className="mt-1 text-xs leading-4 text-gray-400">
-                {t('oauthAuthorize.securityDescription')}
-              </p>
+            <div className="mt-6 flex items-start gap-2.5 border-t border-white/10 pt-4">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300/80" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-white">{t('oauthAuthorize.securityTitle')}</p>
+                <p className="mt-1 text-xs leading-4 text-gray-400">
+                  {t('oauthAuthorize.securityDescription')}
+                </p>
+              </div>
             </div>
           </aside>
         </motion.div>

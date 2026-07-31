@@ -6,6 +6,7 @@ import HLSPlayer from '../../components/HLSPlayer';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
+import { getAdPopupMode } from '../../utils/adPopupMode';
 import { extractM3u8FromEmbed, extractVoeM3u8, extractUqloadFile, extractDarkiboxSources, extractVidzyM3u8, extractFsvidM3u8, extractOneUploadSources, isOneUploadEmbed, isVoeEmbed, extractVidmolyM3u8, extractDoodStreamFile, extractSeekStreamingM3u8, isDoodStreamEmbed, isSeekStreamingEmbed, type M3u8Result } from '../../utils/extractM3u8';
 import { pickAutoSelectedSource, sortHostersByPriority, type SourceAvailability } from '../../utils/sourceAutoSelect';
 import { getSourcePriorityPrefs, buildDefaults, subscribeToPriorityChanges } from '../../utils/sourcePriorityPrefs';
@@ -225,7 +226,7 @@ interface EpisodeInfo {
   vote_average?: number;
 }
 
-type PlayerSourceType = 'darkino' | 'mp4' | 'm3u8' | 'frembed' | 'custom' | 'vostfr' | 'omega' | 'coflix' | 'fstream' | 'wiflix' | 'viper' | 'vox' | string | number; // Allow string for embed types
+type PlayerSourceType = 'darkino' | 'mp4' | 'm3u8' | 'frembed' | 'custom' | 'vostfr' | 'omega' | 'coflix' | 'fstream' | 'wiflix' | 'j1f' | 'viper' | 'vox' | string | number; // Allow string for embed types
 
 function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
   const normalizedParts = parts
@@ -343,78 +344,16 @@ const checkOmegaAvailability = (omegaData: any, seasonNumber: number, episodeNum
 
 // Check Darkino Availability for TV Episodes (Adapted from TVDetails)
 const checkDarkinoAvailability = async (
-  showTitle: string,
-  releaseYear: number,
-  seasonNumber: number,
-  episodeNumber: number,
-  showId: string,
-  updateRetryMessage?: (message: string) => void,
-  retryCount = 0
-) => {
-  const retryMessages = [
-    "Finalisation de la recherche premium...",
-    "Préparation de la source Nightflix VIP...",
-    "Vérification des accès sécurisés...",
-    "Optimisation de la connexion VIP..."
-  ];
-
-  try {
-    const searchResponse = await axios.get(`${MAIN_API}/api/search`, {
-      params: { title: showTitle }
-    });
-
-    if (!searchResponse.data.results || searchResponse.data.results.length === 0) {
-      return false;
-    }
-
-    // Match only by tmdb_id (exact match)
-    const matchingShow = searchResponse.data.results.find((result: any) => {
-      return (result.type === 'series' || result.type === 'animes' || result.type === 'doc') &&
-        result.tmdb_id &&
-        String(result.tmdb_id) === String(showId);
-    });
-
-    if (!matchingShow) {
-      return false;
-    }
-
-    try {
-      const downloadResponse = await axios.get(
-        `${MAIN_API}/api/series/download/${matchingShow.id}/season/${seasonNumber}/episode/${episodeNumber}`
-      );
-
-      if (downloadResponse.data && downloadResponse.data.sources && downloadResponse.data.sources.length > 0) {
-        const m3u8Sources = downloadResponse.data.sources.filter((source: any) => source.m3u8);
-        if (m3u8Sources.length > 0) {
-          return { available: true, sources: m3u8Sources, darkinoId: matchingShow.id };
-        }
-      }
-      return false;
-    } catch (downloadError: any) {
-      // Don't retry if error is 500 (server error)
-      if (downloadError.response && downloadError.response.status === 500) {
-        console.error('[Darkino Download] Server error (500), not retrying:', downloadError.message);
-        return false;
-      }
-      throw downloadError; // Re-throw other errors to be caught by the main catch block
-    }
-
-  } catch (error: any) {
-    console.error('[Darkino Check] Error:', error.message);
-
-    // Don't retry if error is 500 (server error)
-    if (error.response && error.response.status === 500) {
-      console.error('[Darkino Check] Server error (500), not retrying:', error.message);
-      return false;
-    }
-
-    if (retryCount < 3) {
-      if (updateRetryMessage) updateRetryMessage(retryMessages[retryCount % retryMessages.length]);
-      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
-      return checkDarkinoAvailability(showTitle, releaseYear, seasonNumber, episodeNumber, showId, updateRetryMessage, retryCount + 1);
-    }
-    return false;
-  }
+  _showTitle: string,
+  _releaseYear: number,
+  _seasonNumber: number,
+  _episodeNumber: number,
+  _showId: string,
+  _updateRetryMessage?: (message: string) => void,
+  _retryCount = 0
+): Promise<false | { available: boolean; sources: any[]; darkinoId: string | null }> => {
+  // Source Darkino/Nightflix retirée : endpoints api.movix.chat/api/search + /api/series/download désactivés.
+  return false;
 };
 
 // Check sibnet availability for anime
@@ -576,6 +515,12 @@ const WatchTv: React.FC = () => {
   const [selectedWiflixSource, setSelectedWiflixSource] = useState<number>(0);
   const [loadingWiflix, setLoadingWiflix] = useState(true);
 
+  // J1F (1jour1film) source states
+  const [, setJ1fData] = useState<any>(null);
+  const [j1fSources, setJ1fSources] = useState<{ url: string; label: string; category: string }[]>([]);
+  const [selectedJ1fSource, setSelectedJ1fSource] = useState<number>(0);
+  const [loadingJ1f, setLoadingJ1f] = useState(true);
+
   // Extracted sources states (General HLS/File bucket)
   const [nexusHlsSources, setNexusHlsSources] = useState<{ url: string; label: string }[]>([]);
   const [nexusFileSources, setNexusFileSources] = useState<{ url: string; label: string }[]>([]);
@@ -661,6 +606,19 @@ const WatchTv: React.FC = () => {
     return sortHostersByPriority(annotated, { category: 'moviesTv', topLevel: 'wiflix' });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wiflixSources]);
+
+  const sortedJ1f = useMemo(() => {
+    const prefs = getSourcePriorityPrefs();
+    const annotated = j1fSources.map((s) => ({
+      ...s,
+      type: detectHoster(s.url, {
+        patternOverrides: prefs.patternOverrides,
+        customHosters: prefs.customHosters,
+      }) ?? 'unknown',
+    }));
+    return sortHostersByPriority(annotated, { category: 'moviesTv', topLevel: 'j1f' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [j1fSources]);
 
   // Omega / Coflix : les listes viennent de champs dérivés (`omegaData` / `coflixData`).
   // On annote via detectHoster sur l'URL (`.link` pour omega, URL préférée pour coflix)
@@ -1065,7 +1023,7 @@ const WatchTv: React.FC = () => {
 
     // Determine if all necessary sources have finished loading attempts
     // Determine if all necessary sources have finished loading attempts
-    const areSourcesLoading = loadingDarkino || loadingCoflix || loadingOmega || loadingCustom || loadingSibnet || loadingFrembed || loadingFstream || loadingWiflix || loadingViper || loadingExtractions;
+    const areSourcesLoading = loadingDarkino || loadingCoflix || loadingOmega || loadingCustom || loadingSibnet || loadingFrembed || loadingFstream || loadingWiflix || loadingJ1f || loadingViper || loadingExtractions;
 
     if (!areSourcesLoading) {
       setVipRetryMessage(null); // Clear VIP message once attempts are done
@@ -1140,7 +1098,7 @@ const WatchTv: React.FC = () => {
 
       setIsLoading(false); // Mark loading as complete
     }
-  }, [loadingDarkino, loadingCoflix, loadingOmega, loadingCustom, loadingSibnet, loadingFrembed, loadingFstream, loadingWiflix, loadingExtractions, isLoading, selectedSource, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, id, seasonNumber, episodeNumber, customSources, frembedAvailable]);
+  }, [loadingDarkino, loadingCoflix, loadingOmega, loadingCustom, loadingSibnet, loadingFrembed, loadingFstream, loadingWiflix, loadingJ1f, loadingExtractions, isLoading, selectedSource, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, id, seasonNumber, episodeNumber, customSources, frembedAvailable]);
 
   // Add effect to hide Sources button in HLS mode
   useEffect(() => {
@@ -1420,6 +1378,19 @@ const WatchTv: React.FC = () => {
           }
         })();
 
+        // ========== CHECK J1F (1JOUR1FILM) SOURCE ==========
+        const j1fPromise = (async () => {
+          try {
+            const j1fResponse = await axios.get(`${MAIN_API}/api/j1f/tv/${id}/season/${seasonNumber}`);
+            return j1fResponse.data;
+          } catch (error) {
+            console.error('Error fetching 1jour1film TV source:', error);
+            return null;
+          } finally {
+            setLoadingJ1f(false);
+          }
+        })();
+
         // ========== CHECK VIPER SOURCE ==========
         const viperPromise = (async () => {
           try {
@@ -1456,7 +1427,8 @@ const WatchTv: React.FC = () => {
           fstreamResult,
           wiflixResult,
           viperResult,
-          voxResult
+          voxResult,
+          j1fResult
         ] = await Promise.all([
           darkinoPromise,
           customLinksPromise,
@@ -1467,7 +1439,8 @@ const WatchTv: React.FC = () => {
           fstreamPromise,
           wiflixPromise,
           viperPromise,
-          voxPromise
+          voxPromise,
+          j1fPromise
         ]);
 
         // ========== PROCESS OMEGA RESULTS (before setting state) ==========
@@ -2103,6 +2076,37 @@ const WatchTv: React.FC = () => {
 
         setWiflixSources(wiflixProcessedSources);
         console.log('?? [WatchTv] Wiflix/Lynx TV sources set:', wiflixProcessedSources.length, wiflixProcessedSources);
+
+        // =========== TRAITEMENT DES RÉSULTATS J1F (1JOUR1FILM) ===========
+        let j1fProcessedSources: { url: string; label: string; category: string }[] = [];
+
+        if (j1fResult && j1fResult.success && j1fResult.episodes) {
+          setJ1fData(j1fResult);
+          const episodeData = j1fResult.episodes[episodeNumber.toString()];
+          if (episodeData) {
+            const categories = ['vf', 'vostfr'];
+            const vfSources: { url: string; label: string; category: string }[] = [];
+            const vostfrSources: { url: string; label: string; category: string }[] = [];
+            categories.forEach(category => {
+              const categoryPlayers = episodeData[category as keyof typeof episodeData] || [];
+              categoryPlayers.forEach((player: any) => {
+                const source = {
+                  url: player.url,
+                  label: `1J1F ${category.toUpperCase()} - ${player.name}`,
+                  category: category.toUpperCase(),
+                };
+                if (category === 'vf') vfSources.push(source);
+                else vostfrSources.push(source);
+              });
+            });
+            j1fProcessedSources = [...vfSources, ...vostfrSources];
+          }
+        } else {
+          setJ1fData(null);
+        }
+
+        setJ1fSources(j1fProcessedSources);
+        console.log('?? [WatchTv] 1jour1film TV sources set:', j1fProcessedSources.length);
 
         // =========== EXTRACTION ONEUPLOAD DEPUIS WIFLIX ===========
         if (wiflixProcessedSources.length > 0) {
@@ -2890,6 +2894,27 @@ const WatchTv: React.FC = () => {
               setOnlyVostfrAvailable(false);
               return true;
             }
+            case 'j1f': {
+              console.log('✅ Selecting 1JOUR1FILM as source');
+              const prefsJ1f = getSourcePriorityPrefs();
+              const sortedJ1fLocal = sortHostersByPriority(
+                j1fProcessedSources.map((s) => ({
+                  ...s,
+                  type: detectHoster(s.url, {
+                    patternOverrides: prefsJ1f.patternOverrides,
+                    customHosters: prefsJ1f.customHosters,
+                  }) ?? 'unknown',
+                })),
+                { category: 'moviesTv', topLevel: 'j1f' },
+              );
+              setSelectedSource('j1f');
+              setSelectedJ1fSource(0);
+              setEmbedUrl(sortedJ1fLocal[0].url);
+              setEmbedType('j1f');
+              currentSourceRef.current = 'j1f';
+              setOnlyVostfrAvailable(false);
+              return true;
+            }
             case 'viper': {
               console.log('✅ Selecting VIPER as source');
               // Pré-tri langue + hoster pour respecter la préférence user
@@ -3012,6 +3037,7 @@ const WatchTv: React.FC = () => {
             { id: 'fstream', hasData: fstreamProcessedSources.length > 0 },
             { id: 'omega', hasData: !!(isOmegaAvailable && rawOmegaData) },
             { id: 'wiflix', hasData: wiflixProcessedSources.length > 0 },
+            { id: 'j1f', hasData: j1fProcessedSources.length > 0 },
             { id: 'viper', hasData: viperProcessedSources.length > 0 },
             { id: 'coflix', hasData: !!(coflixResult && (coflixResult.current_episode?.player_links?.length || coflixResult.player_links?.length)) },
             { id: 'custom', hasData: !!(customLinksResult.customLinks && customLinksResult.customLinks.length) },
@@ -3246,7 +3272,7 @@ const WatchTv: React.FC = () => {
         }
       }
       // Handle Embed source selections
-      else if (type === 'frembed' || type === 'custom' || type === 'vostfr' || type === 'omega' || type === 'coflix' || type === 'fstream' || type === 'wiflix' || type === 'viper' || type === 'adfree' || type === 'vox') {
+      else if (type === 'frembed' || type === 'custom' || type === 'vostfr' || type === 'omega' || type === 'coflix' || type === 'fstream' || type === 'wiflix' || type === 'j1f' || type === 'viper' || type === 'adfree' || type === 'vox') {
         setEmbedUrl(type === 'fstream' ? getProxyUrl(url) : url);
         setEmbedType(type as string); // type is known to be a string here
         setSelectedSource(type as PlayerSourceType);
@@ -3273,6 +3299,16 @@ const WatchTv: React.FC = () => {
           } else if (sortedWiflix.length > 0) {
             setSelectedWiflixSource(0);
             setEmbedUrl(sortedWiflix[0].url);
+          }
+        }
+        // Handle J1F source selection
+        else if (type === 'j1f') {
+          const index = sortedJ1f.findIndex(s => s.url === url);
+          if (index !== -1) {
+            setSelectedJ1fSource(index);
+          } else if (sortedJ1f.length > 0) {
+            setSelectedJ1fSource(0);
+            setEmbedUrl(sortedJ1f[0].url);
           }
         }
         // Handle Viper source selection
@@ -3311,7 +3347,7 @@ const WatchTv: React.FC = () => {
       window.removeEventListener('sourceChange', handleSourceChangeFromMenu as EventListener);
     };
   }, [
-    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, sortedFstream, sortedWiflix, canUseBravo, // Data sources
+    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, canUseBravo, // Data sources
     setOnlyVostfrAvailable, setShowEmbedQuality, // State setters for visibility
     setEmbedUrl, setEmbedType, setSelectedSource, // General source setters
     setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedFstreamSource, setVideoSource, setSelectedViperSource, // HLS specific setters
@@ -3879,6 +3915,9 @@ const WatchTv: React.FC = () => {
           (wiflixSources.length > 0 && wiflixSources.some(source =>
             source.category === 'VF'
           )) ||
+          (j1fSources.length > 0 && j1fSources.some(source =>
+            source.category === 'VF'
+          )) ||
           (viperSources.length > 0 && viperSources.some(source =>
             source.language === 'VF'
           )) ||
@@ -3920,6 +3959,9 @@ const WatchTv: React.FC = () => {
             break;
           case 'wiflix':
             playerType = 'wiflix';
+            break;
+          case 'j1f':
+            playerType = 'j1f';
             break;
           case 'viper':
             playerType = 'viper';
@@ -3985,7 +4027,10 @@ const WatchTv: React.FC = () => {
   }, []);
 
   // Now, after all hooks, you can do conditional returns:
-  if (showAdFreePopup && adPopupTriggered && !adPopupBypass) {
+  // Normal/auto replace the whole view with the popup (dialog/auto over the gated
+  // black screen). Click-anywhere falls through so the player loads behind the
+  // transparent catcher, which is rendered as an overlay in the main return.
+  if (showAdFreePopup && adPopupTriggered && !adPopupBypass && getAdPopupMode() !== 'click-anywhere') {
     return <AdFreePlayerAds onClose={handlePopupClose} onAccept={handlePopupAccept} adType={adType} onAdClick={() => setHasClickedAd(true)} />;
   }
   if (adPopupBypass) {
@@ -4074,6 +4119,12 @@ const WatchTv: React.FC = () => {
         const source =
           sortedWiflix.find(entry => entry.url === embedUrl) ||
           sortedWiflix[selectedWiflixSource];
+        return formatPremidSourceDetail(source?.label, source?.category);
+      }
+      case 'j1f': {
+        const source =
+          sortedJ1f.find(entry => entry.url === embedUrl) ||
+          sortedJ1f[selectedJ1fSource];
         return formatPremidSourceDetail(source?.label, source?.category);
       }
       case 'viper': {
@@ -4255,6 +4306,7 @@ const WatchTv: React.FC = () => {
                       coflixSources={sortedCoflix}
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
                       rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
                       rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
                       loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
@@ -4600,6 +4652,7 @@ const WatchTv: React.FC = () => {
                       coflixSources={sortedCoflix}
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
                       viperSources={sortedViper}
 
                       voxSources={voxSources}
@@ -4653,6 +4706,7 @@ const WatchTv: React.FC = () => {
             coflixSources={sortedCoflix}
             fstreamSources={sortedFstream}
             wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
             viperSources={sortedViper}
 
             voxSources={voxSources}
@@ -4716,6 +4770,7 @@ const WatchTv: React.FC = () => {
                       coflixSources={sortedCoflix}
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
                       viperSources={sortedViper}
 
                       voxSources={voxSources}
@@ -4759,6 +4814,7 @@ const WatchTv: React.FC = () => {
             coflixSources={sortedCoflix}
             fstreamSources={sortedFstream}
             wiflixSources={sortedWiflix}
+                      j1fSources={sortedJ1f}
             viperSources={sortedViper}
 
             rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
@@ -4803,6 +4859,12 @@ const WatchTv: React.FC = () => {
         </div>
       )}
 
+      {/* Click-anywhere: transparent catcher overlaid on the preloaded player.
+          Normal/auto already returned the popup above, so this renders only for
+          click-anywhere. */}
+      {showAdFreePopup && adPopupTriggered && !adPopupBypass && (
+        <AdFreePlayerAds onClose={handlePopupClose} onAccept={handlePopupAccept} adType={adType} onAdClick={() => setHasClickedAd(true)} />
+      )}
     </div>
   );
 };
