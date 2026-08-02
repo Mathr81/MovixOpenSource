@@ -64,6 +64,12 @@ https.globalAgent.maxFreeSockets = 32;
 // === PROXY CONFIGURATION FLAGS ===
 const ENABLE_DARKINO_PROXY = true; // Passe \u00e0 false pour d\u00e9sactiver le proxy pour Darkino
 const ENABLE_COFLIX_PROXY = true; // Passe \u00e0 false pour d\u00e9sactiver le proxy pour Coflix
+// Origine Coflix utilis\u00e9e comme Referer/Origin des requ\u00eates LecteurVideo
+// (le token JWT du player est \u00e9mis par Coflix ; lecteurvideo.com valide le Referer).
+// Overridable via COFLIX_BASE_URL pour suivre les rotations de domaine.
+const COFLIX_ORIGIN = (
+  process.env.COFLIX_BASE_URL || "https://coflix.esq"
+).replace(/\/$/, "");
 const ENABLE_FRENCH_STREAM_PROXY = true; // Active/d\u00e9sactive le proxy pour French-Stream
 const ENABLE_LECTEURVIDEO_PROXY = true; // Active/d\u00e9sactive le proxy pour LecteurVideo
 const ENABLE_FSTREAM_PROXY = true; // Active/d\u00e9sactive le proxy pour FStream
@@ -578,7 +584,7 @@ async function makeRequestWithCorsFallback(targetUrl, options = {}) {
 //  - 'worker' : preuve POSITIVE d'un blocage Cloudflare du worker lui-meme
 //    (page "error code: 1015"/1027, "You are being rate limited", limite
 //    journaliere). Roter vers un autre worker (bucket de limite distinct) aide.
-//  - 'site'   : tout le reste -> 429 forwarde depuis coflix.band (rate-limit
+//  - 'site'   : tout le reste -> 429 forwarde depuis le site Coflix (rate-limit
 //    global). Defaut volontaire : sans preuve d'un 1015, on ne rote pas et on
 //    ne martele pas l'upstream.
 function classifyCloudflare429(body) {
@@ -689,7 +695,7 @@ async function makeCoflixRequest(targetUrl, options = {}) {
       error.coflixUrl = cleanTargetUrl;
       error.coflixProxy = `${proxy.host}:${proxy.port}`;
 
-      // 429 = coflix.band rate-limit. Une autre IP ProxyScrape = bucket distinct
+      // 429 = rate-limit du site Coflix. Une autre IP ProxyScrape = bucket distinct
       // -> on rote. Le flag coupe le spam de log par titre si tout est limite.
       if (statusCode === 429) {
         error.coflixSiteRateLimited = true;
@@ -825,8 +831,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
         ja3: CHROME_JA3,
         userAgent: CHROME_UA,
         headers: {
-          Referer: "https://coflix.trade/",
-          Origin: "https://coflix.trade",
+          Referer: `${COFLIX_ORIGIN}/`,
+          Origin: COFLIX_ORIGIN,
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "fr-FR,fr;q=0.9",
@@ -875,8 +881,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
           userAgent: CHROME_UA,
           proxy: proxyUrl,
           headers: {
-            Referer: "https://coflix.trade/",
-            Origin: "https://coflix.trade",
+            Referer: `${COFLIX_ORIGIN}/`,
+            Origin: COFLIX_ORIGIN,
             Accept:
               "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9",
@@ -1439,6 +1445,14 @@ async function pickNextSocks5Proxy(options = {}) {
   return proxy || null;
 }
 
+async function pickDedicatedSocks5Proxy(options = {}) {
+  const proxy = await pickNextRateLimitedProxy(DEDICATED_SOCKS5_PROXIES, {
+    poolName: "DEDICATED_SOCKS5",
+    ...options,
+  });
+  return proxy || null;
+}
+
 const splitCsvEnv = (envName, fallback = []) => {
   const rawValue = process.env[envName];
   if (!rawValue) return [...fallback];
@@ -1683,6 +1697,12 @@ const PROXIES = dedupeProxyEntries(
     : parseProxyPayload(process.env.SOCKS5_PROXIES, "socks5")
   )
     .map((entry) => sanitizeProxyEntry(entry, "socks5"))
+    .filter(Boolean),
+);
+
+const DEDICATED_SOCKS5_PROXIES = dedupeProxyEntries(
+  parseProxyPayload(process.env.SOCKS5_PROXIES, "socks5")
+    .map((entry) => sanitizeProxyEntry(entry, "socks5h"))
     .filter(Boolean),
 );
 
@@ -2453,7 +2473,9 @@ module.exports = {
   // Agent helpers
   pickRandomProxyOrNone,
   pickRandomProxy,
+  pickProxyscrapeCandidates,
   pickNextSocks5Proxy,
+  pickDedicatedSocks5Proxy,
   getProxyAgent,
   getDarkinoHttpProxyAgent,
 

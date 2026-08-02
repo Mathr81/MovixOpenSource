@@ -328,8 +328,13 @@ async function probeOriginOnce() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REACHABILITY_TIMEOUT_MS);
   try {
+    // URL stable, sans cache-buster : un blocage FAI casse au niveau DNS/TLS,
+    // donc même une réponse servie par l'edge CDN prouve que le domaine est
+    // joignable. `no-store` suffit à bypasser le cache HTTP du navigateur
+    // (round-trip réseau garanti) ; un buster unique forcerait en plus un MISS
+    // CDN et ferait traverser chaque probe jusqu'au serveur pour rien.
     const url = new URL(REACHABILITY_PROBE_PATH, self.location.origin).href;
-    const res = await fetch(`${url}?_swprobe=${Date.now()}`, {
+    const res = await fetch(url, {
       method: 'HEAD',
       cache: 'no-store',
       signal: controller.signal,
@@ -351,14 +356,41 @@ async function probeOriginOnce() {
 // de cell tower, throttling court) peut le faire échouer. Si la 1ère échoue
 // on attend 500ms et on retente — un VRAI blocage FAI est persistant et
 // échouera les deux fois ; un blip transient laissera passer la 2ème.
+//
+// Memo 30s + single-flight (même pattern que dnsErrorDetection.ts côté page) :
+// sur réseau flaky, chaque navigation échouée déclenchait jusqu'à 2 HEADs — un
+// user qui spam reload générait une rafale de probes. 30s = assez long pour
+// absorber un burst, assez court pour redétecter un blocage qui démarre. État
+// en scope module : reset quand le browser tue le SW idle, ce qui est OK (le
+// memo ne vise que les bursts, pas la persistance).
+const PROBE_CACHE_MS = 30_000;
+let probeInFlight = null;
+let lastProbeAt = 0;
+let lastProbeResult = null;
+
 async function isOriginReachable() {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     return false;
   }
-  const first = await probeOriginOnce();
-  if (first) return true;
-  await new Promise((r) => setTimeout(r, 500));
-  return await probeOriginOnce();
+  const now = Date.now();
+  if (lastProbeResult !== null && now - lastProbeAt < PROBE_CACHE_MS) {
+    return lastProbeResult;
+  }
+  if (probeInFlight) return probeInFlight;
+  probeInFlight = (async () => {
+    const first = await probeOriginOnce();
+    if (first) return true;
+    await new Promise((r) => setTimeout(r, 500));
+    return await probeOriginOnce();
+  })();
+  try {
+    const result = await probeInFlight;
+    lastProbeResult = result;
+    lastProbeAt = Date.now();
+    return result;
+  } finally {
+    probeInFlight = null;
+  }
 }
 
 async function handleNavigation(req) {

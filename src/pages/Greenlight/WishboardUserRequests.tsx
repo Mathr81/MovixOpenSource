@@ -275,8 +275,8 @@ const WishboardUserRequests: React.FC = () => {
                     <div className="relative inline-block">
                         {/* radial-gradient au lieu de blur-[60px] */}
                         <div
-                            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[180%] h-[180%] rounded-full -z-10 pointer-events-none"
-                            style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.30) 0%, transparent 65%)' }}
+                            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[400px] h-[250px] max-w-[90vw] rounded-full -z-10 pointer-events-none"
+                            style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.20) 0%, transparent 70%)' }}
                         />
                         <div className="relative flex items-center gap-3">
                             <Popcorn className="h-8 w-8 text-green-500" />

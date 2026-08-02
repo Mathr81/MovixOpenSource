@@ -6,7 +6,61 @@ import java.net.InetAddress
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Arrays
 import java.util.Locale
+
+internal enum class MediaProxyMode {
+    LOOPBACK,
+    CAST_LAN,
+}
+
+internal data class MediaProxySessionAccess(
+    val mode: MediaProxyMode,
+    val bindAddress: InetAddress,
+    val allowedClientAddress: InetAddress?,
+) {
+    init {
+        when (mode) {
+            MediaProxyMode.LOOPBACK -> {
+                require(bindAddress.isLoopbackAddress) {
+                    "Loopback sessions must bind loopback"
+                }
+                require(allowedClientAddress == null) {
+                    "Loopback sessions cannot carry Cast access"
+                }
+            }
+
+            MediaProxyMode.CAST_LAN -> {
+                MediaProxyPolicy.requireUsableCastLanAddress(bindAddress)
+                MediaProxyPolicy.requireUsableCastLanAddress(
+                    requireNotNull(allowedClientAddress) {
+                        "Cast receiver address required"
+                    },
+                )
+            }
+        }
+    }
+
+    override fun toString(): String = "MediaProxySessionAccess(mode=$mode, redacted=true)"
+
+    companion object {
+        fun loopback(): MediaProxySessionAccess = MediaProxySessionAccess(
+            mode = MediaProxyMode.LOOPBACK,
+            bindAddress = InetAddress.getLoopbackAddress(),
+            allowedClientAddress = null,
+        )
+
+        fun castLan(
+            bindAddress: InetAddress,
+            allowedClientAddress: InetAddress,
+        ): MediaProxySessionAccess = MediaProxySessionAccess(
+            mode = MediaProxyMode.CAST_LAN,
+            bindAddress = MediaProxyPolicy.requireUsableCastLanAddress(bindAddress),
+            allowedClientAddress =
+                MediaProxyPolicy.requireUsableCastLanAddress(allowedClientAddress),
+        )
+    }
+}
 
 object MediaProxyPolicy {
     private const val MAX_URL_LENGTH = 16_384
@@ -27,6 +81,9 @@ object MediaProxyPolicy {
         "origin" to "Origin",
         "range" to "Range",
         "referer" to "Referer",
+        "sec-fetch-dest" to "Sec-Fetch-Dest",
+        "sec-fetch-mode" to "Sec-Fetch-Mode",
+        "sec-fetch-site" to "Sec-Fetch-Site",
         "user-agent" to "User-Agent",
     )
     private val allowedLocalOverrideHeaders = setOf(
@@ -93,13 +150,28 @@ object MediaProxyPolicy {
         if (address is Inet4Address && bytes.size == 4) {
             val first = bytes[0].toInt() and 0xff
             val second = bytes[1].toInt() and 0xff
+            val third = bytes[2].toInt() and 0xff
             if (first == 0 || first >= 224) return true
             if (first == 100 && second in 64..127) return true
+            if (first == 192 && second == 0 && third == 0) return true
+            if (first == 192 && second == 0 && third == 2) return true
+            if (first == 192 && second == 88 && third == 99) return true
             if (first == 198 && second in 18..19) return true
+            if (first == 198 && second == 51 && third == 100) return true
+            if (first == 203 && second == 0 && third == 113) return true
         }
         if (address is Inet6Address && bytes.isNotEmpty()) {
             val first = bytes[0].toInt() and 0xff
             if (first and 0xfe == 0xfc) return true
+            if (
+                bytes.size == 16 &&
+                (bytes[0].toInt() and 0xff) == 0x20 &&
+                (bytes[1].toInt() and 0xff) == 0x01 &&
+                (bytes[2].toInt() and 0xff) == 0x0d &&
+                (bytes[3].toInt() and 0xff) == 0xb8
+            ) {
+                return true
+            }
         }
         return false
     }
@@ -134,6 +206,7 @@ object MediaProxyPolicy {
     fun rewritePlaylist(
         playlist: String,
         baseUrl: String,
+        wrapDirectSubtitles: Boolean = true,
         localize: (String) -> String,
     ): String {
         val baseUri = runCatching { URI(baseUrl) }
@@ -193,7 +266,7 @@ object MediaProxyPolicy {
                 uriAttributePattern.replace(line) { match ->
                     val quote = match.groupValues[1]
                     val value = match.groupValues[2]
-                    val rewritten = if (directSubtitle) {
+                    val rewritten = if (directSubtitle && wrapDirectSubtitles) {
                         wrapDirectSubtitle(value) ?: rewrite(value)
                     } else {
                         rewrite(value)
@@ -216,4 +289,76 @@ object MediaProxyPolicy {
         require(tokenPattern.matches(resourceId)) { "Invalid resource id" }
         return "http://127.0.0.1:$port/p/$processSecret/$sessionId/$resourceId"
     }
+
+    fun buildCastUrl(
+        bindAddress: InetAddress,
+        port: Int,
+        sessionId: String,
+        resourceId: String,
+    ): String {
+        require(port in 1..65_535) { "Invalid Cast proxy port" }
+        require(tokenPattern.matches(sessionId)) { "Invalid session id" }
+        require(tokenPattern.matches(resourceId)) { "Invalid resource id" }
+        val address = requireUsableCastLanAddress(bindAddress)
+        val literal = address.hostAddress
+            ?.substringBefore('%')
+            ?.takeIf(String::isNotBlank)
+            ?: throw IllegalArgumentException("Invalid Cast LAN address")
+        val authority = if (address is Inet6Address) "[$literal]" else literal
+        return "http://$authority:$port/cast/$sessionId/$resourceId"
+    }
+
+    fun requireUsableCastLanAddress(address: InetAddress): InetAddress {
+        require(
+            !address.isAnyLocalAddress &&
+                !address.isLoopbackAddress &&
+                !address.isLinkLocalAddress &&
+                !address.isMulticastAddress,
+        ) {
+            "Unsafe Cast LAN address"
+        }
+        if (address is Inet4Address) {
+            val first = address.address[0].toInt() and 0xff
+            require(first != 0 && first < 224) { "Unsafe Cast LAN address" }
+        }
+        return address
+    }
+
+    fun validateReceiverOrigin(rawOrigin: String): String {
+        val uri = runCatching { URI(rawOrigin) }
+            .getOrElse { throw IllegalArgumentException("Invalid receiver origin") }
+        require(uri.scheme?.lowercase(Locale.US) == "https") {
+            "HTTPS receiver origin required"
+        }
+        require(!uri.host.isNullOrBlank() && uri.userInfo == null) {
+            "Invalid receiver origin"
+        }
+        require(uri.path.isNullOrEmpty() && uri.query == null && uri.fragment == null) {
+            "Receiver origin cannot contain a path, query, or fragment"
+        }
+        require(uri.port == -1 || uri.port in 1..65_535) {
+            "Invalid receiver origin port"
+        }
+        return URI(
+            "https",
+            null,
+            uri.host.lowercase(Locale.US),
+            uri.port,
+            null,
+            null,
+            null,
+        ).toString()
+    }
+
+    fun sameSocketPeer(expected: InetAddress, actual: InetAddress): Boolean {
+        if (!Arrays.equals(expected.address, actual.address)) return false
+        if (expected is Inet6Address && actual is Inet6Address) {
+            val expectedScope = expected.scopeId
+            val actualScope = actual.scopeId
+            return expectedScope == actualScope || expectedScope == 0 || actualScope == 0
+        }
+        return expected::class == actual::class
+    }
+
+    fun isOpaqueToken(value: String): Boolean = tokenPattern.matches(value)
 }

@@ -13,6 +13,7 @@ const path = require('path');
 const fsp = require('fs').promises;
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { fetchTmdbDetails, searchTmdb } = require('../utils/tmdbCache');
+const { COFLIX_ENABLED } = require('./coflix');
 const {
   applyCloneUrlsToPlayerLinks,
   syncCloneLinksForPlayerLinks
@@ -327,6 +328,11 @@ router.get('/tmdb/:type/:id', async (req, res) => {
           const cachedCloneSync = await syncCloneUrlsOnTmdbResult(cachedDataWithClones, type, id, season, episode);
           await saveToCache(CACHE_DIR.COFLIX, cacheKey, cachedCloneSync);
 
+          // Coflix desactive : pas de refresh background
+          if (!COFLIX_ENABLED) {
+            return;
+          }
+
           // Verifier si le dernier vrai refresh Coflix date de plus de 2h
           const refreshedAt = cachedCloneSync._coflixRefreshedAt || 0;
           const twoHours = 2 * 60 * 60 * 1000;
@@ -343,6 +349,15 @@ router.get('/tmdb/:type/:id', async (req, res) => {
     // 3. Fonction pour recuperer les donnees fraiches et mettre a jour le cache
     const updateCache = async () => {
       try {
+        // Coflix desactive : pas de fetch frais, et on ne pollue pas le cache
+        // avec des "Contenu non disponible" qui persisteraient au réveil.
+        if (!COFLIX_ENABLED) {
+          if (!dataReturned) {
+            res.status(200).json({ message: 'Contenu non disponible', tmdb_id: id });
+          }
+          return;
+        }
+
         // Verifier que le type est valide
         if (type !== 'movie' && type !== 'tv') {
           if (!dataReturned) {

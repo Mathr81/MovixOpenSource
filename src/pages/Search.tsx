@@ -149,7 +149,14 @@ const Search: React.FC = () => {
         loadingProviders,
         sortBy,
         setSortBy,
+        ensureFiltersLoaded,
     } = useSearch();
+
+    // Perf : les genres + providers TMDB ne sont plus chargés au boot de l'app,
+    // mais à la demande au premier montage de la page Search
+    useEffect(() => {
+        ensureFiltersLoaded();
+    }, [ensureFiltersLoaded]);
 
     // Scroll to results top after page change finishes loading
     useEffect(() => {

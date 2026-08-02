@@ -22,7 +22,8 @@ const CACHE_DIR = {
   PURSTREAM: path.join(__dirname, '..', 'cache', 'purstream'),
   NOCTAFLIX: path.join(__dirname, '..', 'cache', 'noctaflix'),
   FTV: path.join(__dirname, '..', 'cache', 'ftv'),
-  J1F: path.join(__dirname, '..', 'cache', '1jour1film')
+  J1F: path.join(__dirname, '..', 'cache', '1jour1film'),
+  SWIFTFLOW: path.join(__dirname, '..', 'cache', 'swiftflow')
 };
 
 const DEFAULT_CACHE_REFRESH_WINDOW_MS = 40 * 60 * 1000;

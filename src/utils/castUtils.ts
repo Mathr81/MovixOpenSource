@@ -287,7 +287,7 @@ export const prepareCastMediaInfo = (
       }] : undefined
     },
     customData: {
-      currentTime: currentTime
+      currentTime: currentTime,
     }
   };
 
@@ -586,8 +586,6 @@ export const getAvailableCastOptions = (videoElement?: HTMLVideoElement): {
 /**
  * Initialize Chromecast API
  */
-const DEFAULT_CAST_APP_ID = 'CC1AD845';
-
 const getCastFrameworkContext = () => {
   const castFramework = (window as any).cast?.framework;
   if (!castFramework?.CastContext || !(window as any).chrome?.cast?.AutoJoinPolicy) {
@@ -597,18 +595,27 @@ const getCastFrameworkContext = () => {
   return castFramework.CastContext.getInstance();
 };
 
+const getDefaultCastReceiverApplicationId = (): string => {
+  return (window as any).chrome?.cast?.media?.DEFAULT_MEDIA_RECEIVER_APP_ID || '';
+};
+
 export const initializeCastApi = (): Promise<boolean> => {
   return new Promise((resolve) => {
-    if (typeof window === 'undefined' || !(window as any).chrome?.cast?.isAvailable) {
+    if (
+      typeof window === 'undefined'
+      || !(window as any).chrome?.cast?.isAvailable
+      || !getDefaultCastReceiverApplicationId()
+    ) {
       resolve(false);
       return;
     }
 
     try {
       const castContext = getCastFrameworkContext();
+      const receiverApplicationId = getDefaultCastReceiverApplicationId();
       if (castContext) {
         castContext.setOptions({
-          receiverApplicationId: DEFAULT_CAST_APP_ID,
+          receiverApplicationId,
           autoJoinPolicy: (window as any).chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
         });
         console.log('Cast Framework initialized successfully');
@@ -616,8 +623,7 @@ export const initializeCastApi = (): Promise<boolean> => {
         return;
       }
 
-      const applicationID = DEFAULT_CAST_APP_ID;
-      const sessionRequest = new (window as any).chrome.cast.SessionRequest(applicationID);
+      const sessionRequest = new (window as any).chrome.cast.SessionRequest(receiverApplicationId);
       const apiConfig = new (window as any).chrome.cast.ApiConfig(
         sessionRequest,
         () => {

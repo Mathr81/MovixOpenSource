@@ -1,6 +1,8 @@
 package com.movix.app.cast
 
-import android.net.Uri
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.mediarouter.app.MediaRouteChooserDialog
@@ -10,145 +12,160 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.ReadableArray
+import com.facebook.react.bridge.ReadableMap
+import com.facebook.react.bridge.ReadableType
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.google.android.gms.cast.CastMediaControlIntent
-import com.google.android.gms.cast.MediaInfo
-import com.google.android.gms.cast.MediaLoadRequestData
-import com.google.android.gms.cast.MediaMetadata
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastSession
 import com.google.android.gms.cast.framework.SessionManagerListener
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
-import com.google.android.gms.common.images.WebImage
+import com.movix.app.proxy.CastPreparedSource
+import com.movix.app.proxy.CastPreparedTextTrack
 
-/**
- * Pont Google Cast exposé à React Native / WebView.
- *
- * Méthodes:
- * - isSupported(): les Play Services Cast sont-ils dispo sur l'appareil ?
- * - showPicker(): affiche le sélecteur d'appareils (MediaRouteChooserDialog).
- * - loadMedia(url, title, poster, currentTimeSec): charge un média ; ouvre le picker si pas de session.
- * - stop(): termine la session cast en cours.
- *
- * Événements (via RCTDeviceEventEmitter):
- * - CAST_SESSION_STARTED / CAST_SESSION_RESUMED / CAST_SESSION_ENDED / CAST_SESSION_FAILED
- */
-class CastModule(private val reactContext: ReactApplicationContext) :
-    ReactContextBaseJavaModule(reactContext) {
-
-    private var castContext: CastContext? = null
-    private var pendingLoad: LoadRequest? = null
-    private var listenerRegistered = false
-
-    private data class LoadRequest(
-        val url: String,
-        val title: String,
-        val poster: String?,
-        val currentTimeSec: Double,
+class CastModule internal constructor(
+    private val reactContext: ReactApplicationContext,
+    private val relayClient: CastRelayClient = ForegroundCastRelayClient(reactContext),
+) : ReactContextBaseJavaModule(reactContext) {
+    private data class PendingLoad(
+        val source: CastPreparedSource,
+        val metadata: CastRemoteMetadata,
+        val startTimeSec: Double,
+        val promise: Promise,
     )
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val userSettings = CastUserSettings(reactContext)
+    private var castContext: CastContext? = null
+    private var acceptedCoordinator: CastLoadCoordinator? = null
+    private var pendingCoordinator: CastLoadCoordinator? = null
+    private var pendingLoad: PendingLoad? = null
+    private var listenerRegistered = false
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
         override fun onSessionStarted(session: CastSession, sessionId: String) {
-            val params = Arguments.createMap().apply {
-                putString("deviceName", session.castDevice?.friendlyName ?: "")
-                putDouble(
-                    "durationSec",
-                    (session.remoteMediaClient?.mediaInfo?.streamDuration ?: 0L) / 1000.0,
-                )
-            }
-            emit("CAST_SESSION_STARTED", params)
-            pendingLoad?.let { req ->
-                pendingLoad = null
-                playMedia(session, req)
-            }
+            emitSession("CAST_SESSION_STARTED", session)
+            consumePendingLoad(session)
         }
 
         override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) {
-            val params = Arguments.createMap().apply {
-                putString("deviceName", session.castDevice?.friendlyName ?: "")
-                putDouble(
-                    "durationSec",
-                    (session.remoteMediaClient?.mediaInfo?.streamDuration ?: 0L) / 1000.0,
-                )
-            }
-            emit("CAST_SESSION_RESUMED", params)
-            pendingLoad?.let { req ->
-                pendingLoad = null
-                playMedia(session, req)
+            emitSession("CAST_SESSION_RESUMED", session)
+            if (pendingLoad != null) {
+                consumePendingLoad(session)
+            } else {
+                val active = acceptedCoordinator
+                if (active == null) {
+                    emitStatus(reloadRequiredStatus(session.castDevice?.friendlyName))
+                } else {
+                    active.getStatus(false) { result ->
+                        emitStatus(
+                            result.getOrElse {
+                                reloadRequiredStatus(session.castDevice?.friendlyName)
+                            },
+                        )
+                    }
+                }
             }
         }
 
         override fun onSessionEnded(session: CastSession, error: Int) {
-            pendingLoad = null
-            val params = Arguments.createMap().apply { putInt("error", error) }
-            emit("CAST_SESSION_ENDED", params)
+            failPending("MOVIX_CAST_SESSION_ENDED")
+            clearCoordinators(CastRelayStopReason.SESSION_ENDED)
+            emitStatus(CastStatusMapper.disconnected())
+            emit("CAST_SESSION_ENDED", Arguments.createMap().apply {
+                putString("errorCode", "MOVIX_CAST_SESSION_ENDED")
+            })
         }
 
         override fun onSessionStartFailed(session: CastSession, error: Int) {
-            pendingLoad = null
-            val params = Arguments.createMap().apply { putInt("error", error) }
-            emit("CAST_SESSION_FAILED", params)
+            failPending("MOVIX_CAST_SESSION_FAILED")
+            clearCoordinators(CastRelayStopReason.LOAD_FAILED)
+            emitStatus(
+                CastStatusMapper.disconnected("MOVIX_CAST_SESSION_FAILED"),
+            )
+            emit("CAST_SESSION_FAILED", Arguments.createMap().apply {
+                putString("errorCode", "MOVIX_CAST_SESSION_FAILED")
+            })
         }
 
-        override fun onSessionSuspended(session: CastSession, reason: Int) {}
-        override fun onSessionStarting(session: CastSession) {}
-        override fun onSessionEnding(session: CastSession) {}
-        override fun onSessionResuming(session: CastSession, sessionId: String) {}
-        override fun onSessionResumeFailed(session: CastSession, error: Int) {}
+        override fun onSessionResumeFailed(session: CastSession, error: Int) {
+            clearCoordinators(CastRelayStopReason.SESSION_ENDED)
+            emitStatus(
+                CastStatusMapper.disconnected("MOVIX_RELAY_RELOAD_REQUIRED"),
+            )
+        }
+
+        override fun onSessionSuspended(session: CastSession, reason: Int) = Unit
+        override fun onSessionStarting(session: CastSession) = Unit
+        override fun onSessionEnding(session: CastSession) = Unit
+        override fun onSessionResuming(session: CastSession, sessionId: String) = Unit
     }
 
     override fun getName(): String = "CastModule"
 
     override fun initialize() {
         super.initialize()
+        relayClient.setTerminalListener { reason ->
+            reactContext.runOnUiQueueThread {
+                val pending = pendingCoordinator
+                pendingCoordinator = null
+                pending?.abandonPendingLoad(reason.toErrorCode())
+                val accepted = acceptedCoordinator
+                acceptedCoordinator = null
+                accepted?.retireAfterReplacement()
+                castContext?.sessionManager?.endCurrentSession(true)
+                val errorCode = when (reason) {
+                    CastRelayStopReason.NETWORK_LOST ->
+                        "MOVIX_RELAY_NETWORK_LOST"
+                    CastRelayStopReason.ADDRESS_CHANGED ->
+                        "MOVIX_RELAY_ADDRESS_CHANGED"
+                    CastRelayStopReason.NOTIFICATION_STOP ->
+                        "MOVIX_RELAY_STOPPED"
+                    else -> "MOVIX_RELAY_STOPPED"
+                }
+                emitStatus(CastStatusMapper.disconnected(errorCode))
+            }
+        }
         reactContext.runOnUiQueueThread { ensureContext() }
     }
 
     override fun invalidate() {
+        relayClient.setTerminalListener(null)
         reactContext.runOnUiQueueThread {
+            clearCoordinators(CastRelayStopReason.SESSION_ENDED)
             if (listenerRegistered) {
-                castContext?.sessionManager
-                    ?.removeSessionManagerListener(sessionListener, CastSession::class.java)
+                castContext?.sessionManager?.removeSessionManagerListener(
+                    sessionListener,
+                    CastSession::class.java,
+                )
                 listenerRegistered = false
             }
         }
         super.invalidate()
     }
 
-    private fun ensureContext(): CastContext? {
-        castContext?.let { return it }
-
-        val activity = currentActivity ?: return null
-        val gms = GoogleApiAvailability.getInstance()
-        if (gms.isGooglePlayServicesAvailable(activity) != ConnectionResult.SUCCESS) {
-            return null
-        }
-
-        return try {
-            val ctx = CastContext.getSharedInstance(activity)
-            if (!listenerRegistered) {
-                ctx.sessionManager.addSessionManagerListener(
-                    sessionListener,
-                    CastSession::class.java,
-                )
-                listenerRegistered = true
-            }
-            castContext = ctx
-            ctx
-        } catch (_: Exception) {
-            null
+    @ReactMethod
+    fun isSupported(promise: Promise) {
+        reactContext.runOnUiQueueThread {
+            val available = GoogleApiAvailability.getInstance()
+                    .isGooglePlayServicesAvailable(reactContext) ==
+                ConnectionResult.SUCCESS
+            promise.resolve(available)
         }
     }
 
     @ReactMethod
-    fun isSupported(promise: Promise) {
-        reactContext.runOnUiQueueThread {
-            val gms = GoogleApiAvailability.getInstance()
-            val available = gms.isGooglePlayServicesAvailable(reactContext) == ConnectionResult.SUCCESS
-            promise.resolve(available)
-        }
+    fun getCapabilities(promise: Promise) {
+        promise.resolve(
+            Arguments.createMap().apply {
+                putBoolean("configured", true)
+                putInt("receiverProtocolVersion", CAST_RECEIVER_PROTOCOL_VERSION)
+                putInt("castLanProxyVersion", 1)
+            },
+        )
     }
 
     @ReactMethod
@@ -157,87 +174,123 @@ class CastModule(private val reactContext: ReactApplicationContext) :
             val activity = currentActivity
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "No foreground activity")
-                return@runOnUiQueueThread
-            }
-            if (ensureContext() == null) {
-                promise.reject("CAST_UNAVAILABLE", "Google Cast not available on this device")
-                return@runOnUiQueueThread
-            }
-
-            try {
-                val selector = buildRouteSelector()
-                val dialog = MediaRouteChooserDialog(activity)
-                dialog.routeSelector = selector
-                dialog.show()
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("PICKER_ERROR", e.message ?: "Failed to show picker")
+            } else if (ensureContext() == null) {
+                promise.reject("CAST_UNAVAILABLE", "Google Cast is unavailable")
+            } else {
+                runCatching {
+                    MediaRouteChooserDialog(activity).apply {
+                        routeSelector = buildRouteSelector()
+                        show()
+                    }
+                }.fold(
+                    onSuccess = { promise.resolve(true) },
+                    onFailure = {
+                        promise.reject("PICKER_ERROR", "Unable to show Cast picker")
+                    },
+                )
             }
         }
     }
 
     @ReactMethod
-    fun loadMedia(
-        url: String,
-        title: String,
-        poster: String?,
-        currentTimeSec: Double,
+    fun loadProxiedMedia(
+        source: ReadableMap,
+        metadata: ReadableMap,
+        startTimeSec: Double,
         promise: Promise,
     ) {
         reactContext.runOnUiQueueThread {
-            // Cast Default Media Receiver only accepts http(s). Reject other schemes
-            // at the native boundary even though the JS layer filters 'blob:'.
-            val scheme = url.substringBefore(":", "").lowercase()
-            if (scheme != "http" && scheme != "https") {
-                promise.reject("INVALID_URL", "Only http(s) URLs are castable")
+            val parsed = runCatching {
+                require(
+                    source.hasKey("protocolVersion") &&
+                        source.getInt("protocolVersion") == 1,
+                ) {
+                    "MOVIX_CAST_PROTOCOL_MISMATCH"
+                }
+                PendingLoad(
+                    source = parseSource(source),
+                    metadata = parseMetadata(metadata),
+                    startTimeSec = startTimeSec.coerceAtLeast(0.0),
+                    promise = promise,
+                )
+            }.getOrElse {
+                promise.reject("MOVIX_CAST_INVALID_SOURCE", "Invalid prepared Cast source")
                 return@runOnUiQueueThread
             }
-
-            val ctx = ensureContext()
-            if (ctx == null) {
-                promise.reject("CAST_UNAVAILABLE", "Google Cast not available on this device")
+            val context = ensureContext()
+            if (context == null) {
+                promise.reject("CAST_UNAVAILABLE", "Google Cast is unavailable")
                 return@runOnUiQueueThread
             }
-
-            val req = LoadRequest(url, title, poster, currentTimeSec)
-            val session = ctx.sessionManager.currentCastSession
-            if (session != null && session.isConnected) {
-                playMedia(session, req)
-                promise.resolve(true)
+            val session = context.sessionManager.currentCastSession
+            if (session?.isConnected == true) {
+                startLoad(session, parsed)
                 return@runOnUiQueueThread
             }
-
             val activity = currentActivity
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "No foreground activity")
                 return@runOnUiQueueThread
             }
-
-            // Pas de session active : mémoriser la requête, ouvrir le picker.
-            // onSessionStarted() jouera le média une fois l'appareil sélectionné.
-            pendingLoad = req
-            try {
-                val dialog = MediaRouteChooserDialog(activity)
-                dialog.routeSelector = buildRouteSelector()
-                dialog.setOnDismissListener {
-                    // Delay briefly so onSessionStarting can fire if the user actually
-                    // selected a device (dismiss happens synchronously before the
-                    // Cast framework sets isConnecting=true).
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        val current = ctx.sessionManager.currentCastSession
-                        val sessionActive = current != null &&
-                            (current.isConnected || current.isConnecting)
-                        if (!sessionActive) {
-                            pendingLoad = null
-                            emit("CAST_PICKER_DISMISSED", null)
-                        }
-                    }, 500)
+            failPending("MOVIX_CAST_LOAD_REPLACED")
+            pendingLoad = parsed
+            runCatching {
+                MediaRouteChooserDialog(activity).apply {
+                    routeSelector = buildRouteSelector()
+                    setOnDismissListener {
+                        mainHandler.postDelayed({
+                            val current = context.sessionManager.currentCastSession
+                            if (current?.isConnected != true && current?.isConnecting != true) {
+                                failPending("MOVIX_CAST_PICKER_DISMISSED")
+                                clearCoordinators(CastRelayStopReason.EXPLICIT)
+                                emit("CAST_PICKER_DISMISSED", null)
+                            }
+                        }, 500L)
+                    }
+                    show()
                 }
-                dialog.show()
-                promise.resolve(true)
-            } catch (e: Exception) {
-                pendingLoad = null
-                promise.reject("PICKER_ERROR", e.message ?: "Failed to show picker")
+            }.onFailure {
+                failPending("MOVIX_CAST_PICKER_ERROR")
+            }
+        }
+    }
+
+    @ReactMethod
+    fun play(promise: Promise) = withCoordinator(promise) {
+        it.play { result -> promise.settle(result) }
+    }
+
+    @ReactMethod
+    fun pause(promise: Promise) = withCoordinator(promise) {
+        it.pause { result -> promise.settle(result) }
+    }
+
+    @ReactMethod
+    fun seekTo(seconds: Double, promise: Promise) = withCoordinator(promise) {
+        it.seekTo(seconds) { result -> promise.settle(result) }
+    }
+
+    @ReactMethod
+    fun getStatus(refresh: Boolean, promise: Promise) {
+        reactContext.runOnUiQueueThread {
+            val active = acceptedCoordinator
+            if (active == null) {
+                val session = ensureContext()?.sessionManager?.currentCastSession
+                val status = if (session?.isConnected == true) {
+                    reloadRequiredStatus(session.castDevice?.friendlyName)
+                } else {
+                    CastStatusMapper.disconnected()
+                }
+                promise.resolve(status.toWritableMap())
+                return@runOnUiQueueThread
+            }
+            active.getStatus(refresh) { result ->
+                result.fold(
+                    onSuccess = { promise.resolve(it.toWritableMap()) },
+                    onFailure = {
+                        promise.reject("MOVIX_CAST_STATUS_FAILED", "Unable to read Cast status")
+                    },
+                )
             }
         }
     }
@@ -245,68 +298,238 @@ class CastModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun stop(promise: Promise) {
         reactContext.runOnUiQueueThread {
-            try {
+            val pending = pendingCoordinator
+            pendingCoordinator = null
+            pending?.abandonPendingLoad("MOVIX_CAST_STOPPED")
+            val active = acceptedCoordinator
+            acceptedCoordinator = null
+            if (active == null) {
+                relayClient.stop(CastRelayStopReason.EXPLICIT)
                 castContext?.sessionManager?.endCurrentSession(true)
                 promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("STOP_ERROR", e.message ?: "Failed to stop cast")
+                return@runOnUiQueueThread
+            }
+            active.stop {
+                castContext?.sessionManager?.endCurrentSession(true)
+                promise.settle(it)
             }
         }
     }
 
     @ReactMethod
-    fun getCurrentDeviceName(promise: Promise) {
-        reactContext.runOnUiQueueThread {
-            try {
-                val session = castContext?.sessionManager?.currentCastSession
-                promise.resolve(session?.castDevice?.friendlyName)
-            } catch (e: Exception) {
-                promise.reject("DEVICE_NAME_ERROR", e.message ?: "unknown", e)
-            }
-        }
+    fun getRelayDisclosurePreference(promise: Promise) {
+        promise.resolve(userSettings.isRelayDisclosureSuppressed())
     }
 
     @ReactMethod
-    fun getCurrentPositionSec(promise: Promise) {
-        reactContext.runOnUiQueueThread {
-            try {
-                val client = castContext?.sessionManager?.currentCastSession?.remoteMediaClient
-                val pos = client?.approximateStreamPosition ?: 0L
-                promise.resolve(pos / 1000.0)
-            } catch (e: Exception) {
-                promise.reject("POSITION_ERROR", e.message ?: "unknown", e)
-            }
-        }
+    fun setRelayDisclosureSuppressed(suppressed: Boolean, promise: Promise) {
+        userSettings.setRelayDisclosureSuppressed(suppressed)
+        promise.resolve(true)
     }
 
     @ReactMethod
-    fun getSessionState(promise: Promise) {
+    fun openBatterySettings(promise: Promise) {
+        runCatching(userSettings::openBatterySettings).fold(
+            onSuccess = { promise.resolve(true) },
+            onFailure = {
+                promise.reject("MOVIX_BATTERY_SETTINGS_UNAVAILABLE", "Settings unavailable")
+            },
+        )
+    }
+
+    @ReactMethod
+    fun requestRelayNotificationPermission(promise: Promise) {
         reactContext.runOnUiQueueThread {
-            try {
-                val session = castContext?.sessionManager?.currentCastSession
-                val state = when {
-                    session == null -> "idle"
-                    session.isConnecting -> "starting"
-                    session.isConnected -> "connected"
-                    session.isDisconnecting -> "ending"
-                    else -> "idle"
+            runCatching {
+                val activity = currentActivity
+                if (
+                    Build.VERSION.SDK_INT >= 33 &&
+                    activity != null &&
+                    activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    activity.requestPermissions(
+                        arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                        NOTIFICATION_PERMISSION_REQUEST,
+                    )
                 }
-                promise.resolve(state)
-            } catch (e: Exception) {
-                promise.reject("STATE_ERROR", e.message ?: "unknown", e)
+            }
+            // The request is contextual and deliberately never awaited or used as a Cast gate.
+            promise.resolve(true)
+        }
+    }
+
+    @ReactMethod
+    fun addListener(eventName: String) = Unit
+
+    @ReactMethod
+    fun removeListeners(count: Int) = Unit
+
+    private fun consumePendingLoad(session: CastSession) {
+        val pending = pendingLoad ?: return
+        pendingLoad = null
+        startLoad(session, pending)
+    }
+
+    private fun startLoad(session: CastSession, pending: PendingLoad) {
+        val receiverAddress = session.castDevice?.inetAddress
+        val remote = session.remoteMediaClient
+        if (receiverAddress == null || remote == null) {
+            pending.promise.reject(
+                "MOVIX_RELAY_RECEIVER_ADDRESS_REQUIRED",
+                "Receiver address unavailable",
+            )
+            if (acceptedCoordinator == null) {
+                relayClient.stop(CastRelayStopReason.LOAD_FAILED)
+                emitStatus(
+                    CastStatusMapper.disconnected(
+                        "MOVIX_RELAY_RECEIVER_ADDRESS_REQUIRED",
+                    ),
+                )
+            } else {
+                emitAcceptedStatusOrError("MOVIX_RELAY_RECEIVER_ADDRESS_REQUIRED")
+            }
+            return
+        }
+        val previousAccepted = acceptedCoordinator
+        val supersededPending = pendingCoordinator
+        pendingCoordinator = null
+        supersededPending?.abandonPendingLoad("MOVIX_CAST_LOAD_REPLACED")
+        val nextCoordinator = CastLoadCoordinator(
+            relayClient,
+            GoogleCastRemoteClient(remote, session.castDevice?.friendlyName),
+            ::emitStatus,
+        )
+        pendingCoordinator = nextCoordinator
+        nextCoordinator.load(
+            CastRelayRequest(
+                deviceName = session.castDevice?.friendlyName ?: "Chromecast",
+                receiverAddress = receiverAddress,
+                source = pending.source,
+            ),
+            pending.metadata,
+            pending.startTimeSec,
+            loadCallback@ { result ->
+                val wasCurrent = pendingCoordinator === nextCoordinator
+                if (!wasCurrent) {
+                    pending.promise.settle(result)
+                    return@loadCallback
+                }
+                pendingCoordinator = null
+                if (result.isSuccess) {
+                    previousAccepted?.retireAfterReplacement()
+                    nextCoordinator.activateStatusListener()
+                    acceptedCoordinator = nextCoordinator
+                } else {
+                    nextCoordinator.retireAfterReplacement()
+                    emitAcceptedStatusOrError(
+                        result.exceptionOrNull()?.message
+                            ?.takeIf { it.startsWith("MOVIX_") }
+                            ?: "MOVIX_CAST_LOAD_FAILED",
+                    )
+                }
+                pending.promise.settle(result)
+            },
+        )
+    }
+
+    private fun parseSource(source: ReadableMap): CastPreparedSource {
+        val url = source.getString("url")
+            ?.takeIf(String::isNotBlank)
+            ?: throw IllegalArgumentException("Missing source URL")
+        val headers = parseHeaders(source, "headers")
+        val tracks = if (
+            source.hasKey("tracks") &&
+            source.getType("tracks") == ReadableType.Array
+        ) {
+            parseTracks(source.getArray("tracks"))
+        } else {
+            emptyList()
+        }
+        return CastPreparedSource(
+            url = url,
+            headers = headers,
+            contentType = source.optionalString("contentType"),
+            tracks = tracks,
+        )
+    }
+
+    private fun parseTracks(array: ReadableArray?): List<CastPreparedTextTrack> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (index in 0 until minOf(array.size(), 16)) {
+                if (array.getType(index) != ReadableType.Map) continue
+                val track = array.getMap(index) ?: continue
+                val url = track.optionalString("url") ?: continue
+                add(
+                    CastPreparedTextTrack(
+                        url = url,
+                        language = track.optionalString("language"),
+                        name = track.optionalString("name"),
+                        contentType = track.optionalString("contentType") ?: "text/vtt",
+                        headers = parseHeaders(track, "headers"),
+                        active =
+                            track.hasKey("active") &&
+                                track.getType("active") == ReadableType.Boolean &&
+                                track.getBoolean("active"),
+                    ),
+                )
             }
         }
     }
 
-    // React Native exige ces deux no-ops quand on émet des events via NativeEventEmitter.
-    @ReactMethod
-    fun addListener(eventName: String) {
-        // no-op; DeviceEventEmitter gère l'abonnement côté JS
+    private fun parseMetadata(metadata: ReadableMap): CastRemoteMetadata {
+        return CastRemoteMetadata(
+            title = metadata.optionalString("title") ?: "Movix",
+            poster = metadata.optionalString("poster"),
+        )
     }
 
-    @ReactMethod
-    fun removeListeners(count: Int) {
-        // no-op
+    private fun ReadableMap.optionalString(key: String): String? {
+        return if (hasKey(key) && getType(key) == ReadableType.String) {
+            getString(key)?.takeIf(String::isNotBlank)
+        } else {
+            null
+        }
+    }
+
+    private fun parseHeaders(source: ReadableMap, key: String): Map<String, String> {
+        if (!source.hasKey(key) || source.getType(key) != ReadableType.Map) {
+            return emptyMap()
+        }
+        val output = linkedMapOf<String, String>()
+        val map = source.getMap(key) ?: return emptyMap()
+        val iterator = map.keySetIterator()
+        while (iterator.hasNextKey() && output.size < 32) {
+            val headerName = iterator.nextKey()
+            if (map.getType(headerName) == ReadableType.String) {
+                map.getString(headerName)?.let { output[headerName] = it }
+            }
+        }
+        return output
+    }
+
+    private fun ensureContext(): CastContext? {
+        castContext?.let { return it }
+        val activity = currentActivity ?: return null
+        if (
+            GoogleApiAvailability.getInstance()
+                .isGooglePlayServicesAvailable(activity) != ConnectionResult.SUCCESS
+        ) {
+            return null
+        }
+        return runCatching {
+            CastContext.getSharedInstance(activity).also {
+                if (!listenerRegistered) {
+                    it.sessionManager.addSessionManagerListener(
+                        sessionListener,
+                        CastSession::class.java,
+                    )
+                    listenerRegistered = true
+                }
+                castContext = it
+            }
+        }.getOrNull()
     }
 
     private fun buildRouteSelector(): MediaRouteSelector {
@@ -319,46 +542,121 @@ class CastModule(private val reactContext: ReactApplicationContext) :
             .build()
     }
 
-    private fun playMedia(session: CastSession, req: LoadRequest) {
-        val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MOVIE).apply {
-            putString(MediaMetadata.KEY_TITLE, req.title)
-            req.poster?.takeIf { it.isNotBlank() }?.let { url ->
-                try {
-                    addImage(WebImage(Uri.parse(url)))
-                } catch (_: Exception) {
-                    // Image optionnelle, on ignore une URL invalide
-                }
+    private fun withCoordinator(
+        promise: Promise,
+        action: (CastLoadCoordinator) -> Unit,
+    ) {
+        reactContext.runOnUiQueueThread {
+            val active = acceptedCoordinator
+            if (active == null) {
+                promise.reject("MOVIX_CAST_NOT_LOADED", "No active prepared Cast media")
+            } else {
+                action(active)
             }
         }
+    }
 
-        val contentType = when {
-            req.url.contains(".m3u8", ignoreCase = true) -> "application/x-mpegURL"
-            req.url.contains(".mp4", ignoreCase = true) -> "video/mp4"
-            else -> "application/x-mpegURL"
+    private fun Promise.settle(result: Result<Unit>) {
+        result.fold(
+            onSuccess = { resolve(true) },
+            onFailure = {
+                reject(
+                    it.message?.takeIf { code -> code.startsWith("MOVIX_") }
+                        ?: "MOVIX_CAST_COMMAND_FAILED",
+                    "Cast command failed",
+                )
+            },
+        )
+    }
+
+    private fun failPending(code: String) {
+        pendingLoad?.promise?.reject(code, "Cast request cancelled")
+        pendingLoad = null
+    }
+
+    private fun clearCoordinators(reason: CastRelayStopReason) {
+        val pending = pendingCoordinator
+        pendingCoordinator = null
+        pending?.abandonPendingLoad(reason.toErrorCode())
+        val accepted = acceptedCoordinator
+        acceptedCoordinator = null
+        if (accepted != null) {
+            accepted.cancel(reason)
+        } else if (pending != null) {
+            relayClient.stop(reason)
         }
+    }
 
-        val mediaInfo = MediaInfo.Builder(req.url)
-            .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
-            .setContentType(contentType)
-            .setMetadata(metadata)
-            .build()
+    private fun emitAcceptedStatusOrError(errorCode: String) {
+        val accepted = acceptedCoordinator
+        if (accepted == null) {
+            emitStatus(CastStatusMapper.disconnected(errorCode))
+            return
+        }
+        accepted.getStatus(false) { result ->
+            emitStatus(
+                result.getOrElse {
+                    CastStatusMapper.disconnected(errorCode)
+                },
+            )
+        }
+    }
 
-        val loadReq = MediaLoadRequestData.Builder()
-            .setMediaInfo(mediaInfo)
-            .setAutoplay(true)
-            .setCurrentTime((req.currentTimeSec * 1000).toLong().coerceAtLeast(0L))
-            .build()
+    private fun CastRelayStopReason.toErrorCode(): String = when (this) {
+        CastRelayStopReason.NETWORK_LOST -> "MOVIX_RELAY_NETWORK_LOST"
+        CastRelayStopReason.ADDRESS_CHANGED -> "MOVIX_RELAY_ADDRESS_CHANGED"
+        CastRelayStopReason.NOTIFICATION_STOP -> "MOVIX_RELAY_STOPPED"
+        CastRelayStopReason.SESSION_ENDED -> "MOVIX_CAST_SESSION_ENDED"
+        CastRelayStopReason.LOAD_FAILED -> "MOVIX_CAST_LOAD_FAILED"
+        CastRelayStopReason.SERVICE_DESTROYED -> "MOVIX_RELAY_SERVICE_STOPPED"
+        CastRelayStopReason.EXPLICIT -> "MOVIX_CAST_STOPPED"
+    }
 
-        session.remoteMediaClient?.load(loadReq)
+    private fun reloadRequiredStatus(deviceName: String?): NativeCastStatus {
+        return CastStatusMapper.map(
+            CastStatusSnapshot(
+                connected = true,
+                deviceName = deviceName,
+                playbackState = NativeCastPlaybackState.ERROR,
+                errorCode = "MOVIX_RELAY_RELOAD_REQUIRED",
+            ),
+        )
+    }
+
+    private fun emitSession(name: String, session: CastSession) {
+        emit(name, Arguments.createMap().apply {
+            putString("deviceName", session.castDevice?.friendlyName)
+        })
+    }
+
+    private fun emitStatus(status: NativeCastStatus) {
+        emit("CAST_MEDIA_STATUS", status.toWritableMap())
+    }
+
+    private fun NativeCastStatus.toWritableMap(): WritableMap {
+        return Arguments.createMap().apply {
+            putBoolean("connected", connected)
+            putString("deviceName", deviceName)
+            mediaSessionId?.let { putInt("mediaSessionId", it) } ?: putNull("mediaSessionId")
+            putString("state", state)
+            putDouble("positionSec", positionSec)
+            durationSec?.let { putDouble("durationSec", it) } ?: putNull("durationSec")
+            putBoolean("canSeek", canSeek)
+            putString("idleReason", idleReason)
+            putString("errorCode", errorCode)
+        }
     }
 
     private fun emit(name: String, params: WritableMap?) {
-        try {
+        runCatching {
             reactContext
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
                 .emit(name, params)
-        } catch (_: Exception) {
-            // Catalyst inactif pendant le teardown : on ignore
         }
+    }
+
+    companion object {
+        private const val NOTIFICATION_PERMISSION_REQUEST = 2541
+        private const val CAST_RECEIVER_PROTOCOL_VERSION = 1
     }
 }

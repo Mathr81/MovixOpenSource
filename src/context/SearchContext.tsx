@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import axios from 'axios';
 import i18n from '../i18n';
 import { getTmdbLanguage } from '../i18n';
@@ -101,6 +101,12 @@ interface SearchContextType {
   loadingProviders: boolean;
   sortBy: SortByOption;
   setSortBy: (sortBy: SortByOption) => void;
+  /**
+   * Déclenche le chargement (une seule fois) des genres + providers TMDB.
+   * Appelé par la page Search au montage — perf : ces 4 requêtes ne partent
+   * plus au boot de l'app pour tous les visiteurs.
+   */
+  ensureFiltersLoaded: () => void;
 }
 
 const SearchContext = createContext<SearchContextType | null>(null);
@@ -817,7 +823,22 @@ export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     // Ne lance plus la recherche automatiquement
   };
 
+  // Perf : les fetches genres/providers (4 requêtes TMDB) ne partent plus au boot
+  // pour tous les visiteurs — ils sont déclenchés à la demande par la page Search
+  // via ensureFiltersLoaded().
+  const filtersRequestedRef = useRef(false);
+  const [filtersRequested, setFiltersRequested] = useState(false);
+
+  const ensureFiltersLoaded = useCallback(() => {
+    if (!filtersRequestedRef.current) {
+      filtersRequestedRef.current = true;
+      setFiltersRequested(true);
+    }
+  }, []);
+
   useEffect(() => {
+    if (!filtersRequested) return;
+
     const fetchGenres = async () => {
       setLoadingGenres(true);
       try {
@@ -873,10 +894,12 @@ export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
 
     fetchGenres();
-  }, [selectedType]);
+  }, [selectedType, filtersRequested]);
 
-  // Fetch watch providers from TMDB
+  // Fetch watch providers from TMDB — déclenché à la demande (perf)
   useEffect(() => {
+    if (!filtersRequested) return;
+
     const fetchWatchProviders = async () => {
       setLoadingProviders(true);
       try {
@@ -951,7 +974,7 @@ export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
 
     fetchWatchProviders();
-  }, []);
+  }, [filtersRequested]);
 
   const toggleGenre = (genreId: number) => {
     setSelectedGenres(prev =>
@@ -1041,6 +1064,7 @@ export const SearchProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     loadingProviders,
     sortBy,
     setSortBy,
+    ensureFiltersLoaded,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     query, results, loading, error, genres, selectedGenres, selectedType,

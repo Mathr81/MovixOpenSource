@@ -32,7 +32,7 @@ const { fetchCinestreamMovieData } = require("./cinestream");
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 const TMDB_API_URL = "https://api.themoviedb.org/3";
-const WIFLIX_BASE_URL = "https://flemmix.golf";
+const WIFLIX_BASE_URL = "https://flemmix.men";
 
 // === Cache helpers (local, since getFromCacheNoExpiration is not yet in cacheManager) ===
 const getFromCacheNoExpiration = async (cacheDir, key) => {

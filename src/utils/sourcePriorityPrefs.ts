@@ -59,7 +59,7 @@ const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
  */
 const DEFAULT_MOVIES_TV_ORDER: readonly TopLevelSourceId[] = [
   'nexus_hls', 'bravo', 'mp4', 'darkino',
-  'fstream', 'omega', 'wiflix', 'j1f', 'viper', 'coflix',
+  'fstream', 'omega', 'wiflix', 'j1f', 'swiftflow', 'viper', 'coflix',
   'custom', 'frembed', 'vox', 'vostfr',
 ];
 

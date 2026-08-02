@@ -102,6 +102,30 @@ class MediaProxyPolicyTest {
     }
 
     @Test
+    fun rejectsDocumentationAndReservedUpstreamAddresses() {
+        for (address in listOf(
+            "192.0.2.1",
+            "198.51.100.9",
+            "203.0.113.7",
+            "192.0.0.8",
+            "2001:db8::1",
+        )) {
+            assertTrue(
+                "$address must not be treated as a public upstream",
+                MediaProxyPolicy.isForbiddenAddress(InetAddress.getByName(address)),
+            )
+        }
+        assertFalse(
+            MediaProxyPolicy.isForbiddenAddress(InetAddress.getByName("93.184.216.34")),
+        )
+        assertFalse(
+            MediaProxyPolicy.isForbiddenAddress(
+                InetAddress.getByName("2606:2800:220:1:248:1893:25c8:1946"),
+            ),
+        )
+    }
+
+    @Test
     fun sanitizesRequestHeadersWithAnAllowlist() {
         val sanitized = MediaProxyPolicy.sanitizeRequestHeaders(
             mapOf(
@@ -110,6 +134,9 @@ class MediaProxyPolicyTest {
                 "Range" to "bytes=0-1023",
                 "Accept" to "*/*",
                 "User-Agent" to "Movix",
+                "sec-fetch-site" to "cross-site",
+                "Sec-Fetch-Mode" to "cors",
+                "SEC-FETCH-DEST" to "empty",
                 "Host" to "attacker.invalid",
                 "Connection" to "keep-alive",
                 "Cookie" to "secret=value",
@@ -121,6 +148,9 @@ class MediaProxyPolicyTest {
         assertEquals("https://vidzy.org", sanitized["Origin"])
         assertEquals("https://vidzy.org/", sanitized["Referer"])
         assertEquals("bytes=0-1023", sanitized["Range"])
+        assertEquals("cross-site", sanitized["Sec-Fetch-Site"])
+        assertEquals("cors", sanitized["Sec-Fetch-Mode"])
+        assertEquals("empty", sanitized["Sec-Fetch-Dest"])
         assertFalse(sanitized.containsKey("Host"))
         assertFalse(sanitized.containsKey("Connection"))
         assertFalse(sanitized.containsKey("Cookie"))
@@ -143,5 +173,18 @@ class MediaProxyPolicyTest {
         )
         assertFalse(localUrl.contains("vidzy"))
         assertFalse(localUrl.contains("m3u8"))
+    }
+
+    @Test
+    fun loopbackUrlContractCannotBeUsedAsCast() {
+        val loopback = MediaProxyPolicy.buildLoopbackUrl(
+            port = 28123,
+            processSecret = "process-secret",
+            sessionId = "session-id",
+            resourceId = "resource-id",
+        )
+
+        assertTrue(loopback.startsWith("http://127.0.0.1:28123/p/"))
+        assertFalse(loopback.contains("/cast/"))
     }
 }

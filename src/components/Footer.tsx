@@ -1,5 +1,5 @@
 import React from "react";
-import { Zap, Palette, Code2, Flame, Waves, Scale, Shield, Smartphone, Github } from "lucide-react";
+import { Zap, Palette, Code2, Flame, Waves, Scale, Shield, Smartphone, Github, Euro } from "lucide-react";
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import "./Footer.css";
 import { useTranslation } from 'react-i18next';
@@ -125,6 +125,14 @@ const Footer: React.FC = () => {
                   <path d="m21 11-8-8"></path>
                 </svg>
                 DMCA
+              </Link>
+
+              <Link
+                className="flex flex-row items-center gap-3 text-gray-50 font-medium opacity-75 transition-all mt-4 hover:opacity-100"
+                to="/frais"
+              >
+                <Euro className="size-5" />
+                {t('costs.navLabel')}
               </Link>
             </div>
           </div>

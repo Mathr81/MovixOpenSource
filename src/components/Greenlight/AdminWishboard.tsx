@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { getFrembedBase } from '../../utils/frembedConfig';
 import { useTranslation } from 'react-i18next';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -618,7 +619,7 @@ const AdminWishboard: React.FC = () => {
 
         // Check Frembed
         try {
-            const response = await axios.get(`https://frembed.click/api/public/v1/movies/${tmdbId}`, { timeout: 3000 });
+            const response = await axios.get(`${getFrembedBase()}/api/public/v1/movies/${tmdbId}`, { timeout: 3000 });
             const isAvailable = response.data?.status === 200 && !!response.data?.result;
             results.push({ name: 'Frembed', available: isAvailable });
         } catch {
@@ -731,7 +732,7 @@ const AdminWishboard: React.FC = () => {
 
         // Check Frembed
         try {
-            const response = await axios.get(`https://frembed.click/api/public/v1/tv/${tmdbId}?sa=${season}&epi=${episode}`, { timeout: 3000 });
+            const response = await axios.get(`${getFrembedBase()}/api/public/v1/tv/${tmdbId}?sa=${season}&epi=${episode}`, { timeout: 3000 });
             const isAvailable = response.data?.status === 200 && !!response.data?.result;
             results.push({ name: 'Frembed', available: isAvailable });
         } catch {

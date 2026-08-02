@@ -36,6 +36,36 @@ const getSmoothScrollIntensity = (): SmoothScrollIntensity => {
   return 'standard';
 };
 
+// Desktop non tactile avec des ressources correctes : seul profil où on active
+// Lenis par défaut (absence de préférence explicite en localStorage). Sur
+// mobile/tablette tactile ou machine faible, la boucle rAF main-thread de
+// Lenis amplifie le jank au lieu de le masquer — on préfère le scroll natif
+// tant que l'utilisateur n'a pas explicitement opté pour Lenis dans Apparence.
+const isCapableNonTouchDesktop = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const maxTouchPoints = nav.maxTouchPoints ?? 0;
+  const deviceMemory = nav.deviceMemory ?? 8;
+  const hardwareConcurrency = nav.hardwareConcurrency ?? 8;
+
+  return maxTouchPoints === 0 && deviceMemory > 4 && hardwareConcurrency > 4;
+};
+
+// Politique à 3 états sur `settings_smooth_scroll` :
+//   - 'true'  → opt-in explicite (Paramètres) : Lenis activé.
+//   - 'false' → opt-out explicite : Lenis désactivé.
+//   - absent/autre → activé seulement sur desktop non tactile + machine
+//     correcte, sinon scroll natif (même comportement que 'false').
+const getSmoothScrollSetting = (): boolean => {
+  const v = typeof localStorage !== 'undefined'
+    ? localStorage.getItem('settings_smooth_scroll')
+    : null;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return isCapableNonTouchDesktop();
+};
+
 const LENIS_BYPASS_SELECTOR = [
   '[data-lenis-prevent]',
   '[role="dialog"]',
@@ -205,7 +235,7 @@ const SmoothScroll = () => {
     };
 
     const initLenis = () => {
-      const userEnabled = localStorage.getItem('settings_smooth_scroll') !== 'false';
+      const userEnabled = getSmoothScrollSetting();
       const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       const isEnabled = userEnabled && !reducedMotion;
 

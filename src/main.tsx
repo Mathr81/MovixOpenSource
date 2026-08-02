@@ -132,6 +132,12 @@ const startMovixConsoleSafetyWarning = () => {
 
 startMovixConsoleSafetyWarning();
 
+// Coins carrés (Paramètres > Apparence) : posé avant le premier render pour
+// éviter un flash de coins arrondis. Togglé live depuis SettingsPage.
+if (localStorage.getItem('square_corners_enabled') === '1') {
+  document.documentElement.classList.add('square-corners');
+}
+
 // Register block detection on both the default axios (used by most services)
 // and the api instance (used by contentAPI). Both need their own interceptors
 // since instances created via axios.create() don't inherit from the default.

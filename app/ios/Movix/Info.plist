@@ -57,9 +57,5 @@
     <array>
         <string>audio</string>
     </array>
-    <key>LSApplicationQueriesSchemes</key>
-    <array>
-        <string>tg</string>
-    </array>
 </dict>
 </plist>

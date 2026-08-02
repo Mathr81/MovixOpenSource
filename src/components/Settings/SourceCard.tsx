@@ -27,6 +27,7 @@ export const SOURCE_LABELS: Record<TopLevelSourceId, string> = {
   fstream: 'FStream',
   wiflix: 'Lynx',
   j1f: '1jour1film',
+  swiftflow: 'SwiftFlow',
   omega: 'Omega',
   coflix: 'Coflix',
   frembed: 'Frembed',

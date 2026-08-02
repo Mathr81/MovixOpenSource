@@ -9,10 +9,12 @@ const dbConfig = {
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   waitForConnections: true,
-  connectionLimit: 20,       // 20 × 6 workers = 120 connexions max (avant: 300 × 2 pools × 6 = 3600)
+  // Overridables via .env sans toucher au code. Attention : connectionLimit × nb
+  // workers doit rester sous le max_connections de MySQL (défaut serveur: 151).
+  connectionLimit: parseInt(process.env.DB_POOL_CONNECTION_LIMIT || '20'), // 20 × 6 workers = 120 connexions max
   maxIdle: 5,                // Libère les connexions inactives au-delà de 5
   idleTimeout: 60000,        // Ferme les connexions idle après 60s
-  queueLimit: 200,           // Limite la file d'attente en mémoire (avant: illimité)
+  queueLimit: parseInt(process.env.DB_POOL_QUEUE_LIMIT || '500'), // File d'attente par worker (0 = illimité, risque OOM)
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000
 };
@@ -85,13 +87,13 @@ async function withMysqlAdvisoryLock(poolInstance, lockName, task, options = {})
     }
 
     lockAcquired = true;
-    return await task();
+    return await task(connection);
   } finally {
     if (lockAcquired) {
       try {
         await connection.query('SELECT RELEASE_LOCK(?) AS released', [lockName]);
-      } catch (error) {
-        console.warn(`⚠️ Failed to release MySQL lock "${lockName}":`, error.message);
+      } catch {
+        console.warn('⚠️ Failed to release MySQL lock');
       }
     }
 

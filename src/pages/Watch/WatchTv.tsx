@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { getFrembedBase } from '../../utils/frembedConfig';
 import { useParams, useNavigate } from 'react-router-dom'; // Added useNavigate
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
@@ -8,6 +9,7 @@ import { useAdFreePopup } from '../../context/AdFreePopupContext';
 import AdFreePlayerAds from '../../components/AdFreePlayerAds';
 import { getAdPopupMode } from '../../utils/adPopupMode';
 import { extractM3u8FromEmbed, extractVoeM3u8, extractUqloadFile, extractDarkiboxSources, extractVidzyM3u8, extractFsvidM3u8, extractOneUploadSources, isOneUploadEmbed, isVoeEmbed, extractVidmolyM3u8, extractDoodStreamFile, extractSeekStreamingM3u8, isDoodStreamEmbed, isSeekStreamingEmbed, type M3u8Result } from '../../utils/extractM3u8';
+import { expandSeekStreamingSources, type SeekStreamingHlsSource } from '../../utils/seekStreamingCandidates';
 import { pickAutoSelectedSource, sortHostersByPriority, type SourceAvailability } from '../../utils/sourceAutoSelect';
 import { getSourcePriorityPrefs, buildDefaults, subscribeToPriorityChanges } from '../../utils/sourcePriorityPrefs';
 import { detectHoster } from '../../utils/hosterRegistry';
@@ -25,8 +27,12 @@ import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
 import { getClassificationLabel } from '../../utils/certificationUtils';
 import { getCoflixPreferredUrl } from '../../utils/coflix';
-
-
+import {
+  createHlsAutoFallbackGuard,
+  resolveAcceptedWatchSource,
+  resolveRenderedWatchSource,
+  syncHlsActiveSource,
+} from '../../utils/hlsAutoFallbackGuard';
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 
@@ -205,6 +211,33 @@ interface VoxTvResponse {
   episode: string;
 }
 
+// SwiftFlow source response (mirror of Wiflix/J1F episodes shape)
+interface SwiftflowTvResponse {
+  success: boolean;
+  tmdb_id: number;
+  title?: string;
+  source?: string;
+  season?: number;
+  episodes: {
+    [episodeNumber: string]: {
+      vf: Array<{
+        name: string;
+        url: string;
+        type: string;
+        label?: string;
+      }>;
+      vostfr: Array<{
+        name: string;
+        url: string;
+        type: string;
+        label?: string;
+      }>;
+    };
+  };
+  cache_timestamp?: string;
+  error?: string;
+}
+
 // Interface pour les saisons
 interface Season {
   id: number;
@@ -226,7 +259,7 @@ interface EpisodeInfo {
   vote_average?: number;
 }
 
-type PlayerSourceType = 'darkino' | 'mp4' | 'm3u8' | 'frembed' | 'custom' | 'vostfr' | 'omega' | 'coflix' | 'fstream' | 'wiflix' | 'j1f' | 'viper' | 'vox' | string | number; // Allow string for embed types
+type PlayerSourceType = 'darkino' | 'mp4' | 'm3u8' | 'frembed' | 'custom' | 'vostfr' | 'omega' | 'coflix' | 'fstream' | 'wiflix' | 'j1f' | 'swiftflow' | 'viper' | 'vox' | string | number; // Allow string for embed types
 
 function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
   const normalizedParts = parts
@@ -304,7 +337,7 @@ const checkCustomTVLink = async (showId: string, seasonNumber: number, episodeNu
 // Check Frembed Availability for Episodes
 const checkFrembedAvailability = async (showId: string, seasonNumber: number, episodeNumber: number): Promise<boolean> => {
   try {
-    const checkUrl = `https://frembed.click/api/public/v1/tv/${showId}?sa=${seasonNumber}&epi=${episodeNumber}`;
+    const checkUrl = `${getFrembedBase()}/api/public/v1/tv/${showId}?sa=${seasonNumber}&epi=${episodeNumber}`;
     const response = await axios.get(checkUrl, { timeout: 1000 });
 
     // Check status and if result has items
@@ -456,6 +489,7 @@ const WatchTv: React.FC = () => {
   // Ensure IDs are valid before parsing
   const seasonNumber = parseInt(seasonParam || '1', 10);
   const episodeNumber = parseInt(episodeParam || '1', 10);
+  const autoFallbackGuard = useMemo(() => createHlsAutoFallbackGuard(2), [id, seasonNumber, episodeNumber]);
 
   const [isLoading, setIsLoading] = useState(true);
   const [contentCert] = useState<string>('');
@@ -521,8 +555,14 @@ const WatchTv: React.FC = () => {
   const [selectedJ1fSource, setSelectedJ1fSource] = useState<number>(0);
   const [loadingJ1f, setLoadingJ1f] = useState(true);
 
+  // SwiftFlow source states
+  const [, setSwiftflowData] = useState<SwiftflowTvResponse | null>(null);
+  const [swiftflowSources, setSwiftflowSources] = useState<{ url: string; label: string; category: string }[]>([]);
+  const [selectedSwiftflowSource, setSelectedSwiftflowSource] = useState<number>(0);
+  const [loadingSwiftflow, setLoadingSwiftflow] = useState(true);
+
   // Extracted sources states (General HLS/File bucket)
-  const [nexusHlsSources, setNexusHlsSources] = useState<{ url: string; label: string }[]>([]);
+  const [nexusHlsSources, setNexusHlsSources] = useState<SeekStreamingHlsSource[]>([]);
   const [nexusFileSources, setNexusFileSources] = useState<{ url: string; label: string }[]>([]);
   const [selectedNexusHlsSource, setSelectedNexusHlsSource] = useState<number>(0);
   const [selectedNexusFileSource, setSelectedNexusFileSource] = useState<number>(0);
@@ -620,6 +660,19 @@ const WatchTv: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [j1fSources]);
 
+  const sortedSwiftflow = useMemo(() => {
+    const prefs = getSourcePriorityPrefs();
+    const annotated = swiftflowSources.map((s) => ({
+      ...s,
+      type: detectHoster(s.url, {
+        patternOverrides: prefs.patternOverrides,
+        customHosters: prefs.customHosters,
+      }) ?? 'unknown',
+    }));
+    return sortHostersByPriority(annotated, { category: 'moviesTv', topLevel: 'swiftflow' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [swiftflowSources]);
+
   // Omega / Coflix : les listes viennent de champs dérivés (`omegaData` / `coflixData`).
   // On annote via detectHoster sur l'URL (`.link` pour omega, URL préférée pour coflix)
   // puis on trie.
@@ -682,6 +735,14 @@ const WatchTv: React.FC = () => {
   // Used to reject stale auto-fallback sourceChange events from an unmounted/previous player.
   const currentActiveUrlRef = useRef<string>('');
 
+  useEffect(() => {
+    autoFallbackGuard.activate();
+    if (currentActiveUrlRef.current) {
+      autoFallbackGuard.syncActiveSource(currentActiveUrlRef.current);
+    }
+    return () => autoFallbackGuard.invalidate();
+  }, [autoFallbackGuard]);
+
   // State for Embed player
   const [embedUrl, setEmbedUrl] = useState<string | null>(null);
   const [embedType, setEmbedType] = useState<string | null>(null);
@@ -703,8 +764,58 @@ const WatchTv: React.FC = () => {
   const [videoSource, setVideoSource] = useState<string | null>(null);
 
   useEffect(() => {
-    currentActiveUrlRef.current = videoSource || embedUrl || '';
-  }, [videoSource, embedUrl]);
+    let directSourceUrl = '';
+    if (selectedSource === 'nexus_hls') {
+      directSourceUrl = nexusHlsSources[selectedNexusHlsSource]?.url || '';
+    } else if (selectedSource === 'nexus_file') {
+      directSourceUrl = nexusFileSources[selectedNexusFileSource]?.url || '';
+    } else if (selectedSource === 'darkino') {
+      directSourceUrl = darkinoSources[selectedDarkinoSource]?.m3u8 || '';
+    } else if (selectedSource === 'mp4') {
+      directSourceUrl =
+        videoSource
+        || sibnetUrl
+        || mp4Sources[selectedMp4Source]?.url
+        || '';
+    } else if (selectedSource === 'm3u8') {
+      directSourceUrl = adFreeM3u8Url || videoSource || '';
+    } else if (selectedSource === 'rivestream') {
+      directSourceUrl = rivestreamSources[selectedRivestreamSource]?.url || '';
+    } else if (
+      selectedSource === 'rivestream_hls'
+      || selectedSource === 'bravo'
+    ) {
+      directSourceUrl = videoSource || '';
+    }
+
+    if (loadingRivestream && !directSourceUrl) {
+      directSourceUrl = lastValidHlsSrcRef.current;
+    }
+
+    syncHlsActiveSource(
+      autoFallbackGuard,
+      currentActiveUrlRef,
+      resolveRenderedWatchSource(selectedSource, directSourceUrl, embedUrl),
+    );
+  }, [
+    adFreeM3u8Url,
+    autoFallbackGuard,
+    darkinoSources,
+    embedUrl,
+    loadingRivestream,
+    mp4Sources,
+    nexusFileSources,
+    nexusHlsSources,
+    rivestreamSources,
+    selectedDarkinoSource,
+    selectedMp4Source,
+    selectedNexusFileSource,
+    selectedNexusHlsSource,
+    selectedRivestreamSource,
+    selectedSource,
+    sibnetUrl,
+    videoSource,
+  ]);
 
   // état pour le menu des épisodes
   const [showEpisodesMenu, setShowEpisodesMenu] = useState(false);
@@ -1023,7 +1134,7 @@ const WatchTv: React.FC = () => {
 
     // Determine if all necessary sources have finished loading attempts
     // Determine if all necessary sources have finished loading attempts
-    const areSourcesLoading = loadingDarkino || loadingCoflix || loadingOmega || loadingCustom || loadingSibnet || loadingFrembed || loadingFstream || loadingWiflix || loadingJ1f || loadingViper || loadingExtractions;
+    const areSourcesLoading = loadingDarkino || loadingCoflix || loadingOmega || loadingCustom || loadingSibnet || loadingFrembed || loadingFstream || loadingWiflix || loadingJ1f || loadingSwiftflow || loadingViper || loadingExtractions;
 
     if (!areSourcesLoading) {
       setVipRetryMessage(null); // Clear VIP message once attempts are done
@@ -1080,7 +1191,7 @@ const WatchTv: React.FC = () => {
         // Try frembed as a fallback
         else if (frembedAvailable && id) {
           setSelectedSource('frembed');
-          setEmbedUrl(`https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`);
+          setEmbedUrl(`${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`);
           setEmbedType('frembed');
         }
         // Note: Ne pas sélectionner automatiquement vostfr - laisser l'utilisateur choisir
@@ -1098,7 +1209,7 @@ const WatchTv: React.FC = () => {
 
       setIsLoading(false); // Mark loading as complete
     }
-  }, [loadingDarkino, loadingCoflix, loadingOmega, loadingCustom, loadingSibnet, loadingFrembed, loadingFstream, loadingWiflix, loadingJ1f, loadingExtractions, isLoading, selectedSource, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, id, seasonNumber, episodeNumber, customSources, frembedAvailable]);
+  }, [loadingDarkino, loadingCoflix, loadingOmega, loadingCustom, loadingSibnet, loadingFrembed, loadingFstream, loadingWiflix, loadingJ1f, loadingSwiftflow, loadingExtractions, isLoading, selectedSource, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, id, seasonNumber, episodeNumber, customSources, frembedAvailable]);
 
   // Add effect to hide Sources button in HLS mode
   useEffect(() => {
@@ -1391,6 +1502,19 @@ const WatchTv: React.FC = () => {
           }
         })();
 
+        // ========== CHECK SWIFTFLOW SOURCE ==========
+        const swiftflowPromise = (async () => {
+          try {
+            const swiftflowResponse = await axios.get(`${MAIN_API}/api/swiftflow/tv/${id}/season/${seasonNumber}`);
+            return swiftflowResponse.data;
+          } catch (error) {
+            console.error('Error fetching SwiftFlow TV source:', error);
+            return null;
+          } finally {
+            setLoadingSwiftflow(false);
+          }
+        })();
+
         // ========== CHECK VIPER SOURCE ==========
         const viperPromise = (async () => {
           try {
@@ -1428,7 +1552,8 @@ const WatchTv: React.FC = () => {
           wiflixResult,
           viperResult,
           voxResult,
-          j1fResult
+          j1fResult,
+          swiftflowResult
         ] = await Promise.all([
           darkinoPromise,
           customLinksPromise,
@@ -1440,7 +1565,8 @@ const WatchTv: React.FC = () => {
           wiflixPromise,
           viperPromise,
           voxPromise,
-          j1fPromise
+          j1fPromise,
+          swiftflowPromise
         ]);
 
         // ========== PROCESS OMEGA RESULTS (before setting state) ==========
@@ -1516,7 +1642,7 @@ const WatchTv: React.FC = () => {
         }
 
         // ========== INITIALISATION DES CONTAINERS POUR SOURCES EXTRAITES ==========
-        let finalHlsSources: { url: string; label: string }[] = [];
+        let finalHlsSources: SeekStreamingHlsSource[] = [];
         let finalFileSources: { url: string; label: string }[] = [];
         let localBravoSources: { url: string; label: string }[] = [];
 
@@ -1740,16 +1866,17 @@ const WatchTv: React.FC = () => {
               const seekPromises = seekLinks.map(async (seekUrl: string) => {
                 try {
                   const seekResult = await extractSeekStreamingM3u8(seekUrl);
-                  if (seekResult?.success && seekResult.hlsUrl) {
-                    return { url: seekResult.hlsUrl, label: 'SeekStreaming HLS' };
-                  }
+                  return expandSeekStreamingSources(seekResult, {
+                    label: 'SeekStreaming HLS',
+                    seekEmbedUrl: seekUrl,
+                  });
                 } catch (e) {
                   console.error(' Error extracting SeekStreaming from Firebase link (TV):', e);
                 }
-                return null;
+                return [];
               });
               const seekResults = await Promise.all(seekPromises);
-              const validSeekResults = seekResults.filter(result => result !== null);
+              const validSeekResults = seekResults.flat();
               finalHlsSources = [...finalHlsSources, ...validSeekResults];
               console.log(` Added ${validSeekResults.length} SeekStreaming HLS sources from Firebase`);
             }
@@ -1844,16 +1971,17 @@ const WatchTv: React.FC = () => {
             const seekMultiPromises = seekMulti.map(async (sUrl: string) => {
               try {
                 const seekResult = await extractSeekStreamingM3u8(sUrl);
-                if (seekResult?.success && seekResult.hlsUrl) {
-                  return { url: seekResult.hlsUrl, label: 'SeekStreaming HLS' };
-                }
+                return expandSeekStreamingSources(seekResult, {
+                  label: 'SeekStreaming HLS',
+                  seekEmbedUrl: sUrl,
+                });
               } catch (e) {
                 console.error('? Error extracting SeekStreaming from MULTI link (TV):', e);
               }
-              return null;
+              return [];
             });
             const seekMultiResults = await Promise.all(seekMultiPromises);
-            const validSeekMultiResults = seekMultiResults.filter(result => result !== null);
+            const validSeekMultiResults = seekMultiResults.flat();
             finalHlsSources = [...finalHlsSources, ...validSeekMultiResults];
             console.log(`? Added ${validSeekMultiResults.length} SeekStreaming HLS sources from MULTI`);
           }
@@ -2108,6 +2236,37 @@ const WatchTv: React.FC = () => {
         setJ1fSources(j1fProcessedSources);
         console.log('?? [WatchTv] 1jour1film TV sources set:', j1fProcessedSources.length);
 
+        // =========== TRAITEMENT DES RÉSULTATS SWIFTFLOW ===========
+        let swiftflowProcessedSources: { url: string; label: string; category: string }[] = [];
+
+        if (swiftflowResult && swiftflowResult.success && swiftflowResult.episodes) {
+          setSwiftflowData(swiftflowResult);
+          const episodeData = swiftflowResult.episodes[episodeNumber.toString()];
+          if (episodeData) {
+            const categories = ['vf', 'vostfr'];
+            const vfSources: { url: string; label: string; category: string }[] = [];
+            const vostfrSources: { url: string; label: string; category: string }[] = [];
+            categories.forEach(category => {
+              const categoryPlayers = episodeData[category as keyof typeof episodeData] || [];
+              categoryPlayers.forEach((player: any) => {
+                const source = {
+                  url: player.url,
+                  label: `SwiftFlow ${category.toUpperCase()}${player.label ? ` - ${player.label}` : ''}`,
+                  category: category.toUpperCase(),
+                };
+                if (category === 'vf') vfSources.push(source);
+                else vostfrSources.push(source);
+              });
+            });
+            swiftflowProcessedSources = [...vfSources, ...vostfrSources];
+          }
+        } else {
+          setSwiftflowData(null);
+        }
+
+        setSwiftflowSources(swiftflowProcessedSources);
+        console.log('[WatchTv] SwiftFlow TV sources set:', swiftflowProcessedSources.length);
+
         // =========== EXTRACTION ONEUPLOAD DEPUIS WIFLIX ===========
         if (wiflixProcessedSources.length > 0) {
           console.log('?? Checking for OneUpload sources in Wiflix TV results...');
@@ -2338,15 +2497,16 @@ const WatchTv: React.FC = () => {
 
             const seekExtractionResults = await Promise.all(seekExtractionPromises);
 
-            const validSeekResults: { url: string; label: string }[] = [];
-            seekExtractionResults.forEach(({ result, originalSource }) => {
-              if (result?.success && result.hlsUrl) {
-                validSeekResults.push({
-                  url: result.hlsUrl,
-                  label: `SeekStreaming HLS ${originalSource.category || ''}`
-                });
-              }
-            });
+            const validSeekResults = seekExtractionResults.flatMap(({ result, originalSource }) =>
+              expandSeekStreamingSources(result, {
+                label: `SeekStreaming HLS ${
+                  originalSource.category
+                  || (originalSource as { language?: string }).language
+                  || ''
+                }`.trim(),
+                seekEmbedUrl: originalSource.url,
+              }),
+            );
 
             if (validSeekResults.length > 0) {
               const seekVfSources = validSeekResults.filter(s => s.label.includes('VF'));
@@ -2539,15 +2699,12 @@ const WatchTv: React.FC = () => {
               });
 
               const seekExtractionResults = await Promise.all(seekExtractionPromises);
-              const validSeekResults: { url: string; label: string }[] = [];
-              seekExtractionResults.forEach(({ result, originalSource }) => {
-                if (result?.success && result.hlsUrl) {
-                  validSeekResults.push({
-                    url: result.hlsUrl,
-                    label: `SeekStreaming HLS ${originalSource.language}`
-                  });
-                }
-              });
+              const validSeekResults = seekExtractionResults.flatMap(({ result, originalSource }) =>
+                expandSeekStreamingSources(result, {
+                  label: `SeekStreaming HLS ${originalSource.language}`.trim(),
+                  seekEmbedUrl: originalSource.url,
+                }),
+              );
 
               if (validSeekResults.length > 0) {
                 const vf = validSeekResults.filter(s => s.label.includes('VF'));
@@ -2720,13 +2877,15 @@ const WatchTv: React.FC = () => {
               const sortedHls = sortHostersByPriority(
                 finalHlsSources.map((s: any) => ({
                   ...s,
-                  type: (detectHoster(s.url || '', {
-                    patternOverrides: prefsNh.patternOverrides,
-                    customHosters: prefsNh.customHosters,
-                  }) ?? detectHoster(s.label || '', {
-                    patternOverrides: prefsNh.patternOverrides,
-                    customHosters: prefsNh.customHosters,
-                  })) ?? 'unknown',
+                  type: s.seekKind
+                    ? 'seekstreaming'
+                    : ((detectHoster(s.url || '', {
+                        patternOverrides: prefsNh.patternOverrides,
+                        customHosters: prefsNh.customHosters,
+                      }) ?? detectHoster(s.label || '', {
+                        patternOverrides: prefsNh.patternOverrides,
+                        customHosters: prefsNh.customHosters,
+                      })) ?? 'unknown'),
                 })),
                 { category: 'moviesTv', topLevel: 'nexus_hls' },
               );
@@ -2915,6 +3074,27 @@ const WatchTv: React.FC = () => {
               setOnlyVostfrAvailable(false);
               return true;
             }
+            case 'swiftflow': {
+              console.log('✅ Selecting SWIFTFLOW as source');
+              const prefsSwiftflow = getSourcePriorityPrefs();
+              const sortedSwiftflowLocal = sortHostersByPriority(
+                swiftflowProcessedSources.map((s) => ({
+                  ...s,
+                  type: detectHoster(s.url, {
+                    patternOverrides: prefsSwiftflow.patternOverrides,
+                    customHosters: prefsSwiftflow.customHosters,
+                  }) ?? 'unknown',
+                })),
+                { category: 'moviesTv', topLevel: 'swiftflow' },
+              );
+              setSelectedSource('swiftflow');
+              setSelectedSwiftflowSource(0);
+              setEmbedUrl(sortedSwiftflowLocal[0].url);
+              setEmbedType('swiftflow');
+              currentSourceRef.current = 'swiftflow';
+              setOnlyVostfrAvailable(false);
+              return true;
+            }
             case 'viper': {
               console.log('✅ Selecting VIPER as source');
               // Pré-tri langue + hoster pour respecter la préférence user
@@ -2985,7 +3165,7 @@ const WatchTv: React.FC = () => {
               if (!frembedAvailabilityResult) return false;
               console.log('✅ Selecting FREMBED as source');
               setSelectedSource('frembed');
-              setEmbedUrl(`https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`);
+              setEmbedUrl(`${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`);
               setEmbedType('frembed');
               currentSourceRef.current = 'frembed';
               return true;
@@ -3038,6 +3218,7 @@ const WatchTv: React.FC = () => {
             { id: 'omega', hasData: !!(isOmegaAvailable && rawOmegaData) },
             { id: 'wiflix', hasData: wiflixProcessedSources.length > 0 },
             { id: 'j1f', hasData: j1fProcessedSources.length > 0 },
+            { id: 'swiftflow', hasData: swiftflowProcessedSources.length > 0 },
             { id: 'viper', hasData: viperProcessedSources.length > 0 },
             { id: 'coflix', hasData: !!(coflixResult && (coflixResult.current_episode?.player_links?.length || coflixResult.player_links?.length)) },
             { id: 'custom', hasData: !!(customLinksResult.customLinks && customLinksResult.customLinks.length) },
@@ -3097,11 +3278,13 @@ const WatchTv: React.FC = () => {
   useEffect(() => {
     const handleSourceChangeFromMenu = (event: CustomEvent) => {
       const { type, url, origin, fromSrc } = event.detail as { type: PlayerSourceType | string, url: string, id?: string | number, origin?: string, fromSrc?: string };
+      const isAutomaticFallback =
+        typeof origin === 'string' && origin.includes('auto-fallback');
 
       // Reject stale auto-fallback events whose originating src no longer matches
       // the currently-active player URL. This prevents a late error handler from
       // a previously-selected player reverting a user's manual switch.
-      if (origin === 'auto-fallback' && typeof fromSrc === 'string' && fromSrc) {
+      if (isAutomaticFallback && typeof fromSrc === 'string' && fromSrc) {
         if (fromSrc !== currentActiveUrlRef.current) {
           console.log(
             `[WatchTv] Ignoring stale auto-fallback sourceChange (from=${fromSrc.substring(0, 80)} current=${currentActiveUrlRef.current.substring(0, 80)})`
@@ -3110,9 +3293,122 @@ const WatchTv: React.FC = () => {
         }
       }
 
+      const isRivestreamRetry =
+        type === 'rivestream_hls' && event.detail.id === 'rivestream_retry';
+      const isRivestreamTrigger =
+        type === 'rivestream_hls'
+        && !isRivestreamRetry
+        && (!url || url === '#')
+        && rivestreamSources.length === 0;
+      const rivestreamAllowed =
+        (type !== 'rivestream_hls' && type !== 'rivestream')
+        || isRivestreamRetry
+        || isRivestreamAvailable();
+      const bravoAllowed = type !== 'bravo' || canUseBravo;
+      if (isRivestreamTrigger && !rivestreamAllowed) return;
+
+      const acceptedPlaybackUrl = (() => {
+        switch (type) {
+          case 'nexus_hls':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: nexusHlsSources.map(source => source.url),
+              fallback: 'first',
+            });
+          case 'nexus_file':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: nexusFileSources.map(source => source.url),
+              fallback: 'first',
+            });
+          case 'darkino':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: darkinoSources.map(source => source.m3u8),
+              fallback: 'first',
+            });
+          case 'mp4':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: mp4Sources.map(source => source.url),
+              fallback: 'first',
+            });
+          case 'm3u8':
+            return resolveAcceptedWatchSource({
+              requestedSource: url || adFreeM3u8Url,
+            });
+          case 'sibnet':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: sibnetUrl ? [sibnetUrl] : [],
+              fallback: 'first',
+            });
+          case 'rivestream_hls':
+            if (isRivestreamTrigger) return null;
+            if (isRivestreamRetry) {
+              return resolveAcceptedWatchSource({
+                requestedSource: url,
+                allowed: rivestreamAllowed,
+              });
+            }
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: rivestreamSources.map(source => source.url),
+              allowed: rivestreamAllowed,
+              fallback: 'first',
+            });
+          case 'rivestream':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: rivestreamSources.map(source => source.url),
+              allowed: rivestreamAllowed,
+            });
+          case 'bravo':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              availableSources: purstreamSources.map(source => source.url),
+              allowed: bravoAllowed,
+              fallback: 'last',
+            });
+          case 'frembed':
+          case 'custom':
+          case 'vostfr':
+          case 'omega':
+          case 'coflix':
+          case 'wiflix':
+          case 'j1f':
+          case 'swiftflow':
+          case 'viper':
+          case 'adfree':
+          case 'vox':
+            return resolveAcceptedWatchSource({ requestedSource: url });
+          case 'fstream':
+            return resolveAcceptedWatchSource({
+              requestedSource: url,
+              transform: getProxyUrl,
+            });
+          default:
+            return null;
+        }
+      })();
+
+      if (!isRivestreamTrigger && !acceptedPlaybackUrl) return;
+
       // M11 — track last manually-picked player for "remember last player".
       // Filtre les events auto-fallback ; setLastPlayer valide les ids en interne.
-      if (origin !== 'auto-fallback' && typeof type === 'string') {
+      if (acceptedPlaybackUrl) {
+        syncHlsActiveSource(
+          autoFallbackGuard,
+          currentActiveUrlRef,
+          acceptedPlaybackUrl,
+        );
+      }
+
+      if (
+        !isRivestreamTrigger
+        && !isAutomaticFallback
+        && typeof type === 'string'
+      ) {
         setLastPlayer(type);
       }
 
@@ -3122,7 +3418,7 @@ const WatchTv: React.FC = () => {
       // le trigger ne doit PAS dismisser l'UI "Contenu non trouvé", sinon on remplace l'écran utile
       // par un player vide pendant que le fetch tourne, et si le fetch ne retrouve rien l'utilisateur
       // se retrouve coincé sur un état cassé. Idem pour le menu pendant le chargement Rivestream.
-      if (type !== 'rivestream_hls') {
+      if (!isRivestreamTrigger) {
         setOnlyVostfrAvailable(false);
         if (!isLoadingRivestreamRef.current) {
           setShowEmbedQuality(false);
@@ -3132,13 +3428,13 @@ const WatchTv: React.FC = () => {
       // Handle HLS source selections
       if (type === 'nexus_hls' || type === 'nexus_file' || type === 'darkino' || type === 'mp4' || type === 'm3u8' || type === 'sibnet' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo') {
         // Ne pas cacher l'iframe si c'est juste le déclencheur de chargement Rivestream
-        if (type !== 'rivestream_hls') {
+        if (!isRivestreamTrigger) {
           setEmbedUrl(null); // Hide iframe
           setEmbedType(null);
         }
 
         if (type === 'nexus_hls') {
-          const index = nexusHlsSources.findIndex(s => s.url === url);
+          const index = nexusHlsSources.findIndex(s => s.url === acceptedPlaybackUrl);
           if (index !== -1) {
             setSelectedNexusHlsSource(index);
             setSelectedSource('nexus_hls');
@@ -3151,7 +3447,7 @@ const WatchTv: React.FC = () => {
             currentSourceRef.current = 'nexus_hls';
           }
         } else if (type === 'nexus_file') {
-          const index = nexusFileSources.findIndex(s => s.url === url);
+          const index = nexusFileSources.findIndex(s => s.url === acceptedPlaybackUrl);
           if (index !== -1) {
             setSelectedNexusFileSource(index);
             setSelectedSource('nexus_file');
@@ -3164,7 +3460,7 @@ const WatchTv: React.FC = () => {
             currentSourceRef.current = 'nexus_file';
           }
         } else if (type === 'darkino') {
-          const index = darkinoSources.findIndex(s => s.m3u8 === url);
+          const index = darkinoSources.findIndex(s => s.m3u8 === acceptedPlaybackUrl);
           if (index !== -1) {
             setSelectedDarkinoSource(index);
             setSelectedSource('darkino');
@@ -3177,7 +3473,7 @@ const WatchTv: React.FC = () => {
             }
           }
         } else if (type === 'mp4') {
-          const index = mp4Sources.findIndex(s => s.url === url);
+          const index = mp4Sources.findIndex(s => s.url === acceptedPlaybackUrl);
           if (index !== -1) {
             setSelectedMp4Source(index);
             setSelectedSource('mp4');
@@ -3192,7 +3488,7 @@ const WatchTv: React.FC = () => {
             }
           }
         } else if (type === 'm3u8') {
-          const m3u8UrlToUse = url || adFreeM3u8Url;
+          const m3u8UrlToUse = acceptedPlaybackUrl;
           if (m3u8UrlToUse) {
             setSelectedSource('m3u8');
             setVideoSource(m3u8UrlToUse);
@@ -3210,26 +3506,22 @@ const WatchTv: React.FC = () => {
             }
           }
         }
-        else if (type === 'sibnet' && sibnetUrl) {
+        else if (type === 'sibnet' && acceptedPlaybackUrl) {
           setSelectedSource('mp4'); // Treat as mp4
-          setVideoSource(sibnetUrl);
+          setVideoSource(acceptedPlaybackUrl);
           currentSourceRef.current = 'mp4';
         }
-        else if (type === 'rivestream_hls' && event.detail.id === 'rivestream_retry') {
+        else if (type === 'rivestream_hls' && isRivestreamRetry) {
           // CAS PRIORITAIRE: retry avec un nouveau proxy - utiliser directement l'URL fournie
           console.log('?? [WatchTv] Rivestream proxy retry with new URL:', url);
           setSelectedSource('rivestream_hls');
-          setVideoSource(url);
+          setVideoSource(acceptedPlaybackUrl);
           currentSourceRef.current = 'rivestream_hls';
           setEmbedUrl(null);
           setEmbedType(null);
         }
         else if (type === 'rivestream_hls') {
           // Vérifier si Rivestream est disponible (VIP check si activé)
-          if (!isRivestreamAvailable()) {
-            console.log('?? Rivestream sources are only available for VIP users');
-            return;
-          }
           // Déclencher le chargement des sources Rivestream
           if (rivestreamSources.length === 0 && !loadingRivestream) {
             console.log('?? [WatchTv] Rivestream button clicked, triggering fetch');
@@ -3241,11 +3533,20 @@ const WatchTv: React.FC = () => {
               loadingRivestream,
               sourcesCount: rivestreamSources.length
             });
+            if (acceptedPlaybackUrl) {
+              const index = rivestreamSources.findIndex(
+                source => source.url === acceptedPlaybackUrl,
+              );
+              setSelectedRivestreamSource(index >= 0 ? index : 0);
+              setSelectedSource('rivestream_hls');
+              setVideoSource(acceptedPlaybackUrl);
+              currentSourceRef.current = 'rivestream_hls';
+            }
           }
         }
         else if (type === 'rivestream') {
           // Sélection d'une source Rivestream spécifique depuis le menu
-          const index = rivestreamSources.findIndex(s => s.url === url);
+          const index = rivestreamSources.findIndex(s => s.url === acceptedPlaybackUrl);
           if (index !== -1) {
             setSelectedRivestreamSource(index);
             setSelectedSource('rivestream');
@@ -3255,14 +3556,8 @@ const WatchTv: React.FC = () => {
         }
         else if (type === 'bravo') {
           // Sélection d'une source Bravo (PurStream) depuis le menu
-          const index = purstreamSources.findIndex(s => s.url === url);
-          const chosenBravoUrl = index !== -1
-            ? purstreamSources[index].url
-            : (purstreamSources[purstreamSources.length - 1]?.url || '');
+          const chosenBravoUrl = acceptedPlaybackUrl;
           if (chosenBravoUrl) {
-            if (!canUseBravo) {
-              return;
-            }
             setSelectedSource('bravo');
             setVideoSource(chosenBravoUrl);
             setEmbedUrl(null);
@@ -3272,8 +3567,8 @@ const WatchTv: React.FC = () => {
         }
       }
       // Handle Embed source selections
-      else if (type === 'frembed' || type === 'custom' || type === 'vostfr' || type === 'omega' || type === 'coflix' || type === 'fstream' || type === 'wiflix' || type === 'j1f' || type === 'viper' || type === 'adfree' || type === 'vox') {
-        setEmbedUrl(type === 'fstream' ? getProxyUrl(url) : url);
+      else if (type === 'frembed' || type === 'custom' || type === 'vostfr' || type === 'omega' || type === 'coflix' || type === 'fstream' || type === 'wiflix' || type === 'j1f' || type === 'swiftflow' || type === 'viper' || type === 'adfree' || type === 'vox') {
+        setEmbedUrl(acceptedPlaybackUrl!);
         setEmbedType(type as string); // type is known to be a string here
         setSelectedSource(type as PlayerSourceType);
         currentSourceRef.current = type as PlayerSourceType; // Or null for embeds if ref not used
@@ -3309,6 +3604,16 @@ const WatchTv: React.FC = () => {
           } else if (sortedJ1f.length > 0) {
             setSelectedJ1fSource(0);
             setEmbedUrl(sortedJ1f[0].url);
+          }
+        }
+        // Handle SwiftFlow source selection
+        else if (type === 'swiftflow') {
+          const index = sortedSwiftflow.findIndex(s => s.url === url);
+          if (index !== -1) {
+            setSelectedSwiftflowSource(index);
+          } else if (sortedSwiftflow.length > 0) {
+            setSelectedSwiftflowSource(0);
+            setEmbedUrl(sortedSwiftflow[0].url);
           }
         }
         // Handle Viper source selection
@@ -3347,12 +3652,12 @@ const WatchTv: React.FC = () => {
       window.removeEventListener('sourceChange', handleSourceChangeFromMenu as EventListener);
     };
   }, [
-    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, canUseBravo, // Data sources
+    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, sortedSwiftflow, swiftflowSources, canUseBravo, // Data sources
     setOnlyVostfrAvailable, setShowEmbedQuality, // State setters for visibility
     setEmbedUrl, setEmbedType, setSelectedSource, // General source setters
     setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedFstreamSource, setVideoSource, setSelectedViperSource, // HLS specific setters
     loadingRivestream, rivestreamLoaded, fetchRivestreamSources, // Rivestream specific
-    currentSourceRef, isLoadingRivestreamRef // Refs
+    currentSourceRef, isLoadingRivestreamRef, autoFallbackGuard // Refs
   ]);
 
   // --- Render Logic ---
@@ -3498,7 +3803,7 @@ const WatchTv: React.FC = () => {
         }
         break;
       case 'frembed':
-        const frembedUrl = `https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`;
+        const frembedUrl = `${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}`;
         setEmbedUrl(frembedUrl);
         setEmbedType('frembed');
         setSelectedSource('frembed');
@@ -3918,6 +4223,9 @@ const WatchTv: React.FC = () => {
           (j1fSources.length > 0 && j1fSources.some(source =>
             source.category === 'VF'
           )) ||
+          (swiftflowSources.length > 0 && swiftflowSources.some(source =>
+            source.category === 'VF'
+          )) ||
           (viperSources.length > 0 && viperSources.some(source =>
             source.language === 'VF'
           )) ||
@@ -3962,6 +4270,9 @@ const WatchTv: React.FC = () => {
             break;
           case 'j1f':
             playerType = 'j1f';
+            break;
+          case 'swiftflow':
+            playerType = 'swiftflow';
             break;
           case 'viper':
             playerType = 'viper';
@@ -4127,6 +4438,12 @@ const WatchTv: React.FC = () => {
           sortedJ1f[selectedJ1fSource];
         return formatPremidSourceDetail(source?.label, source?.category);
       }
+      case 'swiftflow': {
+        const source =
+          sortedSwiftflow.find(entry => entry.url === embedUrl) ||
+          sortedSwiftflow[selectedSwiftflowSource];
+        return formatPremidSourceDetail(source?.label, source?.category);
+      }
       case 'viper': {
         const source =
           viperSources.find(entry => entry.url === embedUrl) ||
@@ -4286,6 +4603,7 @@ const WatchTv: React.FC = () => {
                   <div className="p-4">
                     <HLSPlayer
                       priorityCategory="moviesTv"
+                      autoFallbackGuard={autoFallbackGuard}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -4307,6 +4625,7 @@ const WatchTv: React.FC = () => {
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
                       j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
                       rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
                       rivestreamCaptions={isRivestreamAvailable() ? rivestreamCaptions : []}
                       loadingRivestream={isRivestreamAvailable() ? loadingRivestream : false}
@@ -4315,7 +4634,7 @@ const WatchTv: React.FC = () => {
                       autoPlay={false}
                       onlyQualityMenu={true}
                       embedType={selectedSource === 'frembed' ? 'frembed' : (embedType || undefined)}
-                      embedUrl={selectedSource === 'frembed' ? `https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
+                      embedUrl={selectedSource === 'frembed' ? `${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
                     />
                   </div>
                 </div>
@@ -4573,7 +4892,7 @@ const WatchTv: React.FC = () => {
             src={embedUrl || ''}
             className="w-full h-full border-0"
             allowFullScreen
-            referrerPolicy="strict-origin-when-cross-origin"
+            referrerPolicy={(embedUrl || '').toLowerCase().includes('ezplayer') ? 'no-referrer' : 'strict-origin-when-cross-origin'}
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
             sandbox={(() => {
               const urlLower = embedUrl ? embedUrl.toLowerCase() : '';
@@ -4632,6 +4951,7 @@ const WatchTv: React.FC = () => {
                   <div className="p-4">
                     <HLSPlayer
                       priorityCategory="moviesTv"
+                      autoFallbackGuard={autoFallbackGuard}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -4653,6 +4973,7 @@ const WatchTv: React.FC = () => {
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
                       j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
 
                       voxSources={voxSources}
@@ -4664,7 +4985,7 @@ const WatchTv: React.FC = () => {
                       autoPlay={false}
                       onlyQualityMenu={true}
                       embedType={selectedSource === 'frembed' ? 'frembed' : (embedType || undefined)}
-                      embedUrl={selectedSource === 'frembed' ? `https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
+                      embedUrl={selectedSource === 'frembed' ? `${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
                     />
                   </div>
                 </div>
@@ -4676,6 +4997,7 @@ const WatchTv: React.FC = () => {
         <div className="w-full h-full flex items-center justify-center">
           <HLSPlayer
             priorityCategory="moviesTv"
+            autoFallbackGuard={autoFallbackGuard}
             key={`${selectedSource}-${selectedMp4Source}-${hlsSrc}-${videoSource}`} // Updated key to include videoSource
             src={hlsSrc}
             poster={showPosterPath ? `https://image.tmdb.org/t/p/w500${showPosterPath}` : undefined}
@@ -4707,6 +5029,7 @@ const WatchTv: React.FC = () => {
             fstreamSources={sortedFstream}
             wiflixSources={sortedWiflix}
                       j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
 
             voxSources={voxSources}
@@ -4752,6 +5075,7 @@ const WatchTv: React.FC = () => {
                   <div className="p-4">
                     <HLSPlayer
                       priorityCategory="moviesTv"
+                      autoFallbackGuard={autoFallbackGuard}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -4771,6 +5095,7 @@ const WatchTv: React.FC = () => {
                       fstreamSources={sortedFstream}
                       wiflixSources={sortedWiflix}
                       j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
 
                       voxSources={voxSources}
@@ -4782,7 +5107,7 @@ const WatchTv: React.FC = () => {
                       autoPlay={false}
                       onlyQualityMenu={true}
                       embedType={selectedSource === 'frembed' ? 'frembed' : (embedType || undefined)}
-                      embedUrl={selectedSource === 'frembed' ? `https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
+                      embedUrl={selectedSource === 'frembed' ? `${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
                     />
                   </div>
                 </div>
@@ -4794,6 +5119,7 @@ const WatchTv: React.FC = () => {
         <div className="w-full h-full flex flex-col items-center justify-center relative bg-black">
           <HLSPlayer
             priorityCategory="moviesTv"
+            autoFallbackGuard={autoFallbackGuard}
             src={''}
             className="hidden"
             movieId={undefined}
@@ -4815,6 +5141,7 @@ const WatchTv: React.FC = () => {
             fstreamSources={sortedFstream}
             wiflixSources={sortedWiflix}
                       j1fSources={sortedJ1f}
+                      swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
 
             rivestreamSources={isRivestreamAvailable() ? rivestreamSources : []}
@@ -4825,7 +5152,7 @@ const WatchTv: React.FC = () => {
             autoPlay={false}
             onlyQualityMenu={true}
             embedType={selectedSource === 'frembed' ? 'frembed' : (embedType || undefined)}
-            embedUrl={selectedSource === 'frembed' ? `https://frembed.click/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
+            embedUrl={selectedSource === 'frembed' ? `${getFrembedBase()}/api/serie.php?id=${id}&sa=${seasonNumber}&epi=${episodeNumber}` : (embedUrl ?? undefined)}
           />
         </div>
       )}

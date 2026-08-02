@@ -8,6 +8,7 @@ import {
   Modal,
   TouchableOpacity,
   ActivityIndicator,
+  AppState,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -17,7 +18,8 @@ import WebViewBrowser, { type WebViewBrowserRef } from '../components/WebViewBro
 import BrowserToolbar from '../components/BrowserToolbar';
 import MiniPill from '../components/MiniPill';
 import MirrorErrorScreen from '../components/MirrorErrorScreen';
-import { startCastShimEventForwarding } from '../services/bridge';
+import { setLocalPlaybackAwake } from '../services/playbackAwake';
+import { setPictureInPicturePlaybackActive } from '../services/pictureInPicture';
 import { useBrowserUIPrefs } from '../hooks/useBrowserUIPrefs';
 import { useAddress } from '../context/AddressContext';
 import SettingsScreen from './SettingsScreen';
@@ -44,6 +46,7 @@ export default function BrowserScreen() {
   const [currentUrl, setCurrentUrl] = useState('');
   const [dnsEnabled, setDnsEnabled] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
+  const [isPictureInPictureActive, setIsPictureInPictureActive] = useState(false);
 
   const activeUrl = urlChain[mirrorIndex] ?? '';
 
@@ -72,8 +75,24 @@ export default function BrowserScreen() {
   }, [canGoBack, settingsVisible]);
 
   useEffect(() => {
-    const unsub = startCastShimEventForwarding(webViewRef);
-    return unsub;
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        webViewRef.current?.refreshCastShimStatus();
+      }
+    });
+    return () => subscription.remove();
+  }, [activeUrl]);
+
+  useEffect(() => () => {
+    setPictureInPicturePlaybackActive(false);
+    setLocalPlaybackAwake(false);
+  }, []);
+
+  const onPictureInPictureModeChange = useCallback((active: boolean) => {
+    if (active) {
+      setSettingsVisible(false);
+    }
+    setIsPictureInPictureActive(active);
   }, []);
 
   const onNavigationStateChange = useCallback((state: WebViewNavigation) => {
@@ -123,7 +142,9 @@ export default function BrowserScreen() {
   }
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <View style={[styles.container, {
+      paddingTop: isPictureInPictureActive ? 0 : insets.top,
+    }]}>
       <View style={styles.webViewContainer}>
         <WebViewBrowser
           key={activeUrl}
@@ -131,10 +152,11 @@ export default function BrowserScreen() {
           url={activeUrl}
           onNavigationStateChange={onNavigationStateChange}
           onError={onWebViewError}
+          onPictureInPictureModeChange={onPictureInPictureModeChange}
         />
       </View>
 
-      {!toolbarHidden && (
+      {!isPictureInPictureActive && !toolbarHidden && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -154,7 +176,7 @@ export default function BrowserScreen() {
       )}
 
       <Modal
-        visible={settingsVisible}
+        visible={!isPictureInPictureActive && settingsVisible}
         animationType="slide"
         onRequestClose={closeSettings}>
         <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
@@ -169,7 +191,9 @@ export default function BrowserScreen() {
         </View>
       </Modal>
 
-      {navBarHidden && <MiniPill onPress={() => setSettingsVisible(true)} />}
+      {!isPictureInPictureActive && navBarHidden && (
+        <MiniPill onPress={() => setSettingsVisible(true)} />
+      )}
     </View>
   );
 }

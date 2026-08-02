@@ -14,6 +14,11 @@ const cheerio = require("cheerio");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { verifyAccessKey, requireVip } = require("./checkVip");
 const {
+  VAVOO_GROUPS,
+  vavooGroupSlug,
+  buildVavooCatalogs,
+} = require("./utils/vavooCatalogs");
+const {
   DADDYLIVE_BASE_URL,
   DADDYLIVE_REFERER,
   DADDYLIVE_ORIGIN,
@@ -419,7 +424,7 @@ const FCTV_DEFAULT_SITE_TYPE = 2001;
 // (${BYPASS403_SERVER_URL}/proxy), with a hardcoded fallback.
 const FCTV_IMAGE_PROXY = process.env.BYPASS403_SERVER_URL
   ? `${process.env.BYPASS403_SERVER_URL.replace(/\/+$/, "")}/proxy`
-  : "https://proxy.movix.date/proxy";
+  : "https://proxy.movix.fun/proxy";
 
 function proxifyFctvImage(url) {
   if (!url) return "";
@@ -564,14 +569,269 @@ function buildFctvSfverPrefix(pathname, params, bsKeys) {
   return `sfver${md5Hash}${bsKey}`;
 }
 
-// Linkzy configuration (FREE source - no extension/VIP required)
-const LINKZY_CATEGORIES = {
-  general: { id: "linkzy_generaliste", name: "Généraliste", emoji: "📺" },
-  sports: { id: "linkzy_sport", name: "Sport", emoji: "⚽" },
-  movies: { id: "linkzy_cinema", name: "Cinéma", emoji: "🎬" },
-  chaines_info: { id: "linkzy_info", name: "Informations", emoji: "📰" },
-  chaines_jeunesse: { id: "linkzy_jeunesse", name: "Jeunesse", emoji: "👶" },
+// === NORTHLIVE (FREE source — no extension / no VIP) ===================
+// northlive exposes ~1100 channels, each with a ready-to-embed `player_url`
+// (iframe). The upstream `category` field dumps ~60% of channels in a single
+// generic "IPTV" bucket, so we re-classify by channel name into usable content
+// categories. Scope: France + DOM-TOM only (per product decision). The full
+// list is refreshed hourly (fetchAllNorthlive) and cached to disk.
+const NORTHLIVE_BASE =
+  process.env.NORTHLIVE_BASE_URL || "https://northlive.lol/api/v1/index.php";
+const NORTHLIVE_API_KEY =
+  process.env.SWIFTFLOW_API_KEY || process.env.NORTHLIVE_API_KEY || "";
+const NORTHLIVE_REFRESH_MS = 60 * 60 * 1000; // 1h — user requested hourly refresh
+
+// Supplemental channel logos (slug -> url). northlive ships a logo for only ~40%
+// of channels; this map fills the rest (built from northlive's own logos + an
+// iptv-org name match — see scripts/build_northlive_logos.mjs). Optional: a
+// missing file just means no fallback logo.
+let NORTHLIVE_LOGOS = {};
+try {
+  NORTHLIVE_LOGOS = require("./northlive_logos.json");
+} catch (e) {
+  console.warn(`[NORTHLIVE] logo map not loaded: ${e.message}`);
+}
+
+// UI categories (catalog id -> label). Order = pill/catalog display order.
+const NORTHLIVE_CATEGORIES = {
+  northlive_sport: { name: "Sport", emoji: "⚽" },
+  northlive_cinema: { name: "Cinéma", emoji: "🎬" },
+  northlive_series: { name: "Séries & Films", emoji: "🎞️" },
+  northlive_generaliste: { name: "Généraliste", emoji: "📺" },
+  northlive_info: { name: "Info", emoji: "📰" },
+  northlive_jeunesse: { name: "Jeunesse", emoji: "🧒" },
+  northlive_musique: { name: "Musique", emoji: "🎵" },
+  northlive_docs: { name: "Découverte & Docs", emoji: "🌍" },
+  northlive_divertissement: { name: "Divertissement", emoji: "🎭" },
+  northlive_regional: { name: "Régional & Local", emoji: "🏙️" },
+  northlive_autres: { name: "Autres", emoji: "📦" },
 };
+
+// France métropole + DOM-TOM. The upstream `country` field uses "France",
+// "France Martinique", "France GP", "France Guadeloupe", "France MQ", etc. —
+// every France-family value starts with "france".
+function isNorthliveFrance(country) {
+  return typeof country === "string" && country.trim().toLowerCase().startsWith("france");
+}
+
+// ponytail: name-keyword classifier (heuristic). The upstream "IPTV" bucket has
+// no sub-genre, so we infer it from the channel name. Tune the arrays below if a
+// channel lands in the wrong tab. Checked in priority order (first hit wins).
+const NORTHLIVE_KEYWORDS = [
+  ["northlive_sport", ["SPORT", "BEIN", "RMC SPORT", "DAZN", "EUROSPORT", "LIGUE 1", "LIGUE1", "FOOT", "MULTISPORT", "GOLF", "EQUIDIA", "TENNIS", "KOMBAT", "MOTO GP", "MOTOGP", "ELEVEN", "INFOSPORT", "SKWEEK", "AUTOMOTO", "AUTO MOTO", "AB MOTEURS", "OL TV", "PSG", "MOTOR", "NAUTICAL"]],
+  ["northlive_jeunesse", ["GULLI", "CANAL J", "CANAL+ KIDS", "PIWI", "TIJI", "DISNEY", "NICK", "CARTOON", "BOOMERANG", "BOING", "TELETOON", "MANGAS", "GAME ONE", "OKOO", "TOONAMI", "BEYBLADE", "YU-GI-OH", "BOB LEPONGE", "CAILLOU", "MR. BEAN", "KIDZ", "KIDS", "JUNIOR", "SCHTROUMPF", "SUPERTOONS", "J-ONE", "GONG", "BABY TV", "TOONS", "TV PITCHOUN", "XILAM", "BEYBLADE"]],
+  ["northlive_cinema", ["CINE", "CINÉ", "CINA", "OCS", "TCM", "BOX OFFICE", "BOXOFFICE", "PARAMOUNT", "GRAND ECRAN", "ALTICE STUDIO", "ACTION", "MOVIE", "FILM", "WILDSIDE", "MOVIESPHERE", "CANAL PLAY"]],
+  ["northlive_series", ["SERIE", "SÉRIE", "WARNER", "SUNDANCE", "SYFY", "BBC DRAMA", "BBC SÉRIES", "BBC SERIES", "SONY", "NOVELA", "POLAR", "CRIME", "HOMICIDE", "DRAMA", "SEASON", "DETECTIVE", "COMEDY", "ENQUÊTE", "ENQUETE", "TELENOVELA", "TELE NOVELA"]],
+  ["northlive_info", ["INFO", "BFM", "CNEWS", "C NEWS", "C-NEWS", "LCI", "EURONEWS", "I24", "CGTN", "RT FRANCE", "LCP", "PUBLIC SENAT", "PUBLIC SÉNAT", "MONACO INFO", "TECH & CO", "B SMART", "BUSINESS", "LE FIGARO", "20 MINUTES", "FRANCE 24", "AFRICA 24", "FRANCOPHONIE 24", "LE MÉDIA"]],
+  ["northlive_musique", ["MUSIC", "MUSIQUE", "MTV", "TRACE", "NRJ", "MCM", "MEZZO", "RFM", "MELODY", "VEVO", "SKYROCK", "DJAZZ", "STINGRAY", "ZOUK", "SALSA", "CUMBIA", "K-POP", "METAL", "JAZZ", "DANCE", "QWEST", "FOLK", "SOUL", "HITS", "TVM 3", "TVM3", "MDL", "DBM"]],
+  ["northlive_docs", ["DISCOVERY", "NAT GEO", "NATIONAL GEO", "PLANETE", "PLANÈTE", "USHUAIA", "USHUAÏA", "DECOUVERTE", "DÉCOUVERTE", "HISTOIRE", "SCIENCE", "NATURE", "ANIMAUX", "CHASSE", "PECHE", "PÊCHE", "TREK", "TRAVELXP", "VOYAGE", "TOP GEAR", "INVESTIGATION", "REPORTAGE", "FUTURA", "SORCIER", "IMEARTH", "DESTINATION NATURE", "CAP TERRE", "RMC STORY", "RMC DECOUVERTE", "RMC DÉCOUVERTE", "TOUTE HISTOIRE", "TOUTE L HISTOIRE", "SEASONS", "USHUAIA"]],
+  ["northlive_generaliste", ["TF1", "TF 1", "TFI", "TFX", "FRANCE 2", "FRANCE 3", "FRANCE 4", "FRANCE 5", "FRANCE O", "FRANCE Ô", "M6", "C8", "W9", "TMC", "6TER", "NRJ 12", "ARTE", "RTL", "CHERIE 25", "CHÉRIE 25", "NOVO19", "TIPIK", "LA UNE", "LA TROIS", "TV5", "PARIS PREMIERE", "PARIS PREMIÈRE", "TEVA", "RTS", "RTBF"]],
+];
+
+// Maps the upstream `category` field to a UI category (used when the name gives
+// no signal — mainly the already-tagged non-"IPTV" channels).
+const NORTHLIVE_CAT_MAP = {
+  Musique: "northlive_musique",
+  Info: "northlive_info",
+  Cinéma: "northlive_cinema",
+  "Séries-Films": "northlive_series",
+  Jeunesse: "northlive_jeunesse",
+  Généraliste: "northlive_generaliste",
+  Genéraliste: "northlive_generaliste",
+  Sport: "northlive_sport",
+  Régional: "northlive_regional",
+  Local: "northlive_regional",
+  Documentaires: "northlive_docs",
+  Sciences: "northlive_docs",
+  Nature: "northlive_docs",
+  Reportages: "northlive_docs",
+  Divertissement: "northlive_divertissement",
+  Culture: "northlive_divertissement",
+  "Art de vivre": "northlive_divertissement",
+  Sociétal: "northlive_divertissement",
+  Economie: "northlive_info",
+  Voyage: "northlive_docs",
+};
+
+function classifyNorthlive(name, apiCategory) {
+  const upper = String(name || "").toUpperCase();
+  for (const [cat, words] of NORTHLIVE_KEYWORDS) {
+    if (words.some((w) => upper.includes(w))) return cat;
+  }
+  if (apiCategory && NORTHLIVE_CAT_MAP[apiCategory]) return NORTHLIVE_CAT_MAP[apiCategory];
+  return "northlive_autres";
+}
+
+// Builds the ready-to-embed iframe URL for a channel slug (deterministic — same
+// shape as the upstream `player_url`, so we never need to store it per-channel).
+function northliveEmbedUrl(slug) {
+  return `${NORTHLIVE_BASE}?route=tv/${encodeURIComponent(slug)}/player&api_key=${NORTHLIVE_API_KEY}`;
+}
+
+// === VAVOO (FREE source — direct HLS, no extension / no proxy / no VIP) ======
+// vavoo.to exposes IPTV channels grouped by country/region (MediaHubMX API).
+// The catalog is a POST (mediahubmx-catalog.json, paginated via `nextCursor`);
+// each play URL resolves to a raw .m3u8 (mediahubmx-resolve.json) that the
+// client plays as-is (_directPlay) — no proxy, no headers. Groups double as UI
+// categories. Refreshed hourly, cached to disk.
+const VAVOO_BASE = process.env.VAVOO_BASE_URL || "https://vavoo.to";
+const VAVOO_CATALOG_URL = `${VAVOO_BASE}/mediahubmx-catalog.json`;
+const VAVOO_RESOLVE_URL = `${VAVOO_BASE}/mediahubmx-resolve.json`;
+const VAVOO_HEADERS = {
+  "User-Agent": "MediaHubMX/2",
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+// vavoo.to geoblocks datacenter IPs (HTTP 451), so catalog/resolve calls are
+// routed through the shared SOCKS5 pool, rotating to the next proxy on failure.
+// Playback stays direct — the resolved m3u8 is fetched client-side (in-region).
+const {
+  pickDedicatedSocks5Proxy,
+  getProxyAgent,
+} = require("./utils/proxyManager");
+
+async function vavooPost(url, payload, timeout = 15000) {
+  let lastErr;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    let agent = null;
+    try {
+      const proxy = await pickDedicatedSocks5Proxy();
+      if (proxy) agent = getProxyAgent(proxy);
+    } catch {
+      /* pool empty → fall through to a direct call (will likely 451) */
+    }
+    try {
+      const resp = await axios.post(url, payload, {
+        headers: VAVOO_HEADERS,
+        timeout,
+        ...(agent ? { httpAgent: agent, httpsAgent: agent, proxy: false } : {}),
+      });
+      return resp.data;
+    } catch (e) {
+      lastErr = e;
+      // rotate to the next proxy and retry
+    }
+  }
+  throw lastErr;
+}
+
+const VAVOO_SLUG_TO_GROUP = Object.fromEntries(
+  VAVOO_GROUPS.map((g) => [vavooGroupSlug(g), g]),
+);
+
+// Fetch one group's full channel list (paginated via nextCursor), cache 1h.
+async function fetchVavooGroup(group) {
+  const cacheKey = generateCacheKey(`vavoo_group_${group}_v2`);
+  const disk = await getFromCache(cacheKey, 1); // 1h
+  if (disk && Array.isArray(disk) && disk.length) return disk;
+
+  const channels = [];
+  const seenNameId = new Set();
+  const idCounts = new Map();
+  let cursor = null;
+  for (let page = 0; page < 50; page++) {
+    // hard cap: 50 pages guards against a broken nextCursor loop
+    let data;
+    try {
+      const payload = {
+        language: "fr", region: "FR", catalogId: "iptv", id: "",
+        adult: false, search: "", sort: "name",
+        filter: { group },
+        cursor: cursor ? Number(cursor) : 0
+      };
+
+      data = await vavooPost(VAVOO_CATALOG_URL, payload);
+    } catch (e) {
+      console.warn(`[VAVOO] group ${group} page ${page} error: ${e.message}`);
+      break;
+    }
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for (const it of items) {
+      const baseId = it?.ids?.id;
+      if (!baseId) continue;
+      
+      const name = it.name || baseId;
+      const dedupKey = `${baseId}~${name}`;
+      
+      if (seenNameId.has(dedupKey)) continue;
+      seenNameId.add(dedupKey);
+
+      const count = (idCounts.get(baseId) || 0) + 1;
+      idCounts.set(baseId, count);
+
+      const uniqueId = count === 1 ? baseId : `${baseId}~${count}`;
+
+      channels.push({
+        id: `vavoo_${uniqueId}`,
+        type: "tv",
+        name: name,
+        // poster intentionally null — logos hidden for now (name-only landscape
+        // cards); swap back to `it.logo || null` to restore them later.
+        poster: null,
+      });
+    }
+
+    cursor = data?.nextCursor ?? null;
+    if (!cursor || items.length === 0) break;
+  }
+
+  if (channels.length === 0) {
+    // Upstream hiccup — keep serving the last good cache rather than blanking out.
+    const stale = await getFromCache(cacheKey, 24 * 365);
+    if (stale && Array.isArray(stale) && stale.length) return stale;
+    return [];
+  }
+
+  await saveToCache(cacheKey, channels);
+  return channels;
+}
+
+// Channels for a UI category (vavoo_<slug>).
+async function getVavooChannels(catalogId) {
+  const slug = catalogId.slice("vavoo_".length);
+  const group = VAVOO_SLUG_TO_GROUP[slug];
+  if (!group) return [];
+  return fetchVavooGroup(group);
+}
+
+// Resolve a channel id to its raw .m3u8 (played client-side as-is).
+// Each resolve lands on a random edge: usually https on a rotating domain,
+// sometimes plain http on a bare IP — unplayable from the https site (mixed
+// content). Re-resolve up to 5 times to get an https URL; if none shows up,
+// return the http one as a last resort. Every attempt goes through the SOCKS5
+// pool (vavooPost) since vavoo 451s datacenter IPs.
+async function resolveVavooStream(channelId) {
+  let id = channelId.slice("vavoo_".length);
+  if (id.includes("~")) {
+    id = id.split("~")[0];
+  }
+  const playUrl = `${VAVOO_BASE}/vavoo-iptv/play/${id}`;
+  let httpFallback = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let data;
+    try {
+      data = await vavooPost(
+        VAVOO_RESOLVE_URL,
+        { language: "fr", region: "FR", url: playUrl },
+        10000,
+      );
+    } catch (e) {
+      // vavooPost already rotated through 4 proxies — upstream is down, stop.
+      console.warn(`[VAVOO] resolve ${id} failed: ${e.message}`);
+      break;
+    }
+    const arr = Array.isArray(data) ? data : [];
+    const url = arr[0]?.url || null;
+    if (!url) continue;
+    if (url.startsWith("https://")) return url;
+    if (!httpFallback) httpFallback = url;
+  }
+
+  return httpFallback;
+}
 
 // HTTPS Agent for Sosplay — DNS Cloudflare (1.1.1.1) pour contourner le blocage FAI
 const https = require("https");
@@ -4200,101 +4460,90 @@ async function resolveDaddyliveStream(channelId, options = {}) {
   }
 }
 
-// === LINKZY CHANNELS (loaded from linkzy.json) ===
-const LINKZY_CHANNELS = require("./linkzy.json");
+// === NORTHLIVE CHANNELS (FREE source, iframe embed) ===
+// In-memory mirror of the disk cache to keep manifest/catalog requests cheap.
+let northliveMemCache = { channels: [], time: 0 };
 
 /**
- * Returns Linkzy channels from linkzy.json (no API call / decryption needed)
+ * Fetch every northlive page (France + DOM-TOM only), dedup by slug, classify by
+ * content, and cache the result to disk (1h TTL). Called lazily on demand and by
+ * the hourly warmer. Never overwrites a good cache with an empty result.
  */
-function fetchLinkzyChannels() {
-  return LINKZY_CHANNELS.filter((ch) => ch.active);
-}
+async function fetchAllNorthlive(force = false) {
+  const cacheKey = generateCacheKey("northlive_all_v1");
 
-/**
- * Get Linkzy channels for a specific category
- */
-function getLinkzyChannelsByCategory(categoryId) {
-  try {
-    // Map catalog ID to API category string
-    const categoryMap = {
-      linkzy_generaliste: "general",
-      linkzy_sport: "sports",
-      linkzy_cinema: "movies",
-      linkzy_info: "chaines_info",
-      linkzy_jeunesse: "chaines_jeunesse",
-    };
-
-    const apiCategory = categoryMap[categoryId];
-    if (!apiCategory) {
-      console.error(`[LINKZY] Unknown category: ${categoryId}`);
-      return [];
+  if (!force) {
+    if (northliveMemCache.channels.length && Date.now() - northliveMemCache.time < NORTHLIVE_REFRESH_MS) {
+      return northliveMemCache.channels;
     }
-
-    const allChannels = fetchLinkzyChannels();
-    const filteredChannels = allChannels.filter(
-      (ch) => ch.category === apiCategory,
-    );
-
-    console.log(
-      `[LINKZY] Category ${categoryId} (${apiCategory}): ${filteredChannels.length} channels`,
-    );
-
-    return filteredChannels.map((ch) => ({
-      id: `linkzy_${ch.id}`,
-      type: "tv",
-      name: ch.name,
-      poster: ch.logo || null,
-    }));
-  } catch (error) {
-    console.error(
-      "[LINKZY] Error getting channels by category:",
-      error.message,
-    );
-    return [];
+    const disk = await getFromCache(cacheKey, 1); // 1h
+    if (disk && Array.isArray(disk) && disk.length) {
+      northliveMemCache = { channels: disk, time: Date.now() };
+      return disk;
+    }
   }
-}
 
-/**
- * Get stream URLs for a Linkzy channel (returns array of {label, url})
- */
-function getLinkzyStream(channelId) {
-  try {
-    const numericId = parseInt(channelId.replace("linkzy_", ""));
-    const allChannels = fetchLinkzyChannels();
-    const channel = allChannels.find((ch) => ch.id === numericId);
+  const seen = new Set();
+  const channels = [];
+  let totalPages = 25; // refined from the first response; hard cap below as a guard
 
-    if (!channel) {
-      console.error(`[LINKZY] Channel ${channelId} not found`);
-      return [];
-    }
-
-    // streamUrl is a JSON string containing an array of {label, url}
-    let sources = [];
+  for (let page = 1; page <= totalPages && page <= 40; page++) {
     try {
-      sources =
-        typeof channel.streamUrl === "string"
-          ? JSON.parse(channel.streamUrl)
-          : channel.streamUrl;
-    } catch (parseErr) {
-      // Fallback: treat as a plain URL string
-      console.warn(
-        `[LINKZY] Could not parse streamUrl as JSON, using as plain URL`,
-      );
-      sources = [{ label: "Principal", url: channel.streamUrl }];
-    }
+      const response = await axios.get(NORTHLIVE_BASE, {
+        params: { route: "tv", api_key: NORTHLIVE_API_KEY, page },
+        headers: { "User-Agent": LIVE_PAGE_USER_AGENT },
+        timeout: 15000,
+      });
 
-    if (!Array.isArray(sources)) {
-      sources = [{ label: "Principal", url: String(sources) }];
-    }
+      const data = Array.isArray(response.data?.data) ? response.data.data : [];
+      const pag = response.data?.pagination;
+      if (pag?.total && pag?.per_page) {
+        totalPages = Math.ceil(pag.total / pag.per_page);
+      }
+      if (data.length === 0) break;
 
-    console.log(
-      `[LINKZY] Stream for ${channel.name}: ${sources.length} source(s)`,
-    );
-    return sources;
-  } catch (error) {
-    console.error("[LINKZY] Error getting stream:", error.message);
+      for (const ch of data) {
+        if (!ch?.slug || seen.has(ch.slug)) continue;
+        if (ch.active === false) continue;
+        if (!isNorthliveFrance(ch.country)) continue;
+        seen.add(ch.slug);
+        channels.push({
+          id: `northlive_${ch.slug}`,
+          slug: ch.slug,
+          name: ch.name || ch.slug,
+          logo: ch.logo || NORTHLIVE_LOGOS[ch.slug] || null,
+          cat: classifyNorthlive(ch.name, ch.category),
+        });
+      }
+    } catch (error) {
+      console.warn(`[NORTHLIVE] page ${page} error: ${error.message}`);
+      break;
+    }
+  }
+
+  if (channels.length === 0) {
+    // Upstream hiccup — keep serving the last good cache rather than blanking out.
+    const stale = await getFromCache(cacheKey, 24 * 365);
+    if (stale && Array.isArray(stale) && stale.length) return stale;
     return [];
   }
+
+  await saveToCache(cacheKey, channels);
+  northliveMemCache = { channels, time: Date.now() };
+  console.log(`[NORTHLIVE] Cached ${channels.length} FR channels`);
+  return channels;
+}
+
+/**
+ * Get northlive channels for a UI category (catalog id northlive_<cat>).
+ */
+async function getNorthliveChannelsByCategory(catalogId) {
+  const all = await fetchAllNorthlive();
+  // poster intentionally null — the UI renders northlive as name-only landscape
+  // cards (logos hidden for now, per product decision; re-add ch.logo to restore).
+  return all
+    .filter((ch) => ch.cat === catalogId)
+    .map((ch) => ({ id: ch.id, type: "tv", name: ch.name, poster: null }));
 }
 
 // === ROUTES ===
@@ -4402,8 +4651,8 @@ router.get("/resolve-livehdtv", async (req, res) => {
  */
 router.get("/manifest", async (req, res) => {
   try {
-    // v12 = removed dead Vavoo (tvvoo.hayd.uk) source
-    const cacheKey = generateCacheKey("manifest_combined_v12");
+    // v15 = vavoo listed before northlive (source pill order)
+    const cacheKey = generateCacheKey("manifest_combined_v15");
 
     // Vérifier le cache
     const cached = await getFromCache(cacheKey);
@@ -4505,16 +4754,39 @@ router.get("/manifest", async (req, res) => {
     manifest.catalogs = [...matchesCatalogs, ...manifest.catalogs];
     manifest.idPrefixes.push("match_");
 
-    // [DÉSACTIVÉ] Linkzy temporairement désactivé
-    // for (const [catId, config] of Object.entries(LINKZY_CATEGORIES)) {
-    //     manifest.catalogs.push({
-    //         type: 'tv',
-    //         id: config.id,
-    //         name: config.name,
-    //         _free: true,
-    //     });
-    // }
-    // manifest.idPrefixes.push('linkzy_');
+    // Northlive (FREE — no extension / no VIP, iframe embed). Prepended so the
+    // free source is the first pill and the default tab for everyone.
+    try {
+      const nlChannels = await fetchAllNorthlive();
+      const present = new Set(nlChannels.map((c) => c.cat));
+      const northliveCatalogs = [];
+      for (const [id, cfg] of Object.entries(NORTHLIVE_CATEGORIES)) {
+        if (!present.has(id)) continue;
+        northliveCatalogs.push({
+          type: "tv",
+          id,
+          name: `${cfg.emoji} ${cfg.name}`,
+          _free: true,
+        });
+      }
+      if (northliveCatalogs.length) {
+        manifest.catalogs = [...northliveCatalogs, ...manifest.catalogs];
+        manifest.idPrefixes.push("northlive_");
+      }
+    } catch (e) {
+      console.warn(`[NORTHLIVE] manifest injection failed: ${e.message}`);
+    }
+
+    // Vavoo (FREE — direct HLS, no extension/VIP). Groups are listed
+    // unconditionally (no upfront fetch); an empty group simply shows no channels.
+    // Prepended so the vavoo pill sits before northlive.
+    try {
+      const vavooCatalogs = buildVavooCatalogs(VAVOO_GROUPS);
+      manifest.catalogs = [...vavooCatalogs, ...manifest.catalogs];
+      manifest.idPrefixes.push("vavoo_");
+    } catch (e) {
+      console.warn(`[VAVOO] manifest injection failed: ${e.message}`);
+    }
 
     // Sauvegarder en cache
     await saveToCache(cacheKey, manifest);
@@ -4536,7 +4808,10 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
   try {
     const catalogCacheVersion = catalogId.startsWith("matches_")
       ? "v2"
-      : catalogId.startsWith("sosplay_") || catalogId.startsWith("livetv_")
+      : catalogId.startsWith("sosplay_") ||
+          catalogId.startsWith("livetv_") ||
+          catalogId.startsWith("northlive_") ||
+          catalogId.startsWith("vavoo_")
         ? "v5"
         : "v1";
     const cacheKey = generateCacheKey(
@@ -4544,7 +4819,10 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
     );
     const isMatchesCatalog = catalogId.startsWith("matches_");
     const isDynamicCatalog =
-      isMatchesCatalog || catalogId.startsWith("livetv_");
+      isMatchesCatalog ||
+      catalogId.startsWith("livetv_") ||
+      catalogId.startsWith("northlive_") ||
+      catalogId.startsWith("vavoo_");
 
     // Vérifier le cache (1 minute pour matches/LiveTV, 24h pour le reste)
     const cached = isDynamicCatalog
@@ -4597,10 +4875,14 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
       console.log(
         `[TVMIO] Result: ${catalog.metas ? catalog.metas.length : 0} channels`,
       );
-      // [DÉSACTIVÉ] Linkzy temporairement désactivé
-      // } else if (catalogId.startsWith('linkzy_')) {
-      //     const channels = await getLinkzyChannelsByCategory(catalogId);
-      //     catalog = { metas: channels };
+    } else if (catalogId.startsWith("northlive_")) {
+      // Northlive (FREE, iframe embed) — from the 1h-cached France channel list.
+      const channels = await getNorthliveChannelsByCategory(catalogId);
+      catalog = { metas: channels };
+    } else if (catalogId.startsWith("vavoo_")) {
+      // Vavoo (FREE, direct HLS) — country group from the 1h cache.
+      const channels = await getVavooChannels(catalogId);
+      catalog = { metas: channels };
     } else if (catalogId.startsWith("matches_")) {
       // Source Matches (FCTV33)
       console.log(`[LIVETV] Fetching Matches catalog: ${catalogId}`);
@@ -4718,7 +5000,9 @@ router.get("/stream/:type/:channelId", async (req, res) => {
     }
 
     const skipOuterCache =
-      channelId.startsWith("livetv_") || channelId.startsWith("daddylive_");
+      channelId.startsWith("livetv_") ||
+      channelId.startsWith("daddylive_") ||
+      channelId.startsWith("vavoo_");
     const cacheKey = generateCacheKey(
       `stream_${type}_${channelId}_${mode}_${sourceIndex ?? "all"}_v6_${isVip.vip ? "vip" : "free"}`,
     );
@@ -4783,20 +5067,57 @@ router.get("/stream/:type/:channelId", async (req, res) => {
         console.log(`[TVMIO] No streams found for ${channelId} in M3U`);
         streamData = { streams: [] };
       }
-      // [DÉSACTIVÉ] Linkzy temporairement désactivé
-      // } else if (channelId.startsWith('linkzy_')) {
-      //     const sources = await getLinkzyStream(channelId);
-      //     if (sources && sources.length > 0) {
-      //         streamData = {
-      //             streams: sources.map(source => ({
-      //                 title: `${source.label || 'Linkzy Stream'}`,
-      //                 url: source.url,
-      //                 behaviorHints: { notWebReady: false }
-      //             }))
-      //         };
-      //     } else {
-      //         streamData = { streams: [] };
-      //     }
+    } else if (channelId.startsWith("northlive_")) {
+      // === SOURCE NORTHLIVE (FREE, iframe embed) ===
+      // Deterministic player_url from the slug — no VIP, no proxy, no resolution.
+      const slug = channelId.slice("northlive_".length);
+      const embedUrl = northliveEmbedUrl(slug);
+      streamData = {
+        streams: [
+          {
+            title: "northlive",
+            url: embedUrl,
+            originalUrl: embedUrl,
+            _isEmbed: true,
+            behaviorHints: { notWebReady: false },
+          },
+        ],
+      };
+    } else if (channelId.startsWith("vavoo_")) {
+      // === SOURCE VAVOO (FREE, direct HLS) ===
+      // Resolve the play URL to a raw .m3u8. Returned as-is and played
+      // client-side via _directPlay (no proxy, no VIP, no extension).
+      // Cache policy: https URLs are kept 2h; an http (bare-IP) fallback is
+      // only kept 2 min so the next request re-rolls for an https edge.
+      const vavooCacheKey = generateCacheKey(`vavoo_stream_${channelId}_v1`);
+      const cachedVavoo = await getFromCacheMs(vavooCacheKey, 120000); // 2 min
+      if (cachedVavoo) {
+        return res.json(cachedVavoo);
+      }
+      const cachedHttpsVavoo = await getFromCacheMs(
+        vavooCacheKey,
+        2 * 60 * 60 * 1000, // 2h
+      );
+      if (cachedHttpsVavoo?.streams?.[0]?.url?.startsWith("https://")) {
+        return res.json(cachedHttpsVavoo);
+      }
+
+      const m3u8 = await resolveVavooStream(channelId);
+      if (!m3u8) {
+        return res.status(404).json({ error: "Flux Vavoo introuvable" });
+      }
+
+      streamData = {
+        streams: [
+          {
+            title: "Vavoo",
+            url: m3u8,
+            _directPlay: true,
+            behaviorHints: { notWebReady: false },
+          },
+        ],
+      };
+      await saveToCache(vavooCacheKey, streamData);
     } else if (channelId.startsWith("match_")) {
       // === SOURCE MATCHES (FCTV33) ===
       const matchCacheKey = generateCacheKey(
@@ -5442,8 +5763,12 @@ router.delete("/cache", async (req, res) => {
 const XTREAM_URL = (process.env.XTREAM_URL || "").replace(/\/+$/, "");
 const XTREAM_USER = process.env.XTREAM_USER || "";
 const XTREAM_PASS = process.env.XTREAM_PASS || "";
-const IPTV_IMAGE_PROXY = "https://proxy.movix.blog/proxy";
-const IPTV_STREAM_PROXY = "https://proxiesembed.movix.blog/proxy";
+const IPTV_IMAGE_PROXY = (
+  process.env.IPTV_IMAGE_PROXY || "http://localhost:25568/proxy"
+).replace(/\/+$/, "");
+const IPTV_STREAM_PROXY = (
+  process.env.IPTV_STREAM_PROXY || "http://localhost:25569/proxy"
+).replace(/\/+$/, "");
 
 // Cache catégories IPTV en mémoire (change rarement)
 let iptvCategoriesCache = null;
@@ -5504,7 +5829,7 @@ router.get("/iptv/categories", requireVip, async (req, res) => {
 /**
  * GET /api/livetv/iptv/streams/:categoryId
  * Récupère les chaînes d'une catégorie Xtream (VIP only)
- * Images proxifiées via proxy.movix.blog
+ * Images proxifiées via proxy.movix.fun
  */
 router.get("/iptv/streams/:categoryId", requireVip, async (req, res) => {
   const { categoryId } = req.params;
@@ -5567,5 +5892,17 @@ router.get("/iptv/stream-url/:streamId", requireVip, async (req, res) => {
     res.status(500).json({ error: "Erreur lors de la construction de l'URL" });
   }
 });
+
+// Warm the northlive channel cache at boot and refresh it hourly (user request:
+// "récupère toutes les pages toutes les heures et mets en cache"). Failures are
+// swallowed — the lazy fetch in the manifest/catalog routes is the fallback.
+fetchAllNorthlive(true).catch((e) =>
+  console.warn(`[NORTHLIVE] initial warm failed: ${e.message}`),
+);
+setInterval(() => {
+  fetchAllNorthlive(true).catch((e) =>
+    console.warn(`[NORTHLIVE] hourly refresh failed: ${e.message}`),
+  );
+}, NORTHLIVE_REFRESH_MS).unref();
 
 module.exports = router;

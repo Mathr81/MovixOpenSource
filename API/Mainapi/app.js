@@ -105,11 +105,13 @@ const darkiHeaders = {
 };
 
 // Coflix config
-const COFLIX_BASE_URL = "https://coflix.trade";
+const COFLIX_BASE_URL = (
+  process.env.COFLIX_BASE_URL || "https://coflix.esq"
+).replace(/\/$/, "");
 const coflixHeaders = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-  Referer: "https://coflix.trade",
+  Referer: COFLIX_BASE_URL,
 };
 
 // === Axios instances for each source ===
@@ -333,6 +335,7 @@ coflix.configure({
   axiosLecteurVideoRequest: axiosHelpers.axiosLecteurVideoRequest,
   makeCoflixRequest: require("./utils/proxyManager").makeCoflixRequest,
   coflixHeaders,
+  COFLIX_BASE_URL,
   getFromCacheNoExpiration,
   saveToCache,
   formatCoflixError: axiosHelpers.formatCoflixError,
@@ -475,6 +478,7 @@ app.use('/api', downloadRouter);
 app.use('/api/fstream', require('./routes/fstream'));
 app.use('/api/wiflix', require('./routes/wiflix'));
 app.use('/api/j1f', require('./routes/j1f'));
+app.use('/api/swiftflow', require('./routes/swiftflow'));
 app.use('/api', require('./routes/sync'));
 app.use('/api/profiles', require('./routes/profiles'));
 app.use('/api/help', require('./routes/helpFeedback'));

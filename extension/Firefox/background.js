@@ -381,6 +381,24 @@ async function proxyHttpRequest(url, headers = {}) {
 
 // === NEXUS M3U8 EXTRACTION HANDLERS ===
 
+function getSeekStreamingPlaybackUrls(result) {
+  const urls = [];
+  const seen = new Set();
+  const add = (url) => {
+    if (typeof url !== "string" || !url || seen.has(url)) return;
+    seen.add(url);
+    urls.push(url);
+  };
+  if (Array.isArray(result?.hlsCandidates)) {
+    for (const candidate of result.hlsCandidates) {
+      add(candidate?.url);
+    }
+  }
+  add(result?.hlsUrl);
+  add(result?.m3u8Url);
+  return urls;
+}
+
 /**
  * Handle single embed extraction request
  * payload: { type: 'voe'|'fsvid'|..., url: 'https://...' }
@@ -392,6 +410,36 @@ async function handleExtractM3u8(payload) {
   // Auto-detect type if not provided
   const embedType = type || Extractors.detectEmbedType(url);
   if (!embedType) return { success: false, error: "Unknown embed type" };
+
+  if (embedType === "seekstreaming") {
+    let extractionRuleId = null;
+    try {
+      const extractionHeaders = await Extractors.setupHeadersForService(
+        embedType,
+        url,
+        url,
+      );
+      if (extractionHeaders) {
+        extractionRuleId = await addHeadersRule(
+          extractionHeaders.domainPattern,
+          extractionHeaders.headers,
+        );
+      }
+      const result = await Extractors.extractSingle(embedType, url);
+      if (result.success) {
+        for (const videoUrl of getSeekStreamingPlaybackUrls(result)) {
+          const playbackHeaders =
+            await Extractors.setupHeadersForService(embedType, videoUrl, url);
+          if (playbackHeaders) {
+            await replaceSeekPlaybackRule(playbackHeaders);
+          }
+        }
+      }
+      return result;
+    } finally {
+      await removeHeadersRule(extractionRuleId);
+    }
+  }
 
   // Set up DNR headers BEFORE extraction so the fetch request succeeds
   try {
@@ -417,6 +465,7 @@ async function handleExtractM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         embedType,
         videoUrl,
+        url,
       );
       if (headerInfo) {
         await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
@@ -442,6 +491,8 @@ async function handleExtractAllM3u8(payload) {
 
   console.log(`[NEXUS] Extracting all from ${sources.length} sources`);
 
+  const seekExtractionRuleIds = [];
+
   // Set up DNR headers for all sources BEFORE extraction
   try {
     const detected = Extractors.detectSupportedEmbeds(sources);
@@ -449,9 +500,16 @@ async function handleExtractAllM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         item.type,
         item.url,
+        item.url,
       );
       if (headerInfo) {
-        await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+        const ruleId = await addHeadersRule(
+          headerInfo.domainPattern,
+          headerInfo.headers,
+        );
+        if (item.type === "seekstreaming" && Number.isInteger(ruleId)) {
+          seekExtractionRuleIds.push(ruleId);
+        }
       }
     }
     console.log(
@@ -461,31 +519,45 @@ async function handleExtractAllM3u8(payload) {
     console.warn("[NEXUS] Failed to set pre-extraction headers for batch:", e);
   }
 
-  const results = await Extractors.extractAll(sources);
+  try {
+    const results = await Extractors.extractAll(sources);
 
-  // Set up DNR headers for all successful extractions (video URLs)
-  for (const result of results) {
-    if (result.success) {
-      const videoUrl = result.hlsUrl || result.m3u8Url;
-      if (videoUrl) {
-        const headerInfo = await Extractors.setupHeadersForService(
-          result.type,
-          videoUrl,
-        );
-        if (headerInfo) {
-          await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+    // Set up DNR headers for all successful extractions (video URLs)
+    for (const result of results) {
+      if (result.success) {
+        const videoUrls = result.type === "seekstreaming"
+          ? getSeekStreamingPlaybackUrls(result)
+          : [result.hlsUrl || result.m3u8Url].filter(Boolean);
+        for (const videoUrl of videoUrls) {
+          const headerInfo = await Extractors.setupHeadersForService(
+            result.type,
+            videoUrl,
+            result.url,
+          );
+          if (headerInfo) {
+            if (result.type === "seekstreaming") {
+              await replaceSeekPlaybackRule(headerInfo);
+            } else {
+              await addHeadersRule(
+                headerInfo.domainPattern,
+                headerInfo.headers,
+              );
+            }
+          }
         }
       }
     }
-  }
 
-  const successCount = results.filter((r) => r.success).length;
-  return {
-    success: successCount > 0,
-    total: results.length,
-    successCount,
-    results,
-  };
+    const successCount = results.filter((r) => r.success).length;
+    return {
+      success: successCount > 0,
+      total: results.length,
+      successCount,
+      results,
+    };
+  } finally {
+    await Promise.all(seekExtractionRuleIds.map(removeHeadersRule));
+  }
 }
 
 /**
@@ -2435,6 +2507,17 @@ async function saveToCache(key, data, ttlMinutes) {
 
 // DNR Helper
 let ruleIdCounter = 100;
+// Reserved below the general 100+ allocator; FCTV owns fixed rule 60.
+const SEEK_PLAYBACK_RULE_ID_MIN = 61;
+const SEEK_PLAYBACK_RULE_ID_MAX = 99;
+
+function isSeekPlaybackRuleId(ruleId) {
+  return (
+    Number.isInteger(ruleId) &&
+    ruleId >= SEEK_PLAYBACK_RULE_ID_MIN &&
+    ruleId <= SEEK_PLAYBACK_RULE_ID_MAX
+  );
+}
 
 // FCTV (matches) native streams: rotating segment CDN hosts are Referer-gated
 // to the current player origin; they share a `/cfall/s.../v3b/` path, so one
@@ -2579,24 +2662,14 @@ async function resolveFctvStream(opts) {
   return `${parsed.origin}/token-${token}${parsed.pathname}${parsed.search}`;
 }
 
-async function addHeadersRule(urlPattern, headers) {
-  const existingRules =
-    await browserAPI.declarativeNetRequest.getDynamicRules();
-  const existingIds = new Set(existingRules.map((r) => r.id));
-
-  let id = ruleIdCounter;
-  while (existingIds.has(id)) {
-    id++;
-  }
-  ruleIdCounter = id + 1;
-
+function createHeadersRule(id, urlPattern, headers) {
   const requestHeaders = Object.entries(headers).map(([header, value]) => ({
     header: header,
     operation: "set",
     value: value,
   }));
 
-  const rule = {
+  return {
     id: id,
     priority: 10,
     action: {
@@ -2615,12 +2688,97 @@ async function addHeadersRule(urlPattern, headers) {
       ],
     },
   };
+}
+
+async function addHeadersRule(urlPattern, headers) {
+  const existingRules =
+    await browserAPI.declarativeNetRequest.getDynamicRules();
+  const existingIds = new Set(existingRules.map((r) => r.id));
+
+  let id = ruleIdCounter;
+  while (existingIds.has(id)) {
+    id++;
+  }
+  ruleIdCounter = id + 1;
+
+  const rule = createHeadersRule(id, urlPattern, headers);
 
   try {
     await browserAPI.declarativeNetRequest.updateDynamicRules({
       addRules: [rule],
     });
+    return id;
   } catch (e) {
     console.error("Failed to add dynamic rule:", e);
+    return null;
   }
+}
+
+async function removeHeadersRule(ruleId) {
+  if (!Number.isInteger(ruleId)) return;
+  await browserAPI.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+  });
+}
+
+async function persistSeekPlaybackRule(headerInfo) {
+  try {
+    const existingRules =
+      await browserAPI.declarativeNetRequest.getDynamicRules();
+    const seekRules = existingRules.filter((rule) =>
+      isSeekPlaybackRuleId(rule.id),
+    );
+    const matchingRule = seekRules.find(
+      (rule) => rule.condition?.urlFilter === headerInfo.domainPattern,
+    );
+    const usedIds = new Set(seekRules.map((rule) => rule.id));
+    let ruleId = matchingRule?.id ?? null;
+
+    if (ruleId === null) {
+      for (
+        let candidate = SEEK_PLAYBACK_RULE_ID_MIN;
+        candidate <= SEEK_PLAYBACK_RULE_ID_MAX;
+        candidate += 1
+      ) {
+        if (!usedIds.has(candidate)) {
+          ruleId = candidate;
+          break;
+        }
+      }
+    }
+
+    if (ruleId === null) {
+      ruleId = SEEK_PLAYBACK_RULE_ID_MIN;
+      console.warn(
+        "[NEXUS] Seek playback rule capacity reached; evicting oldest slot",
+      );
+    }
+
+    const rule = createHeadersRule(
+      ruleId,
+      headerInfo.domainPattern,
+      headerInfo.headers,
+    );
+    await browserAPI.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+      addRules: [rule],
+    });
+    return ruleId;
+  } catch (e) {
+    console.error("Failed to persist Seek playback rule:", e);
+    return null;
+  }
+}
+
+let seekPlaybackRuleUpdateQueue = Promise.resolve();
+
+function replaceSeekPlaybackRule(headerInfo) {
+  const update = seekPlaybackRuleUpdateQueue.then(() =>
+    persistSeekPlaybackRule(headerInfo),
+  );
+  seekPlaybackRuleUpdateQueue = update.then(
+    () => undefined,
+    () => undefined,
+  );
+  return update;
 }

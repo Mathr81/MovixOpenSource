@@ -1,6 +1,7 @@
 package com.movix.app.proxy
 
 import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
@@ -38,6 +39,30 @@ class MediaProxyModule(
                 promise.reject(
                     "MEDIA_PROXY_OPEN_FAILED",
                     "Local media proxy unavailable",
+                )
+            }
+        }
+    }
+
+    @ReactMethod
+    fun resolveForCast(localUrl: String, promise: Promise) {
+        openExecutor.execute {
+            try {
+                val target = server.resolveLoopbackTargetForCast(localUrl)
+                    ?: throw IllegalArgumentException("Unknown local media source")
+                val headers = Arguments.createMap()
+                target.headers.forEach(headers::putString)
+                promise.resolve(
+                    Arguments.createMap().apply {
+                        putString("url", target.upstreamUrl)
+                        putMap("headers", headers)
+                        putInt("protocolVersion", 1)
+                    },
+                )
+            } catch (_: Throwable) {
+                promise.reject(
+                    "MEDIA_PROXY_CAST_RESOLVE_FAILED",
+                    "Local media source unavailable",
                 )
             }
         }

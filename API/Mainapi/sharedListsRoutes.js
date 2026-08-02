@@ -29,7 +29,12 @@ function getCachedPool() {
 const SHARED_LIST_CACHE_TTL = 600; // 10 minutes
 const USERS_DIR = path.join(__dirname, 'data', 'users');
 
-// === OpenRouter API Configuration for content moderation (using DeepSeek V4 Flash) ===
+// === ZZAPI API Configuration for content moderation ===
+const ZZAPI_API_KEY = process.env.ZZAPI_API_KEY;
+const ZZAPI_API_URL = 'https://zzapi.cc/v1/chat/completions';
+const ZZAPI_MODEL = 'claude-haiku-4-5-20251001';
+
+// === OpenRouter Fallback Configuration ===
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODEL = 'deepseek/deepseek-v4-flash';
@@ -59,26 +64,49 @@ Note: Les films et séries sont des contenus TMDB officiels, donc ils sont gén�
 Réponds UNIQUEMENT avec ce format JSON (sans markdown, sans backticks):
 {"flagged": true/false, "reason": "INSULTES" ou "EROTIQUE" ou "PSEUDO_INAPPROPRIE" ou "NOM_LISTE_INAPPROPRIE" ou "CONTENU_INAPPROPRIE" ou null, "details": "explication courte"}`;
 
-    const response = await axios.post(
-      OPENROUTER_API_URL,
-      {
-        model: OPENROUTER_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 500,
-        temperature: 0.1
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-          'HTTP-Referer': FRONTEND_BASE_URL,
-          'X-Title': 'Movix Shared List Moderation'
+    let responseText = '';
+    try {
+      const response = await axios.post(
+        ZZAPI_API_URL,
+        {
+          model: ZZAPI_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.1
         },
-        timeout: 15000
-      }
-    );
-
-    const responseText = response.data?.choices?.[0]?.message?.content || '';
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${ZZAPI_API_KEY}`,
+            'HTTP-Referer': FRONTEND_BASE_URL,
+            'X-Title': 'Movix Shared List Moderation'
+          },
+          timeout: 15000
+        }
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || '';
+    } catch (primaryError) {
+      console.warn('⚠️ ZZAPI failed for moderation, falling back to OpenRouter:', primaryError.message);
+      const response = await axios.post(
+        OPENROUTER_API_URL,
+        {
+          model: OPENROUTER_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.1
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'HTTP-Referer': FRONTEND_BASE_URL,
+            'X-Title': 'Movix Shared List Moderation'
+          },
+          timeout: 15000
+        }
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || '';
+    }
 
     let moderationResult;
     try {
@@ -211,7 +239,13 @@ const requireAuth = async (req, res, next) => {
     req.user = { userId, userType, sessionId };
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Token invalide' });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ error: 'Token invalide' });
+    }
+    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+    // sinon le front déconnecte l'utilisateur.
+    console.error('[sharedLists][requireAuth] Vérif session impossible:', error.message);
+    return res.status(503).json({ error: 'Service temporairement indisponible' });
   }
 };
 
@@ -254,7 +288,13 @@ const requireAdmin = async (req, res, next) => {
     req.admin = { userId, userType, adminId: adminRows[0].id, role: adminRows[0].role || 'admin' };
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Token invalide' });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ error: 'Token invalide' });
+    }
+    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+    // sinon le front déconnecte l'utilisateur.
+    console.error('[sharedLists][requireAdmin] Vérif session impossible:', error.message);
+    return res.status(503).json({ error: 'Service temporairement indisponible' });
   }
 };
 

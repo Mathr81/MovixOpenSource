@@ -10,7 +10,7 @@ export interface Profile {
 export interface ProfileContextType {
   currentProfile: Profile | null;
   profiles: Profile[];
-  selectProfile: (profileId: string) => void;
+  selectProfile: (profileId: string) => Promise<boolean>;
   createProfile: (name: string, avatar: string, ageRestriction?: number) => Promise<void>;
   updateProfile: (profileId: string, updates: Partial<Profile>) => Promise<void>;
   deleteProfile: (profileId: string) => Promise<void>;

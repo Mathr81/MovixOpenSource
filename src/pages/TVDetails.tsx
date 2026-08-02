@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
+import { getFrembedBase } from '../utils/frembedConfig';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
@@ -9,6 +10,7 @@ import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import AddToListMenu from '../components/AddToListMenu';
 import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
+import CustomDropdown from '../components/CustomDropdown';
 import ShareButtons from '../components/ShareButtons';
 import HLSPlayer, { HLSPlayerRef } from '../components/HLSPlayer';
 import { useAdFreePopup } from '../context/AdFreePopupContext';
@@ -1539,7 +1541,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
     }
     switch (selectedSource as 'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number) {
       case 'primary':
-        newSrc = `https://frembed.click/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
+        newSrc = `${getFrembedBase()}/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
         break;
       case 'peachify':
         newSrc = `https://peachify.top/embed/tv/${showId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
@@ -4107,40 +4109,65 @@ const TVDetails: React.FC = () => {
     // Déterminer le mode par défaut basé sur le nombre d'épisodes
     const defaultDropdownMode = nonEmptyEpisodes.length > 15;
 
-    const handleAnimeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const episode = nonEmptyEpisodes.find((ep: any) => ep.index === Number(e.target.value));
-      if (episode) {
-        setSelectedEpisode(episode.index);
-        setSelectedAnimeEpisode(episode);
+    const selectableEpisodes = nonEmptyEpisodes.filter((ep: any) => {
+      if (type === 'anime') return true;
+      const today = new Date();
+      const airDate = ep.air_date ? new Date(ep.air_date) : null;
+      const isFuture = airDate && airDate > today;
+      return !isFuture;
+    });
 
-        const hasVf = episode.streaming_links.some((link: any) => link.language === 'vf');
-        const hasVostfr = episode.streaming_links.some((link: any) => link.language === 'vostfr');
-
-        if (hasVf) {
-          setSelectedLanguage('vf');
-        } else if (hasVostfr) {
-          setSelectedLanguage('vostfr');
-        }
-        setSelectedPlayer('0');
-
-        if (cinemaMode && id && selectedSeason) {
-          // Rediriger vers la page de visionnage anime en mode cinéma
-          navigate(`/watch/anime/${encodeId(id)}/season/${selectedSeason}/episode/${episode.index}`);
-          return;
-        }
-
-        // Scroll vers la section des lecteurs immédiatement
-        setTimeout(() => {
-          const playerSection = animeVideoPlayerSectionRef.current;
-          if (playerSection) {
-            playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 0); // Délai mis à 0ms
+    const dropdownOptions = selectableEpisodes.map((ep: any) => {
+      if (type === 'anime') {
+        const allLanguages = ep.streaming_links.map((link: any) => {
+          return getAnimeLanguageLabel(link.language, t);
+        }).join(', ');
+        return {
+          value: ep.index.toString(),
+          label: `${ep.index}. ${ep.name} ${allLanguages ? `(${allLanguages})` : ''}`,
+        };
+      } else {
+        return {
+          value: ep.episode_number.toString(),
+          label: shouldHide('episodeNames') 
+            ? getMaskedContent(ep.name, 'episodeNames', undefined, ep.episode_number) 
+            : `${ep.episode_number}. ${ep.name}`,
+        };
       }
-    };
+    });
 
-    const handleStandardChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-      handleEpisodeChange(Number(e.target.value));
+    const handleDropdownChange = (valueStr: string) => {
+      if (type === 'anime') {
+        const episode = nonEmptyEpisodes.find((ep: any) => ep.index === Number(valueStr));
+        if (episode) {
+          setSelectedEpisode(episode.index);
+          setSelectedAnimeEpisode(episode);
+
+          const hasVf = episode.streaming_links.some((link: any) => link.language === 'vf');
+          const hasVostfr = episode.streaming_links.some((link: any) => link.language === 'vostfr');
+
+          if (hasVf) {
+            setSelectedLanguage('vf');
+          } else if (hasVostfr) {
+            setSelectedLanguage('vostfr');
+          }
+          setSelectedPlayer('0');
+
+          if (cinemaMode && id && selectedSeason) {
+            navigate(`/watch/anime/${encodeId(id)}/season/${selectedSeason}/episode/${episode.index}`);
+            return;
+          }
+
+          setTimeout(() => {
+            const playerSection = animeVideoPlayerSectionRef.current;
+            if (playerSection) {
+              playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }, 0);
+        }
+      } else {
+        handleEpisodeChange(Number(valueStr));
+      }
     };
 
     const handleAnimeGridClick = (episode: any) => {
@@ -4185,46 +4212,17 @@ const TVDetails: React.FC = () => {
           >
             <div className="flex justify-start mb-6">  {/* Alignement à gauche */}
               <div className="w-full max-w-md">
-                <label htmlFor={`${type}-episode-select`} className="block text-sm font-medium text-gray-400 mb-2">
+                <label className="block text-sm font-medium text-gray-400 mb-2">
                   {t('details.selectEpisode')}
                 </label>
-                <div className="relative">
-                  <select
-                    id={`${type}-episode-select`}
-                    value={selectedEpisode ? selectedEpisode.toString() : ""}
-                    onChange={isAnime ? handleAnimeChange : handleStandardChange}
-                    className="block w-full bg-gray-800 border border-gray-700 text-white py-3 px-4 pr-8 rounded-lg appearance-none focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-red-500"
-                  >
-                    <option value="" disabled>{t('details.chooseEpisode')}</option>
-                    {nonEmptyEpisodes.map((ep: any) => {
-                      // ... options rendering ...
-                      if (isAnime) {
-                        // Récupérer toutes les langues disponibles pour cet épisode
-                        const allLanguages = ep.streaming_links.map((link: any) => {
-                          return getAnimeLanguageLabel(link.language, t);
-                        }).join(', ');
-
-                        return (
-                          <option key={ep.index} value={ep.index}>
-                            {ep.index}. {ep.name} {allLanguages ? `(${allLanguages})` : ''}
-                          </option>
-                        );
-                      } else {
-                        const today = new Date();
-                        const airDate = ep.air_date ? new Date(ep.air_date) : null;
-                        const isFuture = airDate && airDate > today;
-                        return (
-                          <option key={ep.episode_number} value={ep.episode_number} disabled={!!isFuture}>
-                            {shouldHide('episodeNames') ? getMaskedContent(ep.name, 'episodeNames', undefined, ep.episode_number) : `${ep.episode_number}. ${ep.name}`} {isFuture ? `(${t('details.upcomingBadge')})` : ''}
-                          </option>
-                        );
-                      }
-                    })}
-                  </select>
-                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-white">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                  </div>
-                </div>
+                <CustomDropdown
+                  options={dropdownOptions}
+                  value={selectedEpisode ? selectedEpisode.toString() : ""}
+                  onChange={handleDropdownChange}
+                  placeholder={t('details.chooseEpisode')}
+                  searchable={true}
+                  className="w-full"
+                />
               </div>
             </div>
           </motion.div>
@@ -4565,6 +4563,8 @@ const TVDetails: React.FC = () => {
           backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})`,
           backgroundSize: 'cover',
           backgroundPosition: 'center',
+          willChange: 'transform',
+          transform: 'translateZ(0)',
         } : undefined}
       />
       <div className="relative z-10 min-h-screen">

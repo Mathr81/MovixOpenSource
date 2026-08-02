@@ -3,6 +3,7 @@ import { motion, AnimatePresence, PanInfo, useReducedMotion } from 'framer-motio
 import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import i18n from '../i18n';
+import { DEFAULT_PUBLIC_DOMAIN } from '../i18n/currentDomain';
 import { ChevronLeft, ChevronRight, Share2, X, Sparkles, Calendar, Trophy, BarChart3, Clock, Flame, Music, ShieldOff, Settings, ImageIcon, Download, Copy, FileText, Loader2, LogIn, UserPlus, TrendingUp, Repeat, Hourglass, MousePointerClick, HelpCircle } from 'lucide-react';
 import { fetchWrappedData, WrappedData, WrappedProgress, WrappedSlide, WrappedTopContent, WrappedResponse } from '../services/wrappedService';
 import { drawRoundedRectPath, wrapCanvasText, loadCanvasImage, ensureShareFonts, drawSeededStickers } from '../utils/wrappedCanvas';
@@ -1175,7 +1176,7 @@ const CreditsRoll: React.FC<{ topContent: WrappedData['topContent']; topGenres?:
         ...(topGenres?.length ? [{ label: t('wrapped.creditsGenre'), value: topGenres[0].name }] : []),
         { label: t('wrapped.creditsRuntime'), value: formatCompactDuration(stats.totalMinutes, t) },
         { label: t('wrapped.creditsProducedBy'), value: 'MOVIX' },
-        { label: '©', value: 'movix.date' },
+        { label: '©', value: DEFAULT_PUBLIC_DOMAIN },
     ];
 
     return (
@@ -3080,7 +3081,7 @@ const WrappedPage: React.FC = () => {
 
         ctx.fillStyle = 'rgba(255,255,255,0.36)';
         ctx.font = '600 26px Inter, system-ui, sans-serif';
-        const domainLabel = 'movix.date';
+        const domainLabel = DEFAULT_PUBLIC_DOMAIN;
         ctx.fillText(domainLabel, width - 78 - ctx.measureText(domainLabel).width, footerTextY);
 
         return new Promise((resolve) => {

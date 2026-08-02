@@ -272,7 +272,7 @@ const WishboardPage: React.FC = () => {
     return (
         <SquareBackground squareSize={48} borderColor="rgba(34, 197, 94, 0.10)" className="min-h-screen bg-black text-white">
             {/* Hero Section */}
-            <div className="relative z-10 pt-24 pb-2 overflow-hidden">
+            <div className="relative z-10 pt-24 pb-2 overflow-x-hidden">
                 <div className="container mx-auto px-6 md:px-10">
                     <div className="flex flex-col items-center text-center max-w-4xl mx-auto">
                         <motion.div
@@ -282,8 +282,8 @@ const WishboardPage: React.FC = () => {
                         >
                             {/* radial-gradient au lieu de blur-[80px] (même halo, ~0ms compositor) */}
                             <div
-                                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[200%] h-[200%] rounded-full -z-10 pointer-events-none"
-                                style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.30) 0%, transparent 65%)' }}
+                                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[350px] max-w-[90vw] rounded-full -z-10 pointer-events-none"
+                                style={{ background: 'radial-gradient(circle, rgba(34, 197, 94, 0.20) 0%, transparent 70%)' }}
                             />
                             <h1 className="relative text-5xl md:text-7xl font-black tracking-tight">
                                 <ShinyText text="GREENLIGHT" speed={3} color="#ffffff" shineColor="#4ade80" className="" />

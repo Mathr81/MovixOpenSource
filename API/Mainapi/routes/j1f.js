@@ -63,9 +63,19 @@ const DROP_SOURCES = new Set(
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean),
 );
-// Series episode servers carry no `source` tag, so generic aggregators are
-// dropped by host here too (vsembed=vidsrc, videasy, frembed).
+// Dropped by host at SCRAPE time (never cached): generic aggregators with no
+// `source` tag (vsembed=vidsrc, videasy, frembed).
 const DROP_HOST_RE = new RegExp(process.env.J1F_DROP_HOSTS || 'vsembed|videasy|frembed|vidsrc', 'i');
+// Hidden AFTER cache: these stay IN the cache but are stripped from the response.
+// Flip J1F_HIDE_HOSTS to un-hide instantly — no re-scrape. ezplayer (doremifasol)
+// + uns.bio (dismoiceline) + bysezoxexe.com, per request.
+const HIDE_HOST_RE = new RegExp(
+  process.env.J1F_HIDE_HOSTS || 'ezplayer|uns\\.bio|bysezoxexe\\.com',
+  'i',
+);
+// 1J1F's own player host (onregardeou.site/video/{slug}) is a WRAPPER page, not
+// an embed — unwrap it into its real nested servers. Host rotates → env-override.
+const WRAP_HOST_RE = new RegExp(process.env.J1F_WRAP_HOSTS || 'onregardeou', 'i');
 const SRV_VAR = process.env.J1F_SRV_VAR || 'J1F_SRV'; // movie source array
 const EPS_VAR = process.env.J1F_EPS_VAR || 'j1fEpsData'; // series episodes array
 const SIMILARITY_THRESHOLD = parseFloat(process.env.J1F_SIMILARITY || '0.7');
@@ -77,6 +87,17 @@ const hostOf = (u) => {
   return m ? m[1] : u || 'embed';
 };
 const toBody = (r) => (typeof r.data === 'string' ? r.data : JSON.stringify(r.data));
+// J1F now base64-wraps the `url` field inside J1F_SRV / servers. Decode it back
+// to the real embed URL; leave already-plain http(s) URLs untouched (backward-compat).
+const decodeUrl = (u) => {
+  if (typeof u !== 'string' || /^https?:\/\//i.test(u)) return u;
+  try {
+    const dec = Buffer.from(u, 'base64').toString('utf-8');
+    return /^https?:\/\//i.test(dec) ? dec : u;
+  } catch {
+    return u;
+  }
+};
 // VOSTFR only when the label is VOSTFR-only; "VF + VOSTFR" (dual) stays VF.
 const langOf = (label) =>
   /vostfr/i.test(label || '') && !/\bvf\b/i.test(label || '') ? 'VOSTFR' : 'VF';
@@ -180,10 +201,11 @@ function splitUniqueServers(servers) {
   for (const s of servers || []) {
     if (!s || !s.url) continue;
     if (DROP_SOURCES.has(String(s.source || '').toLowerCase())) continue; // drop by `source` tag (movies)
-    if (DROP_HOST_RE.test(s.url)) continue; // drop by host (series servers have no `source` tag)
+    const url = decodeUrl(s.url);
+    if (DROP_HOST_RE.test(url)) continue; // drop by host (series servers have no `source` tag)
     const entry = {
-      name: hostOf(s.url),
-      url: s.url,
+      name: hostOf(url),
+      url,
       type: s.type === 'mp4' ? 'mp4' : 'iframe',
       label: s.label || '',
       source: s.source || 'manual',
@@ -191,6 +213,54 @@ function splitUniqueServers(servers) {
     (langOf(s.label) === 'VOSTFR' ? vostfr : vf).push(entry);
   }
   return { vf, vostfr };
+}
+
+// onregardeou wrapper HTML ships its real embed list inline as
+// `const videoData = { ..., "servers":[{name,url,type}, ...] }`. Pull that array.
+function parseWrapperServers(html) {
+  const m = html.match(/"servers"\s*:\s*(\[[\s\S]*?\])/);
+  if (!m) return null;
+  try {
+    const arr = JSON.parse(m[1]); // JSON.parse un-escapes the \/ in the urls
+    return Array.isArray(arr) ? arr : null;
+  } catch {
+    return null;
+  }
+}
+
+// Replace any wrapper entry (onregardeou.site) with its nested servers. The bare
+// wrapper URL 301s, so the trailing slash is required. Nested servers inherit the
+// wrapper's VF/VOSTFR label. On fetch/parse failure the wrapper is kept as-is
+// (still playable as an iframe). Order-preserving; wrapper fetches run in parallel.
+async function expandWrappers(servers) {
+  const out = [];
+  await Promise.all(
+    (servers || []).map(async (s, i) => {
+      const url = decodeUrl(s && s.url);
+      if (!s || !url || !WRAP_HOST_RE.test(url)) {
+        out[i] = s ? [s] : [];
+        return;
+      }
+      const wrapUrl = `${url.split('#')[0].split('?')[0].replace(/\/+$/, '')}/`;
+      try {
+        const res = await make1j1fRequest(wrapUrl, { timeout: 15 });
+        const nested = parseWrapperServers(toBody(res));
+        if (nested && nested.length) {
+          out[i] = nested.map((n) => ({
+            label: s.label || '', // keep wrapper's VF/VOSTFR lang
+            url: n.url,
+            type: /\.(mp4|m3u8|webm)(\?|$)/i.test(n.url || '') ? 'mp4' : 'iframe',
+            source: s.source || 'manual',
+          }));
+          return;
+        }
+      } catch (e) {
+        console.log(`[1J1F WRAP] ${wrapUrl}: ${e.message}`);
+      }
+      out[i] = [s]; // fetch/parse failed -> keep wrapper iframe
+    }),
+  );
+  return out.flat();
 }
 
 // === Search: {base}/?s={query} -> [{url, slug, type, year}] ===
@@ -274,7 +344,8 @@ async function fetchMovie(base, tmdbId) {
     return { success: false, error: 'Sources introuvables', tmdb_id: tmdbId, j1f_url: hit.url };
   }
 
-  const { vf, vostfr } = splitUniqueServers(srv);
+  const expanded = await expandWrappers(srv); // unwrap onregardeou -> real embeds
+  const { vf, vostfr } = splitUniqueServers(expanded);
   if (vf.length === 0 && vostfr.length === 0) {
     // Only generic aggregators (frembed/vidsrc/videasy) — nothing 1J1F adds.
     return { success: false, error: 'Aucune source unique (generiques uniquement)', tmdb_id: tmdbId, j1f_url: hit.url };
@@ -324,11 +395,14 @@ async function fetchSeason(base, tmdbId, seasonNum, episodeNum) {
   // and the frontend slices the current episode. `?episode=` still narrows it.
   const wanted = episodeNum ? eps.filter((e) => Number(e.num) === Number(episodeNum)) : eps;
   const episodes = {};
-  for (const e of wanted) {
-    const { vf, vostfr } = splitUniqueServers(e.servers);
-    if (!vf.length && !vostfr.length) continue; // drop generic-only episodes
-    episodes[String(e.num)] = { vf, vostfr, label: e.label || '' };
-  }
+  await Promise.all(
+    wanted.map(async (e) => {
+      const expanded = await expandWrappers(e.servers); // unwrap onregardeou -> real embeds
+      const { vf, vostfr } = splitUniqueServers(expanded);
+      if (!vf.length && !vostfr.length) return; // drop generic-only episodes
+      episodes[String(e.num)] = { vf, vostfr, label: e.label || '' };
+    }),
+  );
 
   if (Object.keys(episodes).length === 0) {
     return { success: false, error: 'Aucune source unique (generiques uniquement)', tmdb_id: tmdbId, j1f_url: seasonUrl };
@@ -345,6 +419,29 @@ async function fetchSeason(base, tmdbId, seasonNum, episodeNum) {
   };
 }
 
+// Strip HIDE_HOST_RE players from a (cached) response on the way out — the cache
+// keeps them, the client never sees them. Non-mutating; handles movie/series/
+// pending/error shapes.
+const keepVisible = (arr) =>
+  Array.isArray(arr) ? arr.filter((p) => !HIDE_HOST_RE.test((p && p.url) || '')) : arr;
+function hideHosts(data) {
+  if (!data || !data.success) return data;
+  if (data.players) {
+    return {
+      ...data,
+      players: { vf: keepVisible(data.players.vf), vostfr: keepVisible(data.players.vostfr) },
+    };
+  }
+  if (data.episodes) {
+    const episodes = {};
+    for (const [num, ep] of Object.entries(data.episodes)) {
+      episodes[num] = { ...ep, vf: keepVisible(ep.vf), vostfr: keepVisible(ep.vostfr) };
+    }
+    return { ...data, episodes };
+  }
+  return data;
+}
+
 // === Routes ===
 router.get('/movie/:id', async (req, res) => {
   const { id } = req.params;
@@ -353,7 +450,7 @@ router.get('/movie/:id', async (req, res) => {
     const data = await withCache(generateCacheKey({ src: 'j1f', t: 'movie', id }), () =>
       fetchMovie(base, id),
     );
-    res.json(data);
+    res.json(hideHosts(data));
   } catch (err) {
     console.error(`[1J1F MOVIE] ${id}: ${err.message}`);
     res.status(200).json({ success: false, error: 'Erreur 1jour1film', tmdb_id: id });
@@ -367,7 +464,7 @@ router.get('/tv/:id/season/:season', async (req, res) => {
     const base = await resolveBase();
     const key = generateCacheKey({ src: 'j1f', t: 'tv', id, season, episode: episode || '' });
     const data = await withCache(key, () => fetchSeason(base, id, season, episode));
-    res.json(data);
+    res.json(hideHosts(data));
   } catch (err) {
     console.error(`[1J1F TV] ${id} S${season}: ${err.message}`);
     res.status(200).json({ success: false, error: 'Erreur 1jour1film', tmdb_id: id });

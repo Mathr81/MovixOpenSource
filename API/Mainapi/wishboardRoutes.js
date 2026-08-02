@@ -78,7 +78,13 @@ function createWishboardRouter(mysqlPool, redis) {
             };
             next();
         } catch (error) {
-            return res.status(401).json({ error: 'Token invalide' });
+            if (error instanceof jwt.JsonWebTokenError) {
+                return res.status(401).json({ error: 'Token invalide' });
+            }
+            // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+            // sinon le front déconnecte l'utilisateur.
+            console.error('[wishboard][requireAuth] Vérif session impossible:', error.message);
+            return res.status(503).json({ error: 'Service temporairement indisponible' });
         }
     };
 

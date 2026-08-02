@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { useWebHaptics } from 'web-haptics/react';
 import { useTranslation } from 'react-i18next';
 import { useIntro } from '../context/IntroContext';
@@ -7,854 +7,579 @@ interface IntroAnimationProps {
   onAnimationComplete: () => void;
 }
 
-interface Element {
-  symbol: string;
-  number: number;
-  name: string;
-  mass: string;
-}
+/* ============================================================
+   Title card façon Breaking Bad :
+   brume teal + fumée turbulente (feTurbulence) → formules 3D
+   qui passent devant la caméra → fragment réel du tableau
+   périodique (périodes 4-6) → ignition en cascade de
+   Mo (42) · V (23) · I (53) · Xe (54) — les 4 vrais éléments
+   qui épellent MOVIX — le reste se dissout → glissé FLIP des
+   4 tuiles vers le wordmark → glint spéculaire → tagline →
+   fumée qui avale l'écran.
+   ============================================================ */
 
-const ELEMENTS: Element[] = [
-  { symbol: 'Mo', number: 42, name: 'Molybdène', mass: '95.95' },
-  { symbol: 'O', number: 8, name: 'Oxygène', mass: '15.999' },
-  { symbol: 'V', number: 23, name: 'Vanadium', mass: '50.942' },
-  { symbol: 'I', number: 53, name: 'Iode', mass: '126.90' },
+type El = [symbol: string, number: number];
+
+const P4: El[] = [['Ti', 22], ['V', 23], ['Cr', 24], ['Mn', 25], ['Fe', 26], ['Co', 27], ['Ni', 28], ['Cu', 29], ['Zn', 30], ['Ga', 31], ['Ge', 32], ['As', 33], ['Se', 34], ['Br', 35], ['Kr', 36]];
+const P5: El[] = [['Zr', 40], ['Nb', 41], ['Mo', 42], ['Tc', 43], ['Ru', 44], ['Rh', 45], ['Pd', 46], ['Ag', 47], ['Cd', 48], ['In', 49], ['Sn', 50], ['Sb', 51], ['Te', 52], ['I', 53], ['Xe', 54]];
+const P6: El[] = [['Hf', 72], ['Ta', 73], ['W', 74], ['Re', 75], ['Os', 76], ['Ir', 77], ['Pt', 78], ['Au', 79], ['Hg', 80], ['Tl', 81], ['Pb', 82], ['Bi', 83], ['Po', 84], ['At', 85], ['Rn', 86]];
+const ROWS: El[][] = [P4, P5, P6];
+
+// Ignition en cascade dans l'ordre de lecture
+const IGNITE_DELAY: Record<string, string> = { Mo: '0s', V: '0.14s', I: '0.28s', Xe: '0.42s' };
+
+// Tuiles du wordmark : délais de glissé (--gld) et de glint (--gt)
+const TILES = [
+  { sym: 'Mo', num: 42, gld: '0s', gt: '0s' },
+  { sym: 'V', num: 23, gld: '0.07s', gt: '0.1s' },
+  { sym: 'I', num: 53, gld: '0.14s', gt: '0.2s' },
+  { sym: 'Xe', num: 54, gld: '0.21s', gt: '0.3s' },
+] as const;
+
+// Délais de dissolution pseudo-aléatoires stables (pas de Math.random au render)
+const DISSOLVE_DELAYS = Array.from({ length: 45 }, (_, i) => ((i * 37 + 11) % 29) / 100);
+
+// [layer, taille vmin, left %, top %, rgb, opacité, variante, durée s, délai s, caché mobile]
+const SMOKES: readonly [string, number, number, number, string, number, 'A' | 'B', number, number, boolean][] = [
+  ['back', 74, -14, 44, '44,108,78', 0.17, 'A', 17, 0, false],
+  ['back', 58, 62, -16, '36,94,66', 0.14, 'B', 21, -6, true],
+  ['back', 68, 68, 56, '48,116,84', 0.15, 'A', 19, -11, false],
+  ['back', 52, 16, 66, '56,128,96', 0.13, 'B', 15, -3, true],
+  ['back', 46, 36, 6, '42,102,74', 0.12, 'A', 23, -9, false],
+  ['front', 48, 4, 10, '96,172,130', 0.12, 'B', 13, -2, false],
+  ['front', 56, 64, 28, '88,162,122', 0.105, 'A', 16, -7, false],
+  ['front', 46, 28, 68, '104,182,138', 0.115, 'B', 12, -5, false],
 ];
 
-const CARD_ANIMS = ['slamIn', 'bubbleUp', 'dropIn', 'materialize'] as const;
+// [texte, formule ?, left %, top %, taille px, délai s, durée s, opacité, sx, sy, ex, ey, z0 px, z1 px, caché mobile]
+const FORMULAS: readonly [string, boolean, number, number, number, number, number, number, string, string, string, string, number, number, boolean][] = [
+  ['CH3', true, 18, 24, 26, 0.2, 2.2, 0.8, '3vw', '2vh', '-12vw', '-6vh', -430, 430, false],
+  ['C2H5OH', true, 66, 18, 21, 0.5, 2.3, 0.7, '-3vw', '3vh', '11vw', '-8vh', -380, 460, false],
+  ['H2O', true, 36, 68, 24, 0.35, 2.0, 0.75, '2vw', '-2vh', '-8vw', '10vh', -460, 400, false],
+  ['CO2', true, 80, 60, 17, 0.85, 2.2, 0.6, '-2vw', '-3vh', '9vw', '8vh', -350, 480, true],
+  ['C8H10N4O2', true, 22, 44, 19, 1.0, 2.4, 0.65, '3vw', '2vh', '-12vw', '4vh', -400, 420, false],
+  ['CH3NH2', true, 58, 12, 18, 1.15, 2.1, 0.6, '1vw', '3vh', '7vw', '-9vh', -420, 440, true],
+  ['95.95', false, 56, 76, 15, 1.25, 2.0, 0.55, '1vw', '2vh', '7vw', '9vh', -320, 380, false],
+  ['50.942', false, 12, 34, 14, 1.4, 1.9, 0.5, '2vw', '1vh', '-6vw', '5vh', -360, 360, true],
+  ['126.90', false, 84, 36, 14, 1.05, 2.0, 0.5, '-2vw', '1vh', '6vw', '-5vh', -340, 380, true],
+  ['NaCl', false, 8, 58, 16, 1.5, 2.0, 0.5, '2vw', '1vh', '-7vw', '7vh', -380, 400, false],
+  ['C6H12O6', true, 72, 42, 22, 1.4, 2.3, 0.65, '-4vw', '0vh', '12vw', '-4vh', -440, 430, false],
+  ['O2', true, 30, 12, 14, 1.65, 1.9, 0.5, '2vw', '3vh', '-5vw', '-9vh', -300, 420, false],
+  ['N2', true, 46, 84, 15, 1.75, 1.8, 0.5, '1vw', '-2vh', '5vw', '8vh', -340, 400, true],
+  ['CH4', true, 88, 78, 18, 1.6, 2.0, 0.55, '-3vw', '-2vh', '8vw', '6vh', -400, 440, false],
+  ['C12H22O11', true, 40, 32, 16, 1.85, 2.1, 0.55, '2vw', '2vh', '-9vw', '-3vh', -420, 400, false],
+];
 
-function makeParticles(count: number, compact = false) {
-  const n = compact ? Math.ceil(count * 0.5) : count;
-  return Array.from({ length: n }, () => ({
-    angle: Math.random() * Math.PI * 2,
-    dist: (compact ? 25 : 60) + Math.random() * (compact ? 65 : 150),
-    size: (compact ? 1.5 : 2) + Math.random() * (compact ? 3 : 5),
-    delay: Math.random() * 0.25,
-    dur: 0.5 + Math.random() * 0.7,
-  }));
-}
+// [opacité max, délai s, taille vmax, left %, top %, rgb, texturé]
+const PUFFS: readonly [number, number, number, number, number, string, boolean][] = [
+  [0.68, 0, 120, 74, 88, '214,240,222', false],
+  [0.60, 0.1, 96, 88, 66, '188,226,200', false],
+  [0.52, 0.14, 80, 70, 92, '206,238,218', true],
+  [0.64, 0.18, 110, 60, 100, '200,232,210', false],
+  [0.50, 0.24, 66, 90, 78, '196,230,208', true],
+  [0.55, 0.28, 84, 96, 88, '170,214,186', false],
+  [0.66, 0.36, 130, 80, 110, '206,236,216', false],
+];
 
-// Pre-generated sparkle positions (stable, no Math.random in render)
-const SPARKLE_POSITIONS = Array.from({ length: 8 }, (_, i) => ({
-  x: 15 + ((i * 37 + 13) % 70),
-  y: 15 + ((i * 53 + 7) % 70),
-  delay: 0.8 + i * 0.08,
-}));
+// "C8H10N4O2" -> C<sub>8</sub>H<sub>10</sub>… (uniquement pour les formules)
+const fmtFormula = (s: string, isFormula: boolean): React.ReactNode =>
+  isFormula
+    ? s.split(/(\d+)/).map((seg, i) => (/^\d+$/.test(seg) ? <sub key={i}>{seg}</sub> : seg))
+    : s;
 
 const IntroAnimation: React.FC<IntroAnimationProps> = ({ onAnimationComplete }) => {
   const { t } = useTranslation();
-  const [step, setStep] = useState(-1);
-  const [flash, setFlash] = useState<string | null>(null);
-  const [shaking, setShaking] = useState(false);
   const { skipIntro } = useIntro();
-
   const { trigger: haptic } = useWebHaptics();
-  const isMobile = useMemo(() => typeof window !== 'undefined' && window.innerWidth < 640, []);
 
-  // Stable particle sets — fewer & closer on mobile
-  const allParticles = useMemo(() => ({
-    0: makeParticles(24, isMobile),
-    1: makeParticles(16, isMobile),
-    2: makeParticles(22, isMobile),
-    3: makeParticles(18, isMobile),
-    4: makeParticles(35, isMobile),
-  }), [isMobile]);
+  // -1 ambiance | 1 tableau | 2 ignition | 3 dissolution | 4 glide |
+  // 5 posé + glint | 6 tagline | 7 wisp | 8 fumée | 9 fondu sortie
+  const [step, setStep] = useState(-1);
+
+  const reduced = useMemo(
+    () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    []
+  );
+
+  const gridRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const tileRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const finish = useCallback(() => {
     document.body.style.overflow = '';
     onAnimationComplete();
   }, [onAnimationComplete]);
 
-  const triggerFlash = useCallback((color: string, dur = 300) => {
-    setFlash(color);
-    setTimeout(() => setFlash(null), dur);
-  }, []);
+  const canVibrate = typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
+  const vibe = useCallback((pattern: number[], strength: 'medium' | 'heavy') => {
+    if (canVibrate) navigator.vibrate(pattern);
+    else haptic(strength as never);
+  }, [canVibrate, haptic]);
 
-  const triggerShake = useCallback((dur = 400) => {
-    setShaking(true);
-    setTimeout(() => setShaking(false), dur);
-  }, []);
-
-  // Lock scroll immediately
+  // Verrouillage du scroll pendant l'intro
   useEffect(() => {
     document.body.style.overflow = 'hidden';
     return () => { document.body.style.overflow = ''; };
   }, []);
 
-  // Strong vibration patterns (ms) — [vibrate, pause, vibrate, ...]
-  const VIBE = {
-    tap:      [30],
-    slam:     [100, 30, 150],          // Mo, V — heavy double impact
-    medium:   [80],                     // O — single pulse
-    soft:     [50],                     // I — gentle
-    tension:  [60, 40, 60, 40, 60],    // anxiety triple pulse
-    explode:  [120, 30, 120, 30, 250], // X — escalating explosion
-    success:  [80, 60, 120],           // logo reveal — satisfying
-    light:    [40],                     // tagline — subtle
-  };
-
-  const canVibrate = typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
-
-  const vibe = useCallback((pattern: number[], label: string) => {
-    if (canVibrate) {
-      navigator.vibrate(pattern);
-    } else {
-      haptic(label === 'slam' ? 'heavy' : label === 'explode' ? 'error' : 'medium' as any);
-    }
-  }, [canVibrate, haptic]);
-
+  // Timeline
   useEffect(() => {
     const timers: ReturnType<typeof setTimeout>[] = [];
-    const t = (fn: () => void, at: number) => { timers.push(setTimeout(fn, at)); };
+    const at = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
 
-    //  Timeline — strong vibrations
-    t(() => { setStep(0); triggerFlash('#22c55e', 250); triggerShake(500); vibe(VIBE.slam, 'slam'); }, 700);
-    t(() => { setStep(1); triggerFlash('#22c55e', 200); vibe(VIBE.medium, 'medium'); }, 1600);
-    t(() => { setStep(2); triggerFlash('#22c55e', 250); triggerShake(350); vibe(VIBE.slam, 'slam'); }, 2400);
-    t(() => { setStep(3); triggerFlash('#a855f7', 300); vibe(VIBE.soft, 'soft'); }, 3200);
-    t(() => { setStep(4); vibe(VIBE.tension, 'tension'); }, 4000);
-    t(() => { setStep(5); triggerFlash('#dc2626', 450); triggerShake(600); vibe(VIBE.explode, 'explode'); }, 4800);
-    t(() => { setStep(6); triggerFlash('#ffffff', 400); vibe(VIBE.success, 'success'); }, 6400);
-    t(() => { setStep(7); vibe(VIBE.light, 'light'); }, 7600);
-    t(() => { setStep(8); }, 8800);
-    t(finish, 9800);
+    if (reduced) {
+      // Version statique : wordmark + tagline, sortie rapide
+      at(50, () => setStep(6));
+      at(2400, finish);
+      return () => timers.forEach(clearTimeout);
+    }
 
-    return () => { timers.forEach(clearTimeout); };
-  }, [finish, triggerFlash, triggerShake, vibe]);
+    at(2600, () => setStep(1));
+    at(3400, () => { setStep(2); vibe([25, 80, 25, 80, 25, 80, 25], 'medium'); });
+    at(3900, () => setStep(3));
+    at(4700, () => setStep(4));
+    at(5650, () => { setStep(5); vibe([90, 40, 130], 'heavy'); });
+    at(6150, () => { setStep(6); vibe([30], 'medium'); });
+    at(6900, () => setStep(7));
+    at(7300, () => setStep(8));
+    at(7950, () => setStep(9));
+    at(8700, finish);
 
-  const isCardPhase = step >= 0 && step <= 5;
-  const isLogoPhase = step >= 6;
-  const isFading = step >= 8;
+    return () => timers.forEach(clearTimeout);
+  }, [finish, vibe, reduced]);
 
-  const equation = useMemo(() => {
-    if (step < 0) return '';
-    const parts = ['Mo', 'O', 'V', 'I'].slice(0, Math.min(step + 1, 4));
-    let eq = parts.join(' + ');
-    if (step >= 5) eq += ' + X';
-    if (step >= 6) eq += ' \u2192 MOVIX';
-    return eq;
-  }, [step]);
+  // FLIP : mesure des cases de la grille -> variables CSS des tuiles du logo.
+  // Posé avant le premier paint du step 4, bbTileGlide lit --dx/--dy/--s.
+  useLayoutEffect(() => {
+    if (step !== 4 || reduced) return;
+    TILES.forEach(({ sym }) => {
+      const from = gridRefs.current[sym];
+      const to = tileRefs.current[sym];
+      if (!from || !to) return;
+      const a = from.getBoundingClientRect();
+      const b = to.getBoundingClientRect();
+      to.style.setProperty('--dx', `${a.left - b.left}px`);
+      to.style.setProperty('--dy', `${a.top - b.top}px`);
+      to.style.setProperty('--s', String(a.width / b.width));
+    });
+  }, [step, reduced]);
 
   return (
     <div
-      className={`fixed inset-0 z-[99999] overflow-hidden transition-opacity duration-800
-        ${isFading ? 'opacity-0' : 'opacity-100'}
-        ${shaking ? 'intro-shake' : ''}`}
-      style={{ background: '#010a01', height: '100dvh', touchAction: 'none', WebkitTapHighlightColor: 'transparent' }}
+      className={`fixed inset-0 z-[99999] overflow-hidden transition-opacity duration-700 ease-out
+        ${step >= 9 ? 'opacity-0 pointer-events-none' : 'opacity-100'}
+        ${reduced ? 'bb-rm' : ''}`}
+      style={{
+        background: '#010806',
+        height: '100dvh',
+        touchAction: 'none',
+        WebkitTapHighlightColor: 'transparent',
+        '--cell': 'clamp(17px, 4.6vw, 44px)',
+        '--tile': 'clamp(52px, 12vw, 104px)',
+        '--bb-hi': '#0b7a44',
+        '--bb': '#026635',
+        '--bb-lo': '#014b27',
+      } as React.CSSProperties}
     >
       <style>{KEYFRAMES}</style>
 
-      {/* ===== BACKGROUND LAYERS ===== */}
-      {<>
-
-      {/* Molecular dot grid */}
-      <div className="absolute inset-0 opacity-30"
-        style={{
-          backgroundImage: 'radial-gradient(circle, rgba(34,197,94,0.12) 1px, transparent 1px)',
-          backgroundSize: '28px 28px',
-        }}
-      />
-
-      {/* Hexagonal molecular pattern overlay */}
-      <svg className="absolute inset-0 w-full h-full opacity-[0.04]" xmlns="http://www.w3.org/2000/svg">
+      {/* Filtres de turbulence pour la fumée volumétrique */}
+      <svg width="0" height="0" style={{ position: 'absolute' }} aria-hidden="true">
         <defs>
-          <pattern id="hex" width="56" height="100" patternUnits="userSpaceOnUse" patternTransform="scale(1.2)">
-            <path d="M28 2L54 18V50L28 66L2 50V18Z" fill="none" stroke="#22c55e" strokeWidth="0.5"/>
-            <path d="M28 34L54 50V82L28 98L2 82V50Z" fill="none" stroke="#22c55e" strokeWidth="0.5"/>
-          </pattern>
+          <filter id="bbTurbA" x="-35%" y="-35%" width="170%" height="170%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.011 0.016" numOctaves="3" seed="7" result="n" />
+            <feDisplacementMap in="SourceGraphic" in2="n" scale="110" xChannelSelector="R" yChannelSelector="G" />
+          </filter>
+          <filter id="bbTurbB" x="-35%" y="-35%" width="170%" height="170%">
+            <feTurbulence type="fractalNoise" baseFrequency="0.02 0.028" numOctaves="2" seed="3" result="n" />
+            <feDisplacementMap in="SourceGraphic" in2="n" scale="70" xChannelSelector="R" yChannelSelector="G" />
+          </filter>
         </defs>
-        <rect width="100%" height="100%" fill="url(#hex)"/>
       </svg>
 
-      {/* CRT scanning line */}
-      <div className="absolute left-0 right-0 h-[2px] pointer-events-none z-10 intro-scanline"
-        style={{
-          background: 'linear-gradient(90deg, transparent 5%, rgba(34,197,94,0.25) 50%, transparent 95%)',
-          boxShadow: '0 0 20px 4px rgba(34,197,94,0.08)',
-        }}
-      />
+      <div className="bb-scene">
+        {/* Brume de fond — grade teal */}
+        <div className="bb-haze" />
 
-      {/* Secondary slower scanline */}
-      <div className="absolute left-0 right-0 h-[1px] pointer-events-none z-10 intro-scanline-slow"
-        style={{
-          background: 'linear-gradient(90deg, transparent 10%, rgba(34,197,94,0.12) 50%, transparent 90%)',
-        }}
-      />
-
-      {/* Vignette */}
-      <div className="absolute inset-0 pointer-events-none z-[1]"
-        style={{ background: 'radial-gradient(ellipse at center, transparent 30%, rgba(0,0,0,0.8) 100%)' }}
-      />
-
-      {/* Ambient green light pulses */}
-      {step >= 0 && (
-        <>
-          <div className="absolute top-1/3 left-1/4 w-48 h-48 sm:w-96 sm:h-96 pointer-events-none intro-ambient-1"
+        {/* Fumée turbulente (2 couches) */}
+        {SMOKES.map(([layer, size, l, tp, rgb, op, anim, dur, delay, mHide], i) => (
+          <div
+            key={i}
+            className={`bb-smoke ${layer}${mHide ? ' bb-m-hide' : ''}`}
             style={{
-              background: 'radial-gradient(circle, rgba(34,197,94,0.06) 0%, transparent 70%)',
-              filter: 'blur(40px)',
+              width: `${size}vmin`,
+              height: `${size}vmin`,
+              left: `${l}%`,
+              top: `${tp}%`,
+              background: `radial-gradient(circle, rgba(${rgb},${op}) 0%, rgba(${rgb},${op * 0.55}) 38%, transparent 68%)`,
+              animation: `bbSmoke${anim} ${dur}s ease-in-out ${delay}s infinite alternate`,
             }}
           />
-          <div className="absolute bottom-1/4 right-1/3 w-40 h-40 sm:w-80 sm:h-80 pointer-events-none intro-ambient-2"
-            style={{
-              background: 'radial-gradient(circle, rgba(34,197,94,0.04) 0%, transparent 70%)',
-              filter: 'blur(50px)',
-            }}
-          />
-        </>
-      )}
+        ))}
 
-      {/* Red ambient when X appears */}
-      {step >= 5 && (
-        <div className="absolute top-1/2 right-[20%] w-48 h-48 sm:w-96 sm:h-96 -translate-y-1/2 pointer-events-none intro-ambient-red"
-          style={{
-            background: 'radial-gradient(circle, rgba(220,38,38,0.08) 0%, transparent 60%)',
-            filter: 'blur(60px)',
-          }}
-        />
-      )}
-
-      {/* ===== FLASH OVERLAY ===== */}
-      {flash && (
-        <div
-          className="absolute inset-0 z-40 pointer-events-none intro-flash"
-          style={{ backgroundColor: flash }}
-        />
-      )}
-
-      {/* ===== CARD PHASE ===== */}
-      {isCardPhase && (
-        <div className="absolute inset-0 flex items-center justify-center z-20">
-          <div className="flex items-end gap-1 sm:gap-3 md:gap-5 relative">
-
-            {ELEMENTS.map((el, i) => (
-              <div key={el.symbol} className="relative">
-                {/* Particle explosion on appear */}
-                {step >= i && (
-                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30">
-                    {(allParticles[i as keyof typeof allParticles] || []).map((p, pi) => (
-                      <div
-                        key={pi}
-                        className="absolute rounded-full intro-particle"
-                        style={{
-                          width: p.size,
-                          height: p.size,
-                          backgroundColor: i === 3 ? '#a855f7' : '#22c55e',
-                          boxShadow: `0 0 ${p.size * 3}px ${i === 3 ? 'rgba(168,85,247,0.8)' : 'rgba(34,197,94,0.8)'}`,
-                          '--px': `${Math.cos(p.angle) * p.dist}px`,
-                          '--py': `${Math.sin(p.angle) * p.dist}px`,
-                          animationDuration: `${p.dur}s`,
-                          animationDelay: `${p.delay}s`,
-                        } as React.CSSProperties}
-                      />
-                    ))}
-                  </div>
-                )}
-
-                {/* Smoke/vapor rising from card */}
-                {step >= i && (
-                  <div className="absolute -top-1 sm:-top-2 left-1/2 -translate-x-1/2 w-12 sm:w-20 h-16 sm:h-24 pointer-events-none z-20">
-                    {(isMobile ? [0, 1] : [0, 1, 2, 3]).map(si => (
-                      <div
-                        key={si}
-                        className="absolute bottom-0 rounded-full blur-lg intro-smoke"
-                        style={{
-                          width: 14 + si * 8,
-                          height: 14 + si * 8,
-                          left: `${20 + si * 12}%`,
-                          animationDelay: `${si * 0.12}s`,
-                          backgroundColor: i === 3 ? 'rgba(168,85,247,0.15)' : 'rgba(34,197,94,0.12)',
-                        }}
-                      />
-                    ))}
-                  </div>
-                )}
-
-                {/* The periodic table card */}
-                {step >= i && (
-                  <div
-                    className={`relative flex flex-col items-center justify-center select-none
-                      rounded-sm backdrop-blur-sm
-                      w-[50px] h-[66px] sm:w-[88px] sm:h-[112px] md:w-[105px] md:h-[132px]
-                      ${step === 4 && step < 5 ? 'intro-tension' : ''}`}
-                    style={{
-                      animation: `${CARD_ANIMS[i]} 0.65s cubic-bezier(0.16, 1, 0.3, 1) forwards,
-                                  cardGlow 2.5s ease-in-out 0.7s infinite`,
-                      border: `1.5px solid ${i === 3 ? 'rgba(168,85,247,0.5)' : 'rgba(34,197,94,0.45)'}`,
-                      background: `linear-gradient(170deg, ${i === 3 ? 'rgba(59,7,100,0.7)' : 'rgba(5,46,22,0.7)'} 0%, rgba(2,10,2,0.95) 100%)`,
-                    }}
-                  >
-                    {/* Top category bar */}
-                    <div className="absolute top-0 left-0 right-0 h-[2px]"
-                      style={{ background: i === 3
-                        ? 'linear-gradient(90deg, transparent, rgba(168,85,247,0.6), transparent)'
-                        : 'linear-gradient(90deg, transparent, rgba(34,197,94,0.6), transparent)' }}
-                    />
-
-                    {/* Inner subtle glow */}
-                    <div className="absolute inset-0 rounded-sm pointer-events-none"
-                      style={{
-                        background: `radial-gradient(ellipse at 50% 30%, ${i === 3 ? 'rgba(168,85,247,0.08)' : 'rgba(34,197,94,0.08)'} 0%, transparent 70%)`,
-                      }}
-                    />
-
-                    {/* Atomic number */}
-                    <span className={`absolute top-1 left-1.5 sm:top-1.5 sm:left-2 text-[7px] sm:text-[10px] md:text-xs font-mono font-bold
-                      ${i === 3 ? 'text-purple-400/80' : 'text-green-400/80'}`}>
-                      {el.number}
-                    </span>
-
-                    {/* Symbol */}
-                    <span
-                      className={`text-lg sm:text-3xl md:text-5xl font-bold leading-none mt-1 sm:mt-2
-                        ${i === 3 ? 'text-purple-300' : 'text-green-300'}`}
-                      style={{
-                        textShadow: `0 0 20px ${i === 3 ? 'rgba(168,85,247,0.6)' : 'rgba(34,197,94,0.6)'},
-                                     0 0 40px ${i === 3 ? 'rgba(168,85,247,0.2)' : 'rgba(34,197,94,0.2)'}`,
-                        fontFamily: 'Georgia, "Palatino Linotype", "Book Antiqua", Palatino, serif',
-                        letterSpacing: el.symbol.length > 1 ? '-0.02em' : '0',
-                      }}
-                    >
-                      {el.symbol}
-                    </span>
-
-                    {/* Element name */}
-                    <span className={`text-[5px] sm:text-[8px] md:text-[9px] mt-0.5 sm:mt-1.5 tracking-[0.1em] sm:tracking-[0.15em] uppercase font-mono
-                      ${i === 3 ? 'text-purple-400/50' : 'text-green-400/50'}`}>
-                      {el.name}
-                    </span>
-
-                    {/* Atomic mass */}
-                    <span className={`hidden sm:inline text-[7px] font-mono mt-0.5
-                      ${i === 3 ? 'text-purple-400/30' : 'text-green-400/30'}`}>
-                      {el.mass}
-                    </span>
-
-                    {/* Corner brackets */}
-                    {[
-                      'top-0 left-0 border-t border-l',
-                      'top-0 right-0 border-t border-r',
-                      'bottom-0 left-0 border-b border-l',
-                      'bottom-0 right-0 border-b border-r',
-                    ].map(pos => (
-                      <div key={pos}
-                        className={`absolute w-1.5 h-1.5 sm:w-3 sm:h-3 ${pos} ${i === 3 ? 'border-purple-400/25' : 'border-green-400/25'}`}
-                      />
-                    ))}
-                  </div>
-                )}
+        {/* Formules chimiques en 3D vers la caméra */}
+        {!reduced && (
+          <div className="bb-formulas">
+            {FORMULAS.map(([txt, isF, l, tp, size, delay, dur, op, sx, sy, ex, ey, z0, z1, mHide]) => (
+              <div
+                key={txt}
+                className={`bb-formula${mHide ? ' bb-m-hide' : ''}`}
+                style={{ left: `${l}%`, top: `${tp}%`, fontSize: size }}
+              >
+                <span
+                  className="inner"
+                  style={{
+                    '--delay': `${delay}s`, '--dur': `${dur}s`, '--op': op,
+                    '--sx': sx, '--sy': sy, '--ex': ex, '--ey': ey,
+                    '--z0': `${z0}px`, '--z1': `${z1}px`,
+                  } as React.CSSProperties}
+                >
+                  {fmtFormula(txt, isF)}
+                </span>
               </div>
             ))}
-
-            {/* ===== X ENTRANCE ===== */}
-            {step >= 5 && (
-              <div className="relative w-[50px] h-[66px] sm:w-[88px] sm:h-[112px] md:w-[105px] md:h-[132px]
-                flex items-center justify-center">
-
-                {/* Energy gathering point */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <div className="intro-energy-gather"
-                    style={{
-                      width: 6, height: 6,
-                      borderRadius: '50%',
-                      backgroundColor: '#dc2626',
-                      boxShadow: '0 0 40px 15px rgba(220,38,38,0.6), 0 0 80px 30px rgba(220,38,38,0.2)',
-                    }}
-                  />
-                </div>
-
-                {/* Radiating ring */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <div className="intro-ring"
-                    style={{
-                      width: 4, height: 4,
-                      borderRadius: '50%',
-                      border: '1px solid rgba(220,38,38,0.6)',
-                      boxShadow: '0 0 15px rgba(220,38,38,0.3)',
-                    }}
-                  />
-                </div>
-
-                {/* X SVG — 4 strokes radiating from center */}
-                <svg viewBox="0 0 80 100" className="w-full h-full relative z-10" fill="none">
-                  <defs>
-                    <filter id="xglow">
-                      <feGaussianBlur stdDeviation="2.5" result="blur"/>
-                      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-                    </filter>
-                    <filter id="xglow-strong">
-                      <feGaussianBlur stdDeviation="5" result="blur"/>
-                      <feMerge>
-                        <feMergeNode in="blur"/>
-                        <feMergeNode in="blur"/>
-                        <feMergeNode in="SourceGraphic"/>
-                      </feMerge>
-                    </filter>
-                  </defs>
-                  {/* Shadow / glow layer */}
-                  <g filter="url(#xglow-strong)" opacity="0.5">
-                    <line x1="40" y1="50" x2="16" y2="18" stroke="#dc2626" strokeWidth="7" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.25s' }}/>
-                    <line x1="40" y1="50" x2="64" y2="18" stroke="#dc2626" strokeWidth="7" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.35s' }}/>
-                    <line x1="40" y1="50" x2="16" y2="82" stroke="#dc2626" strokeWidth="7" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.45s' }}/>
-                    <line x1="40" y1="50" x2="64" y2="82" stroke="#dc2626" strokeWidth="7" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.55s' }}/>
-                  </g>
-                  {/* Main crisp layer */}
-                  <g filter="url(#xglow)">
-                    <line x1="40" y1="50" x2="16" y2="18" stroke="#ef4444" strokeWidth="4.5" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.25s' }}/>
-                    <line x1="40" y1="50" x2="64" y2="18" stroke="#ef4444" strokeWidth="4.5" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.35s' }}/>
-                    <line x1="40" y1="50" x2="16" y2="82" stroke="#ef4444" strokeWidth="4.5" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.45s' }}/>
-                    <line x1="40" y1="50" x2="64" y2="82" stroke="#ef4444" strokeWidth="4.5" strokeLinecap="round"
-                      className="intro-x-stroke" style={{ animationDelay: '0.55s' }}/>
-                  </g>
-                  {/* Bright center dot */}
-                  <circle cx="40" cy="50" r="3" fill="#fff" opacity="0"
-                    className="intro-center-dot"/>
-                </svg>
-
-                {/* Sparkles flying from X */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
-                  {SPARKLE_POSITIONS.map((sp, i) => (
-                    <div key={i}
-                      className="absolute w-1.5 h-1.5 bg-red-400 rounded-full intro-sparkle"
-                      style={{
-                        left: `${sp.x}%`,
-                        top: `${sp.y}%`,
-                        animationDelay: `${sp.delay}s`,
-                        boxShadow: '0 0 6px 2px rgba(248,113,113,0.8)',
-                      }}
-                    />
-                  ))}
-                </div>
-
-                {/* Red particles explosion */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
-                  {(allParticles[4] || []).map((p, pi) => (
-                    <div key={pi}
-                      className="absolute rounded-full intro-particle"
-                      style={{
-                        width: p.size,
-                        height: p.size,
-                        backgroundColor: '#ef4444',
-                        boxShadow: `0 0 ${p.size * 3}px rgba(239,68,68,0.9)`,
-                        '--px': `${Math.cos(p.angle) * p.dist}px`,
-                        '--py': `${Math.sin(p.angle) * p.dist}px`,
-                        animationDuration: `${p.dur}s`,
-                        animationDelay: `${0.3 + p.delay}s`,
-                      } as React.CSSProperties}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Chemical equation */}
-          {step >= 0 && (
-            <div className="absolute bottom-[10%] sm:bottom-[14%] left-0 right-0 text-center">
-              <span className="text-green-500/35 text-[10px] sm:text-xs md:text-sm font-mono tracking-[0.2em] intro-equation">
-                {equation}
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ===== LOGO PHASE ===== */}
-      {isLogoPhase && (
-        <div className="absolute inset-0 flex items-center justify-center z-20">
-          <div className="flex flex-col items-center relative intro-logo-container">
-
-            {/* Background energy burst */}
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="w-[250px] h-[250px] sm:w-[500px] sm:h-[500px] intro-logo-burst"
+            {/* Le beat "Xe · 131.293" — l'élément qui signe le X */}
+            <div className="bb-formula hero">
+              <span
+                className="inner"
                 style={{
-                  background: 'radial-gradient(circle, rgba(220,38,38,0.15) 0%, rgba(34,197,94,0.05) 40%, transparent 70%)',
-                  filter: 'blur(30px)',
-                }}
-              />
-            </div>
-
-            {/* Logo letters */}
-            <h1 className="relative text-4xl sm:text-7xl md:text-[10rem] font-black tracking-[0.08em] sm:tracking-[0.15em] flex items-baseline z-10"
-              style={{ fontFamily: 'Georgia, "Palatino Linotype", "Book Antiqua", Palatino, serif' }}>
-              {['M', 'O', 'V', 'I'].map((letter, i) => (
-                <span key={letter}
-                  className="inline-block intro-logo-letter"
-                  style={{
-                    animationDelay: `${i * 0.08}s`,
-                    color: '#22c55e',
-                    textShadow: '0 0 30px rgba(34,197,94,0.5), 0 0 60px rgba(34,197,94,0.2)',
-                  }}
-                >
-                  {letter}
-                </span>
-              ))}
-              <span className="inline-block intro-logo-x ml-0.5 sm:ml-2"
-                style={{
-                  color: '#dc2626',
-                  textShadow: '0 0 40px rgba(220,38,38,0.7), 0 0 80px rgba(220,38,38,0.3), 0 0 120px rgba(220,38,38,0.1)',
-                }}
+                  '--delay': '1.55s', '--dur': '1.8s', '--op': 0.97,
+                  '--sx': '-2vw', '--sy': '1vh', '--ex': '4vw', '--ey': '-5vh',
+                  '--z0': '-160px', '--z1': '230px',
+                } as React.CSSProperties}
               >
-                X
+                Xe<span className="weight">131.293</span>
               </span>
-            </h1>
-
-            {/* Lens flare sweep */}
-            <div className="absolute top-1/2 -translate-y-1/2 left-0 right-0 h-full overflow-hidden pointer-events-none z-20">
-              <div className="intro-lens-flare"
-                style={{
-                  position: 'absolute',
-                  top: '30%',
-                  width: '80px',
-                  height: '40%',
-                  background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.5) 40%, rgba(255,255,255,0.8) 50%, rgba(255,255,255,0.5) 60%, transparent)',
-                  filter: 'blur(8px)',
-                  transform: 'skewX(-15deg)',
-                }}
-              />
             </div>
-
-            {/* Expanding underline */}
-            <div className="mt-4 sm:mt-6 h-[1.5px] intro-logo-line relative overflow-hidden"
-              style={{
-                background: 'linear-gradient(90deg, transparent, rgba(34,197,94,0.5) 30%, rgba(220,38,38,0.5) 70%, transparent)',
-              }}
-            />
-
-            {/* Tagline */}
-            {step >= 7 && (
-              <p className="mt-5 sm:mt-8 text-white/40 text-[10px] sm:text-xs md:text-sm tracking-[0.4em] uppercase font-mono intro-tagline">
-                {t('introAnimation.tagline')}
-              </p>
-            )}
           </div>
+        )}
+
+        {/* Fragment du tableau périodique */}
+        {!reduced && step >= 1 && (
+          <div className={`bb-table visible${step >= 3 ? ' dissolve' : ''}`}>
+            <div className="bb-grid">
+              {ROWS.flatMap((row, ri) =>
+                row.map(([sym, num], ci) => {
+                  const keep = sym in IGNITE_DELAY;
+                  return (
+                    <div
+                      key={sym}
+                      ref={keep ? (el) => { gridRefs.current[sym] = el; } : undefined}
+                      className={`bb-cell${keep ? ' keep' : ''}${keep && step >= 2 ? ' lit' : ''}`}
+                      style={{
+                        '--dd': `${DISSOLVE_DELAYS[ri * 15 + ci]}s`,
+                        '--ig': keep ? IGNITE_DELAY[sym] : undefined,
+                        visibility: keep && step >= 4 ? 'hidden' : undefined,
+                      } as React.CSSProperties}
+                    >
+                      <span className="num">{num}</span>
+                      <span className="sym">{sym}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Wordmark [Mo][V][I][Xe] + tagline */}
+        <div className={`bb-logo${step >= 8 ? ' consumed' : ''}`}>
+          <div className={`bb-logo-inner${!reduced && step >= 5 ? ' afloat' : ''}`}>
+            <div className="bb-wordmark">
+              {TILES.map(({ sym, num, gld, gt }) => (
+                <div
+                  key={sym}
+                  ref={(el) => { tileRefs.current[sym] = el; }}
+                  className={`bb-tile${!reduced && step >= 4 ? ' glide' : ''}${!reduced && step >= 5 ? ' landed' : ''}`}
+                  style={{ '--gld': gld, '--gt': gt } as React.CSSProperties}
+                >
+                  <span className="num">{num}</span>
+                  <span className="sym">{sym}</span>
+                </div>
+              ))}
+            </div>
+            <div className={`bb-tagline${step >= 6 ? ' in' : ''}`}>{t('introAnimation.tagline')}</div>
+          </div>
+        </div>
+
+        {/* Wisp de fumée qui traverse le logo */}
+        {!reduced && <div className={`bb-wisp${step >= 7 ? ' go' : ''}`} />}
+
+        <div className="bb-vignette" />
+        <div className="bb-grain" />
+      </div>
+
+      {/* Fumée finale qui avale le titre */}
+      {!reduced && (
+        <div className={`bb-consume${step >= 8 ? ' go' : ''}`}>
+          {PUFFS.map(([po, pd, size, l, tp, rgb, tex], i) => (
+            <div
+              key={i}
+              className={`bb-puff${tex ? ' tex' : ''}`}
+              style={{
+                '--po': po,
+                '--pd': `${pd}s`,
+                width: `${size}vmax`,
+                height: `${size}vmax`,
+                left: `calc(${l}% - ${size / 2}vmax)`,
+                top: `calc(${tp}% - ${size / 2}vmax)`,
+                background: `radial-gradient(circle, rgba(${rgb},0.85) 0%, rgba(${rgb},0.4) 42%, transparent 68%)`,
+              } as React.CSSProperties}
+            />
+          ))}
         </div>
       )}
 
-      {/* ===== SKIP BUTTON (during animation) ===== */}
+      {/* Passer */}
       <button
-          onClick={() => { haptic('selection'); skipIntro(); }}
-          className="absolute top-5 right-5 sm:top-6 sm:right-6 text-white/20 hover:text-white/60 text-[10px] sm:text-xs
-                    px-3 py-1.5 sm:px-4 sm:py-2 transition-all duration-300 hover:bg-white/5 rounded
-                    border border-white/[0.06] hover:border-white/15 z-[100000] font-mono tracking-widest uppercase"
-        >
-          {t('introAnimation.skip')}
-        </button>
-
-      </>}
-
+        onClick={() => { haptic('selection'); skipIntro(); }}
+        className="absolute top-5 right-5 sm:top-6 sm:right-6 text-white/20 hover:text-white/60 text-[10px] sm:text-xs
+                  px-3 py-1.5 sm:px-4 sm:py-2 transition-all duration-300 hover:bg-white/5 rounded
+                  border border-white/[0.06] hover:border-white/15 z-[100000] font-mono tracking-widest uppercase"
+      >
+        {t('introAnimation.skip')}
+      </button>
     </div>
   );
 };
 
-/* ============================================
-   KEYFRAMES — cinematic Breaking Bad intro
-   ============================================ */
+/* ============================================================
+   CSS — title card Breaking Bad v2
+   ============================================================ */
 const KEYFRAMES = `
-  /* --- CARD ENTRANCES --- */
-  @keyframes slamIn {
-    0% { opacity: 0; transform: translateX(-60px) rotate(-8deg) scale(0.6); filter: brightness(2.5) blur(3px); }
-    50% { opacity: 1; transform: translateX(6px) rotate(1deg) scale(1.05); filter: brightness(1.5) blur(0); }
-    75% { transform: translateX(-3px) rotate(-0.3deg) scale(0.97); filter: brightness(1.1); }
-    100% { opacity: 1; transform: translateX(0) rotate(0) scale(1); filter: brightness(1); }
+  .bb-scene { position: absolute; inset: 0; animation: bbCameraPull 8.8s cubic-bezier(0.25, 0.1, 0.25, 1) forwards; }
+  @keyframes bbCameraPull { 0% { transform: scale(1.09); } 100% { transform: scale(1); } }
+
+  .bb-haze {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(120vmax 90vmax at 38% 42%, rgba(10,62,46,0.36) 0%, transparent 60%),
+      radial-gradient(90vmax 70vmax at 70% 68%, rgba(6,44,36,0.32) 0%, transparent 65%),
+      radial-gradient(70vmax 55vmax at 20% 85%, rgba(8,50,38,0.25) 0%, transparent 60%),
+      #010806;
   }
-  @media (min-width: 640px) {
-    @keyframes slamIn {
-      0% { opacity: 0; transform: translateX(-100px) rotate(-12deg) scale(0.6); filter: brightness(2.5) blur(4px); }
-      50% { opacity: 1; transform: translateX(10px) rotate(1.5deg) scale(1.06); filter: brightness(1.5) blur(0); }
-      75% { transform: translateX(-4px) rotate(-0.5deg) scale(0.97); filter: brightness(1.1); }
-      100% { opacity: 1; transform: translateX(0) rotate(0) scale(1); filter: brightness(1); }
+  .bb-vignette {
+    position: absolute; inset: 0; z-index: 9; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 32%, rgba(0,0,0,0.64) 80%, rgba(0,0,0,0.9) 100%);
+  }
+  .bb-grain {
+    position: absolute; inset: -50%; z-index: 10; pointer-events: none;
+    opacity: 0.055;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    animation: bbGrainShift 0.9s steps(3) infinite;
+  }
+  @keyframes bbGrainShift {
+    0% { transform: translate(0,0); } 33% { transform: translate(-6%,4%); }
+    66% { transform: translate(5%,-5%); } 100% { transform: translate(0,0); }
+  }
+
+  .bb-smoke { position: absolute; border-radius: 50%; will-change: transform; pointer-events: none; }
+  .bb-smoke.back { z-index: 1; filter: url(#bbTurbA) blur(16px); }
+  .bb-smoke.front { z-index: 5; filter: url(#bbTurbA) blur(14px); }
+  @keyframes bbSmokeA {
+    0% { transform: translate(0,0) rotate(0) scale(1); }
+    50% { transform: translate(10vmin,-8vmin) rotate(40deg) scale(1.25); }
+    100% { transform: translate(-7vmin,5vmin) rotate(-28deg) scale(0.92); }
+  }
+  @keyframes bbSmokeB {
+    0% { transform: translate(0,0) rotate(0) scale(1); }
+    50% { transform: translate(-12vmin,6vmin) rotate(-48deg) scale(1.32); }
+    100% { transform: translate(8vmin,-7vmin) rotate(34deg) scale(0.88); }
+  }
+
+  .bb-formulas { position: absolute; inset: 0; z-index: 2; perspective: 900px; perspective-origin: 50% 46%; }
+  .bb-formula {
+    position: absolute;
+    color: rgba(226,244,236,0.9);
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-weight: 500; letter-spacing: 0.05em; white-space: nowrap;
+    text-shadow: 0 0 14px rgba(190,240,214,0.55);
+  }
+  .bb-formula sub { font-size: 0.62em; }
+  .bb-formula .inner {
+    display: inline-block; opacity: 0;
+    animation: bbFlyBy var(--dur,2.2s) cubic-bezier(0.25,0.3,0.55,1) var(--delay,0s) forwards;
+    will-change: transform, opacity;
+  }
+  @keyframes bbFlyBy {
+    0% { opacity: 0; transform: translate3d(var(--sx),var(--sy),var(--z0,-420px)); filter: blur(2.5px); }
+    18% { opacity: var(--op,0.85); filter: blur(0.6px); }
+    58% { opacity: var(--op,0.85); filter: blur(0.3px); }
+    100% { opacity: 0; transform: translate3d(var(--ex),var(--ey),var(--z1,420px)); filter: blur(4px); }
+  }
+  .bb-formula.hero {
+    left: 50%; top: 28%; transform: translateX(-50%);
+    font-size: clamp(24px, 5.2vw, 46px); font-weight: 700;
+    color: rgba(242,252,246,0.97);
+    text-shadow: 0 0 20px rgba(214,250,230,0.75), 0 0 80px rgba(120,220,165,0.45);
+  }
+  .bb-formula.hero .weight { font-size: 0.5em; font-weight: 400; opacity: 0.85; margin-left: 0.55em; letter-spacing: 0.1em; }
+
+  .bb-table {
+    position: absolute; inset: 0; z-index: 3;
+    display: flex; align-items: center; justify-content: center;
+    perspective: 1100px;
+  }
+  .bb-grid { display: grid; grid-template-columns: repeat(15, var(--cell)); gap: calc(var(--cell) * 0.13); opacity: 0; }
+  .bb-table.visible .bb-grid { animation: bbTableIn 0.85s cubic-bezier(0.2,0.6,0.3,1) forwards; }
+  @keyframes bbTableIn {
+    from { opacity: 0; transform: rotateX(10deg) scale(1.07); }
+    to { opacity: 1; transform: rotateX(0) scale(1); }
+  }
+  .bb-cell {
+    position: relative; width: var(--cell); height: var(--cell);
+    border: 1px solid rgba(146,220,176,0.20); border-radius: 2px;
+    background: rgba(7,42,24,0.38);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    color: rgba(196,232,209,0.52);
+  }
+  .bb-cell .sym { font-size: calc(var(--cell) * 0.38); font-weight: 600; letter-spacing: -0.01em; }
+  .bb-cell .num { position: absolute; top: 5%; left: 8%; font-size: calc(var(--cell) * 0.19); opacity: 0.75; }
+  .bb-table.dissolve .bb-cell:not(.keep) { animation: bbCellOut 0.6s ease-out var(--dd,0s) forwards; }
+  @keyframes bbCellOut { to { opacity: 0; filter: blur(2px); } }
+
+  .bb-cell.keep.lit { z-index: 2; animation: bbIgnite 0.55s ease-out var(--ig,0s) both; }
+  .bb-cell.keep.lit .num { opacity: 0.95; }
+  @keyframes bbIgnite {
+    0% {
+      border-color: rgba(146,220,176,0.20);
+      background: rgba(7,42,24,0.38);
+      color: rgba(196,232,209,0.52);
+      filter: brightness(1);
+      box-shadow: none;
+    }
+    22% {
+      border-color: rgba(255,255,255,1);
+      background: linear-gradient(180deg, var(--bb-hi) 0%, var(--bb) 55%, var(--bb-lo) 100%);
+      color: #fff;
+      filter: brightness(3.4);
+      box-shadow: 0 0 30px 8px rgba(140,240,180,0.55);
+    }
+    100% {
+      border-color: rgba(250,255,252,0.92);
+      background: linear-gradient(180deg, var(--bb-hi) 0%, var(--bb) 55%, var(--bb-lo) 100%);
+      color: #fff;
+      filter: brightness(1);
+      box-shadow: 0 0 26px 5px rgba(96,214,148,0.4), 0 0 90px 12px rgba(40,160,95,0.25);
     }
   }
 
-  @keyframes bubbleUp {
-    0% { opacity: 0; transform: translateY(30px) scale(0.7); filter: blur(2px); }
-    30% { opacity: 1; filter: blur(0); }
-    60% { transform: translateY(-6px) scale(1.04); }
-    80% { transform: translateY(2px) scale(0.98); }
-    100% { opacity: 1; transform: translateY(0) scale(1); }
+  .bb-logo {
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; align-items: center; justify-content: center;
   }
-  @media (min-width: 640px) {
-    @keyframes bubbleUp {
-      0% { opacity: 0; transform: translateY(50px) scale(0.7); filter: blur(3px); }
-      30% { opacity: 1; filter: blur(0); }
-      60% { transform: translateY(-10px) scale(1.04); }
-      80% { transform: translateY(3px) scale(0.98); }
-      100% { opacity: 1; transform: translateY(0) scale(1); }
-    }
-  }
+  .bb-logo.consumed { animation: bbLogoConsumed 0.9s ease-in 0.15s forwards; }
+  @keyframes bbLogoConsumed { to { opacity: 0; filter: blur(9px); } }
+  .bb-logo-inner { display: flex; flex-direction: column; align-items: center; gap: clamp(18px, 4vh, 34px); }
+  .bb-logo-inner.afloat { animation: bbLogoFloat 7s ease-in-out infinite; }
+  @keyframes bbLogoFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-0.6vh); } }
+  .bb-wordmark { display: flex; align-items: center; gap: calc(var(--tile) * 0.06); }
 
-  @keyframes dropIn {
-    0% { opacity: 0; transform: translateY(-40px) scaleY(1.2) scaleX(0.9); filter: brightness(2) blur(2px); }
-    45% { opacity: 1; transform: translateY(4px) scaleY(0.96) scaleX(1.02); filter: brightness(1.3) blur(0); }
-    70% { transform: translateY(-2px) scaleY(1.01) scaleX(0.99); filter: brightness(1.1); }
-    100% { opacity: 1; transform: translateY(0) scale(1); filter: brightness(1); }
-  }
-  @media (min-width: 640px) {
-    @keyframes dropIn {
-      0% { opacity: 0; transform: translateY(-70px) scaleY(1.3) scaleX(0.85); filter: brightness(2) blur(2px); }
-      45% { opacity: 1; transform: translateY(6px) scaleY(0.95) scaleX(1.03); filter: brightness(1.3) blur(0); }
-      70% { transform: translateY(-3px) scaleY(1.01) scaleX(0.99); filter: brightness(1.1); }
-      100% { opacity: 1; transform: translateY(0) scale(1); filter: brightness(1); }
-    }
-  }
-
-  @keyframes materialize {
-    0% { opacity: 0; transform: scale(1.3); filter: blur(10px) brightness(2.5); }
-    30% { opacity: 0.6; filter: blur(4px) brightness(2); }
-    60% { opacity: 0.9; transform: scale(0.97); filter: blur(1px) brightness(1.3); }
-    100% { opacity: 1; transform: scale(1); filter: blur(0) brightness(1); }
-  }
-  @media (min-width: 640px) {
-    @keyframes materialize {
-      0% { opacity: 0; transform: scale(1.4); filter: blur(15px) brightness(3); }
-      30% { opacity: 0.6; filter: blur(6px) brightness(2); }
-      60% { opacity: 0.9; transform: scale(0.97); filter: blur(2px) brightness(1.3); }
-      100% { opacity: 1; transform: scale(1); filter: blur(0) brightness(1); }
-    }
-  }
-
-  /* --- CARD GLOW --- */
-  @keyframes cardGlow {
-    0%, 100% { box-shadow: 0 0 15px rgba(34,197,94,0.15), inset 0 0 10px rgba(34,197,94,0.03); }
-    50% { box-shadow: 0 0 30px rgba(34,197,94,0.3), inset 0 0 20px rgba(34,197,94,0.06), 0 0 60px rgba(34,197,94,0.08); }
-  }
-
-  /* --- TENSION (cards vibrate before X) --- */
-  @keyframes tension {
-    0%, 100% { transform: translateX(0) translateY(0); }
-    10% { transform: translateX(-1.5px) translateY(0.5px); }
-    20% { transform: translateX(1px) translateY(-1px); }
-    30% { transform: translateX(-0.5px) translateY(1px); }
-    40% { transform: translateX(1.5px) translateY(-0.5px); }
-    50% { transform: translateX(-1px) translateY(-0.5px); }
-    60% { transform: translateX(0.5px) translateY(1px); }
-    70% { transform: translateX(-1px) translateY(-1px); }
-    80% { transform: translateX(1px) translateY(0.5px); }
-    90% { transform: translateX(-0.5px) translateY(-0.5px); }
-  }
-  .intro-tension { animation: tension 0.3s linear infinite !important; }
-
-  /* --- PARTICLES --- */
-  @keyframes particleBurst {
-    0% { opacity: 1; transform: translate(0, 0) scale(1); }
-    100% { opacity: 0; transform: translate(var(--px), var(--py)) scale(0); }
-  }
-  .intro-particle {
+  .bb-tile {
+    position: relative;
+    width: var(--tile); height: var(--tile);
+    border: 2px solid rgba(250,255,252,0.95); border-radius: 5px;
+    background: linear-gradient(180deg, var(--bb-hi) 0%, var(--bb) 55%, var(--bb-lo) 100%);
+    box-shadow:
+      0 0 34px 6px rgba(96,214,148,0.34),
+      0 0 110px 16px rgba(40,160,95,0.20),
+      inset 0 1px 0 rgba(255,255,255,0.28),
+      inset 0 -10px 22px rgba(0,30,12,0.35);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    color: #fff;
     opacity: 0;
-    animation: particleBurst forwards;
-    animation-fill-mode: forwards;
+    transform-origin: top left;
+    will-change: transform;
+    overflow: hidden;
   }
+  .bb-tile .sym {
+    font-size: calc(var(--tile) * 0.46); font-weight: 700; letter-spacing: -0.02em;
+    text-shadow: 0 0 16px rgba(255,255,255,0.35);
+    transform: translateY(3%);
+  }
+  .bb-tile .num { position: absolute; top: 6.5%; left: 8.5%; font-size: calc(var(--tile) * 0.16); font-weight: 600; }
 
-  /* --- SMOKE --- */
-  @keyframes smokeRise {
-    0% { opacity: 0.4; transform: translateY(0) scaleX(1) scaleY(1); }
-    50% { opacity: 0.2; transform: translateY(-20px) scaleX(1.5) scaleY(1.1); }
-    100% { opacity: 0; transform: translateY(-40px) scaleX(2) scaleY(0.5); }
-  }
-  @media (min-width: 640px) {
-    @keyframes smokeRise {
-      0% { opacity: 0.5; transform: translateY(0) scaleX(1) scaleY(1); }
-      50% { opacity: 0.3; transform: translateY(-30px) scaleX(1.8) scaleY(1.2); }
-      100% { opacity: 0; transform: translateY(-70px) scaleX(3) scaleY(0.5); }
-    }
-  }
-  .intro-smoke { animation: smokeRise 1.5s ease-out forwards; }
-
-  /* --- SCREEN FLASH --- */
-  @keyframes screenFlash {
-    0% { opacity: 0; }
-    8% { opacity: 0.35; }
-    25% { opacity: 0.15; }
-    100% { opacity: 0; }
-  }
-  .intro-flash { animation: screenFlash 0.35s ease-out forwards; }
-
-  /* --- SCREEN SHAKE --- */
-  @keyframes shake {
-    0%, 100% { transform: translate(0, 0); }
-    10% { transform: translate(-2px, 1px); }
-    20% { transform: translate(2px, -1px); }
-    30% { transform: translate(-1px, 1px); }
-    40% { transform: translate(1px, -1px); }
-    50% { transform: translate(-1px, 1px); }
-    60% { transform: translate(1px, 0); }
-    80% { transform: translate(-1px, 0); }
-  }
-  @media (min-width: 640px) {
-    @keyframes shake {
-      0%, 100% { transform: translate(0, 0) rotate(0); }
-      10% { transform: translate(-4px, 2px) rotate(-0.3deg); }
-      20% { transform: translate(3px, -3px) rotate(0.3deg); }
-      30% { transform: translate(-3px, 1px) rotate(-0.2deg); }
-      40% { transform: translate(2px, -2px) rotate(0.2deg); }
-      50% { transform: translate(-2px, 3px) rotate(-0.1deg); }
-      60% { transform: translate(3px, -1px) rotate(0.1deg); }
-      70% { transform: translate(-1px, 2px); }
-      80% { transform: translate(1px, -1px); }
-      90% { transform: translate(-1px, 1px); }
-    }
-  }
-  .intro-shake { animation: shake 0.5s ease-in-out; }
-
-  /* --- CRT SCANLINES --- */
-  @keyframes scanDown {
-    0% { top: -5%; }
-    100% { top: 105%; }
-  }
-  .intro-scanline { animation: scanDown 2.8s linear infinite; }
-  .intro-scanline-slow { animation: scanDown 5s linear infinite; animation-delay: 1.5s; }
-
-  /* --- AMBIENT LIGHTS --- */
-  @keyframes ambientDrift1 {
-    0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.5; }
-    33% { transform: translate(30px, -20px) scale(1.1); opacity: 0.7; }
-    66% { transform: translate(-20px, 15px) scale(0.9); opacity: 0.4; }
-  }
-  @keyframes ambientDrift2 {
-    0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.4; }
-    50% { transform: translate(-25px, -30px) scale(1.15); opacity: 0.6; }
-  }
-  .intro-ambient-1 { animation: ambientDrift1 8s ease-in-out infinite; }
-  .intro-ambient-2 { animation: ambientDrift2 6s ease-in-out infinite; }
-  .intro-ambient-red { animation: ambientDrift1 4s ease-in-out infinite; }
-
-  /* --- X DRAWING --- */
-  @keyframes drawStroke {
-    0% { stroke-dashoffset: 200; }
-    100% { stroke-dashoffset: 0; }
-  }
-  .intro-x-stroke {
-    stroke-dasharray: 200;
-    stroke-dashoffset: 200;
-    animation: drawStroke 0.5s cubic-bezier(0.4, 0, 0.2, 1) forwards;
-  }
-
-  /* --- X ENERGY GATHER --- */
-  @keyframes energyGather {
-    0% { transform: scale(0); opacity: 0; }
-    30% { opacity: 1; transform: scale(4); }
-    60% { transform: scale(2); }
-    100% { opacity: 0.6; transform: scale(1); }
-  }
-  .intro-energy-gather { animation: energyGather 0.6s ease-out forwards; }
-
-  /* --- X RING EXPAND --- */
-  @keyframes ringExpand {
-    0% { transform: scale(0); opacity: 1; }
-    100% { transform: scale(25); opacity: 0; }
-  }
-  .intro-ring { animation: ringExpand 1s ease-out 0.2s forwards; }
-
-  /* --- X CENTER DOT --- */
-  @keyframes centerDot {
-    0% { opacity: 0; r: 0; }
-    20% { opacity: 1; r: 5; }
-    60% { opacity: 0.8; r: 3; }
-    100% { opacity: 0; r: 0; }
-  }
-  .intro-center-dot { animation: centerDot 0.8s ease-out 0.2s forwards; }
-
-  /* --- SPARKLES --- */
-  @keyframes sparkle {
-    0% { opacity: 0; transform: scale(0); }
-    40% { opacity: 1; transform: scale(1.5); }
-    100% { opacity: 0; transform: scale(0); }
-  }
-  .intro-sparkle { opacity: 0; animation: sparkle 0.5s ease-out forwards; }
-
-  /* --- CHEMICAL EQUATION --- */
-  @keyframes fadeInUp {
-    0% { opacity: 0; transform: translateY(10px); }
-    100% { opacity: 1; transform: translateY(0); }
-  }
-  .intro-equation { animation: fadeInUp 0.5s ease-out forwards; }
-
-  /* --- LOGO PHASE --- */
-  @keyframes logoContainer {
-    0% { opacity: 0; transform: scale(2.5); filter: blur(30px) brightness(5); }
-    30% { opacity: 1; filter: blur(8px) brightness(2.5); }
-    60% { transform: scale(0.97); filter: blur(2px) brightness(1.3); }
-    100% { opacity: 1; transform: scale(1); filter: blur(0) brightness(1); }
-  }
-  .intro-logo-container { animation: logoContainer 1.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-
-  @keyframes logoBurst {
-    0% { transform: scale(0); opacity: 1; }
-    100% { transform: scale(1); opacity: 0.5; }
-  }
-  .intro-logo-burst { animation: logoBurst 1.5s ease-out forwards; }
-
-  @keyframes letterReveal {
-    0% { opacity: 0; transform: translateY(20px) scale(0.8); filter: blur(4px); }
-    100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
-  }
-  .intro-logo-letter {
+  .bb-tile::after {
+    content: '';
+    position: absolute; inset: -30%;
+    background: linear-gradient(105deg, transparent 42%, rgba(255,255,255,0.42) 50%, transparent 58%);
+    transform: translateX(-120%);
     opacity: 0;
-    animation: letterReveal 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+  .bb-tile.landed::after { animation: bbGlint 0.9s ease-out calc(var(--gt,0s) + 0.3s) forwards; }
+  @keyframes bbGlint {
+    0% { opacity: 1; transform: translateX(-120%) skewX(-8deg); }
+    100% { opacity: 0.9; transform: translateX(120%) skewX(-8deg); }
   }
 
-  @keyframes xReveal {
-    0% { opacity: 0; transform: scale(3) rotate(90deg); filter: blur(10px) brightness(4); }
-    40% { opacity: 1; filter: blur(2px) brightness(2); }
-    70% { transform: scale(0.95) rotate(-3deg); filter: brightness(1.2); }
-    100% { opacity: 1; transform: scale(1) rotate(0); filter: blur(0) brightness(1); }
+  .bb-tile.glide { animation: bbTileGlide 0.9s cubic-bezier(0.6,0.05,0.22,1) var(--gld,0s) both; }
+  .bb-tile.glide.landed {
+    animation:
+      bbTileGlide 0.9s cubic-bezier(0.6,0.05,0.22,1) var(--gld,0s) both,
+      bbTilePulse 3s ease-in-out 1.3s infinite;
   }
-  .intro-logo-x {
+  @keyframes bbTileGlide {
+    from { opacity: 1; transform: translate(var(--dx,0px),var(--dy,0px)) scale(var(--s,0.4)); }
+    to { opacity: 1; transform: translate(0,0) scale(1); }
+  }
+  @keyframes bbTilePulse {
+    0%, 100% { box-shadow: 0 0 34px 6px rgba(96,214,148,0.34), 0 0 110px 16px rgba(40,160,95,0.20), inset 0 1px 0 rgba(255,255,255,0.28), inset 0 -10px 22px rgba(0,30,12,0.35); }
+    50% { box-shadow: 0 0 46px 10px rgba(96,214,148,0.48), 0 0 150px 24px rgba(40,160,95,0.30), inset 0 1px 0 rgba(255,255,255,0.28), inset 0 -10px 22px rgba(0,30,12,0.35); }
+  }
+
+  .bb-tagline {
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: clamp(10px, 1.6vw, 14px);
+    letter-spacing: 0.52em; text-indent: 0.52em; text-transform: uppercase;
+    color: rgba(255,255,255,0); text-align: center; max-width: 94vw;
+  }
+  .bb-tagline.in { animation: bbTaglineIn 1s ease-out forwards; }
+  @keyframes bbTaglineIn {
+    0% { opacity: 0; color: rgba(255,255,255,0.55); transform: translateY(8px); letter-spacing: 0.75em; }
+    100% { opacity: 1; color: rgba(255,255,255,0.55); transform: translateY(0); letter-spacing: 0.52em; }
+  }
+
+  .bb-wisp {
+    position: absolute; z-index: 6; pointer-events: none;
+    width: 120vw; height: 30vh;
+    left: -10vw; top: 42%;
+    background: radial-gradient(ellipse 60% 50% at 50% 50%, rgba(190,228,204,0.5) 0%, rgba(150,200,170,0.22) 45%, transparent 70%);
+    filter: url(#bbTurbB) blur(20px);
     opacity: 0;
-    animation: xReveal 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.3s forwards;
+    will-change: transform, opacity;
+  }
+  .bb-wisp.go { animation: bbWispCross 2.6s cubic-bezier(0.3,0.2,0.6,1) forwards; }
+  @keyframes bbWispCross {
+    0% { opacity: 0; transform: translateX(-55vw) rotate(-2deg); }
+    30% { opacity: 0.16; }
+    70% { opacity: 0.13; }
+    100% { opacity: 0; transform: translateX(60vw) rotate(2deg); }
   }
 
-  @keyframes lensFlare {
-    0% { left: -15%; opacity: 0; }
-    10% { opacity: 0.8; }
-    80% { opacity: 0.6; }
-    100% { left: 115%; opacity: 0; }
-  }
-  .intro-lens-flare { opacity: 0; animation: lensFlare 1.4s ease-in-out 0.5s forwards; }
-
-  @keyframes expandLine {
-    0% { width: 0; opacity: 0; }
-    100% { width: min(320px, 60vw); opacity: 1; }
-  }
-  .intro-logo-line { width: 0; animation: expandLine 0.8s ease-out 0.6s forwards; }
-
-  @keyframes taglineIn {
-    0% { opacity: 0; transform: translateY(8px); letter-spacing: 0.8em; }
-    100% { opacity: 0.4; transform: translateY(0); letter-spacing: 0.4em; }
-  }
-  .intro-tagline { opacity: 0; animation: taglineIn 1s ease-out forwards; }
-
-  /* --- TAP TO START SCREEN --- */
-  @keyframes tapPulse {
-    0%, 100% { transform: scale(1); opacity: 0.7; }
-    50% { transform: scale(1.05); opacity: 1; }
-  }
-  .intro-tap-pulse { animation: tapPulse 2s ease-in-out infinite; }
-
-  @keyframes ringPulseOut {
-    0% { transform: scale(1); opacity: 0.4; }
-    100% { transform: scale(2); opacity: 0; }
-  }
-  .intro-ring-pulse {
-    animation: ringPulseOut 2.5s ease-out infinite;
-  }
-  .intro-ring-pulse-delayed {
-    animation: ringPulseOut 2.5s ease-out 1s infinite;
+  .bb-consume { position: absolute; inset: 0; z-index: 8; pointer-events: none; }
+  .bb-puff { position: absolute; border-radius: 50%; filter: blur(34px); opacity: 0; will-change: transform, opacity; }
+  .bb-puff.tex { filter: url(#bbTurbB) blur(24px); }
+  .bb-consume.go .bb-puff { animation: bbPuffIn 1.6s cubic-bezier(0.2,0.5,0.3,1) var(--pd,0s) forwards; }
+  @keyframes bbPuffIn {
+    0% { opacity: 0; transform: translate(26%,30%) scale(0.22) rotate(0); }
+    28% { opacity: var(--po,0.6); }
+    100% { opacity: var(--po,0.6); transform: translate(-14%,-16%) scale(2.2) rotate(22deg); }
   }
 
-  @keyframes tapTextBlink {
-    0%, 100% { opacity: 0.4; }
-    50% { opacity: 0.8; }
+  @media (max-width: 560px) {
+    .bb-cell .num { display: none; }
+    .bb-tagline { font-size: 9px; letter-spacing: 0.32em; text-indent: 0.32em; }
+    .bb-m-hide { display: none; }
+    .bb-smoke.back, .bb-smoke.front { filter: blur(26px); }
+    .bb-wisp { filter: blur(18px); }
+    .bb-puff.tex { filter: blur(22px); }
   }
-  .intro-tap-text { animation: tapTextBlink 2.5s ease-in-out infinite; }
+
+  /* Version reduced-motion : wordmark statique, aucune animation */
+  .bb-rm .bb-scene, .bb-rm .bb-smoke, .bb-rm .bb-grain { animation: none !important; }
+  .bb-rm .bb-tile { opacity: 1; }
+  .bb-rm .bb-tagline.in { animation: none; opacity: 1; color: rgba(255,255,255,0.55); }
 `;
 
 export default IntroAnimation;

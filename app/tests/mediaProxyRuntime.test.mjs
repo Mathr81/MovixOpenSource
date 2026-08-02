@@ -43,8 +43,12 @@ function createRuntimeHarness(buildBridgeRuntime, { rejectOpen = false } = {}) {
     dispatchEvent(event) {
       for (const handler of listeners.get(event.type) || []) handler(event);
     },
-    fetch: async url => {
-      nativeFetches.push(String(url));
+    fetch: async (url, init = {}) => {
+      nativeFetches.push({
+        url: String(url),
+        method: init.method,
+        headers: { ...init.headers },
+      });
       return {
         status: 206,
         statusText: 'Partial Content',
@@ -120,24 +124,42 @@ function gmRequest(window, details) {
   });
 }
 
-test('protected media uses the native loopback proxy without a Base64 GM_FETCH', async () => {
+test('Seek media opens a header-bound proxy and sends Range only to loopback', async () => {
   const { buildBridgeRuntime } = await loadBridgeRuntimeBuilder();
   const harness = createRuntimeHarness(buildBridgeRuntime);
 
   const response = await gmRequest(harness.window, {
     method: 'GET',
-    url: 'https://u14.vidzy.cc/movie/master.m3u8?token=abc',
+    url: 'https://185.237.106.181/v4/synthetic/master.m3u8?v=1',
     headers: {
-      Origin: 'https://vidzy.org',
-      Referer: 'https://vidzy.org/',
+      Origin: 'https://movix1.embedseek.com',
+      Referer: 'https://movix1.embedseek.com/',
+      Range: 'bytes=0-99',
     },
   });
 
   assert.deepEqual(harness.posted.map(entry => entry.type), [
     'GM_OPEN_MEDIA_PROXY',
   ]);
+  const { id, ...openPayload } = harness.posted[0];
+  assert.equal(typeof id, 'string');
+  assert.deepEqual(openPayload, {
+    type: 'GM_OPEN_MEDIA_PROXY',
+    url: 'https://185.237.106.181/v4/synthetic/master.m3u8?v=1',
+    method: 'GET',
+    headers: {
+      Origin: 'https://movix1.embedseek.com',
+      Referer: 'https://movix1.embedseek.com/',
+    },
+  });
   assert.deepEqual(harness.nativeFetches, [
-    'http://127.0.0.1:28123/p/opaque-session',
+    {
+      url: 'http://127.0.0.1:28123/p/opaque-session',
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-99',
+      },
+    },
   ]);
   assert.deepEqual([...new Uint8Array(response.response)], [1, 2, 3]);
 });

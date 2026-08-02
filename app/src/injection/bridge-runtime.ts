@@ -103,18 +103,25 @@ export function buildBridgeRuntime(): string {
       throw new Error('Native WebView fetch unavailable');
     }
 
+    var upstreamHeaders = {};
+    var originalHeaders = details.headers || {};
+    for (var upstreamKey in originalHeaders) {
+      if (!/^(?:accept|range)$/i.test(upstreamKey)) {
+        upstreamHeaders[upstreamKey] = originalHeaders[upstreamKey];
+      }
+    }
+
     var openResponse = await bridgeRequest({
       type: 'GM_OPEN_MEDIA_PROXY',
       url: details.url,
       method: (details.method || 'GET').toUpperCase(),
-      headers: details.headers || {}
+      headers: upstreamHeaders
     });
     if (!openResponse.success || typeof openResponse.value !== 'string') {
       throw new Error(openResponse.error || 'Local media proxy unavailable');
     }
 
     var localHeaders = {};
-    var originalHeaders = details.headers || {};
     for (var key in originalHeaders) {
       if (/^(?:accept|range)$/i.test(key)) {
         localHeaders[key] = originalHeaders[key];

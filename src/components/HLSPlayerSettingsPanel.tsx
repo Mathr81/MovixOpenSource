@@ -1,10 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronRight } from 'lucide-react';
+import { useLightMode } from '../context/LightModeContext';
+import { ChevronRight, Gauge, Loader2 } from 'lucide-react';
 import ReactCountryFlag from 'react-country-flag';
 import { Select, SelectTrigger, SelectContent, SelectItem } from '@/components/ui/select';
+import CustomDropdown from './CustomDropdown';
+import { BgColorPickerPanel } from './Settings/BgColorPickerPanel';
 import { PinButton } from './ui/PinButton';
+import { HLSQualitySelector } from './HLSQualitySelector';
+import { HLSServerSelector } from './HLSServerSelector';
 import { sortHostersByPriority } from '../utils/sourceAutoSelect';
+import { groupSeekStreamingSources } from '../utils/seekStreamingCandidates';
 import { detectHoster } from '../utils/hosterRegistry';
 import {
   getSourcePriorityPrefs,
@@ -32,6 +38,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   fstream_main: 'fstream',
   wiflix_main: 'wiflix',
   j1f_main: 'j1f',
+  swiftflow_main: 'swiftflow',
   omega_main: 'omega',
   multi_main: 'coflix', // multi = coflix (naming historique)
   viper_main: 'viper',
@@ -62,10 +69,28 @@ const TRANSLATION_LANGS = [
 ] as const;
 
 const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
+  const { effectivePrefs } = useLightMode();
+  const animationsDisabled = !effectivePrefs.transitions;
+
+  const getTransition = useCallback((tObj: any) => {
+    return animationsDisabled ? { duration: 0 } : tObj;
+  }, [animationsDisabled]);
+
+  const hoverProp = useCallback((hObj: any) => {
+    return animationsDisabled ? undefined : hObj;
+  }, [animationsDisabled]);
+
+  const tapProp = useCallback((tObj: any) => {
+    return animationsDisabled ? undefined : tObj;
+  }, [animationsDisabled]);
   const {
     settingsMenuRef,
     settingsMenuWidth,
     audioTracks,
+    qualities,
+    qualityPreference,
+    effectiveQualityHeight,
+    handleQualityPreferenceChange,
     subtitles,
     t,
     setShowSettings,
@@ -91,12 +116,15 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     handleSourceChange,
     renderSourceQualityMeta,
     renderCopySourceButton,
+    hlsQualityScan,
+    runHlsQualityScan,
     showDarkinoMenu,
     showOmegaMenu,
     showCoflixMenu,
     showFstreamMenu,
     showWiflixMenu,
     showJ1fMenu,
+    showSwiftflowMenu,
     showNexusMenu,
     showRivestreamMenu,
     showBravoMenu,
@@ -108,6 +136,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     fstreamSources,
     wiflixSources,
     j1fSources,
+    swiftflowSources,
     rivestreamSources,
     rivestreamCaptions,
     getOriginalUrl,
@@ -305,6 +334,22 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [nexusHlsSources],
   );
+  const seekStreamingNexusMemo = useMemo(
+    () => sortedNexusHlsMemo.filter(source => (
+      source.seekKind === 'cfNative' || source.seekKind === 'source'
+    )),
+    [sortedNexusHlsMemo],
+  );
+  const seekStreamingNexusGroupsMemo = useMemo(
+    () => groupSeekStreamingSources(seekStreamingNexusMemo),
+    [seekStreamingNexusMemo],
+  );
+  const otherNexusHlsMemo = useMemo(
+    () => sortedNexusHlsMemo.filter(source => (
+      source.seekKind !== 'cfNative' && source.seekKind !== 'source'
+    )),
+    [sortedNexusHlsMemo],
+  );
   const sortedNexusFileMemo = useMemo(
     () => enrichAndSort(nexusFileSources ?? [], 'nexus_hls'),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -342,10 +387,10 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
         opacity: 0,
         width: 0
       }}
-      transition={{
+      transition={getTransition({
         duration: 0.3,
         ease: [0.25, 1, 0.5, 1]
-      }}
+      })}
       style={{
         height: '100%',
         position: 'absolute',
@@ -396,7 +441,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       onClick={() => setSettingsTab('quality')}
                       className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'quality' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                         }`}
-                      whileTap={{ scale: 0.97 }}
+                      whileTap={tapProp({ scale: 0.97 })}
                     >
                       {t('watch.qualityTab')}
                       {settingsTab === 'quality' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -406,7 +451,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('format')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'format' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.formatTab')}
                     {settingsTab === 'format' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -415,7 +460,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('speed')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'speed' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.speedTab')}
                     {settingsTab === 'speed' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -426,7 +471,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       onClick={() => setSettingsTab('audio')}
                       className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'audio' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                         }`}
-                      whileTap={{ scale: 0.97 }}
+                      whileTap={tapProp({ scale: 0.97 })}
                     >
                       {t('watch.audioTab')}
                       {settingsTab === 'audio' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -437,7 +482,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('subtitles')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'subtitles' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.subtitlesTab')}
                     {settingsTab === 'subtitles' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -447,7 +492,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('style')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'style' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.styleST')}
                     {settingsTab === 'style' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -457,7 +502,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('progression')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'progression' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.progressionTab')}
                     {settingsTab === 'progression' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -467,7 +512,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('enhancer')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'enhancer' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.audioPlusTab')}
                     {settingsTab === 'enhancer' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -477,7 +522,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     onClick={() => setSettingsTab('oled')}
                     className={`relative py-2 px-3 text-sm font-medium rounded-t-md transition-colors duration-200 ease-out flex-shrink-0 min-w-max ${settingsTab === 'oled' ? 'text-white' : 'text-gray-400 hover:text-gray-200'
                       }`}
-                    whileTap={{ scale: 0.97 }}
+                    whileTap={tapProp({ scale: 0.97 })}
                   >
                     {t('watch.oledTab')}
                     {settingsTab === 'oled' && <motion.div layoutId="activeSettingsTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-red-600" />}
@@ -495,15 +540,44 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2"
                     data-source-menu
                     onFocusCapture={handleSourceMenuFocusCapture}
                   >
+                    <HLSQualitySelector
+                      options={qualities}
+                      preference={qualityPreference}
+                      effectiveHeight={effectiveQualityHeight}
+                      onSelect={handleQualityPreferenceChange}
+                      title={t('watch.streamQuality')}
+                      autoLabel={t('watch.qualityAuto')}
+                      playingLabel={t('watch.qualityPlaying')}
+                    />
+
                     {/* Sources HLS d'abord */}
                     {sourceGroups.map((group, groupIndex) => (
                       <div key={`group_${groupIndex}`} className="mb-6">
-                        <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">{group.title}</h4>
+                        <div className="flex items-center justify-between gap-2 mb-2 px-2">
+                          <h4 className="text-gray-400 text-xs uppercase tracking-wider">{group.title}</h4>
+                          {group.type === 'hls' && (
+                            hlsQualityScan?.status === 'running' ? (
+                              <span className="flex items-center gap-1.5 text-xs text-gray-400 whitespace-nowrap">
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                {hlsQualityScan.done}/{hlsQualityScan.total}
+                              </span>
+                            ) : (
+                              <button
+                                onClick={runHlsQualityScan}
+                                title={t('watch.qualityCheckTitle')}
+                                className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-gray-800/70 hover:bg-gray-700 text-gray-300 hover:text-white whitespace-nowrap"
+                              >
+                                <Gauge className="w-3.5 h-3.5" />
+                                {t('watch.qualityCheck')}
+                              </button>
+                            )
+                          )}
+                        </div>
 
                         {group.sources.map(source => {
                           // Skip rendering individual VOSTFR sources here, they are handled in the dropdown
@@ -562,13 +636,14 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                     {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                                   </div>
                                   <div className="ml-3 flex items-center gap-2">
-                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
+                                    {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
                                       <ChevronRight className={`w-4 h-4 transition-transform ${(source.type === 'darkino_main' && showDarkinoMenu) ||
                                         (source.type === 'omega_main' && showOmegaMenu) ||
                                         (source.type === 'multi_main' && showCoflixMenu) ||
                                         (source.type === 'fstream_main' && showFstreamMenu) ||
                                         (source.type === 'wiflix_main' && showWiflixMenu) ||
                                         (source.type === 'j1f_main' && showJ1fMenu) ||
+                                        (source.type === 'swiftflow_main' && showSwiftflowMenu) ||
                                         (source.type === 'nexus_main' && showNexusMenu) ||
                                         (source.type === 'rivestream_main' && showRivestreamMenu) ||
                                         (source.type === 'bravo_main' && showBravoMenu) ||
@@ -604,7 +679,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {sortedDarkinoMemo.map((darkiSource, index) => {
@@ -615,7 +690,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             key={`darkino_${index}`}
                                             initial={{ opacity: 0 }}
                                             animate={{ opacity: 1 }}
-                                            transition={{ duration: 0.1, delay: index * 0.02 }}
+                                            transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                             className="mb-2 flex items-stretch gap-2"
                                           >
                                             <button
@@ -653,22 +728,56 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, scale: 0.95, transformOrigin: "top" }}
                                       animate={{ opacity: 1, scale: 1 }}
                                       exit={{ opacity: 0, scale: 0.95 }}
-                                      transition={{ duration: 0.2, ease: "easeOut" }}
+                                      transition={getTransition({ duration: 0.2, ease: "easeOut" })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
-                                      {/* Nexus HLS Sources */}
-                                      {nexusHlsSources && nexusHlsSources.length > 0 && sortedNexusHlsMemo.map((nexusSource: any, index: number) => {
+                                      {seekStreamingNexusGroupsMemo.map((group, groupIndex) => (
+                                        <HLSServerSelector
+                                          key={`${group[0]?.seekGroupKey ?? 'legacy'}-${groupIndex}`}
+                                          sources={group}
+                                          currentUrl={src}
+                                          onSelect={(nexusSource) => {
+                                            const sourceIndex = nexusHlsSources.findIndex(
+                                              (source: { url?: string }) => source.url === nexusSource.url,
+                                            );
+                                            handleSourceChange(
+                                              'nexus_hls',
+                                              `nexus_hls_${sourceIndex}`,
+                                              nexusSource.url,
+                                            );
+                                          }}
+                                          title={seekStreamingNexusGroupsMemo.length > 1
+                                            ? t('watch.seekStreamingNumber', { number: groupIndex + 1 })
+                                            : t('watch.seekStreaming')}
+                                          serverTitle={t('watch.server')}
+                                          getServerLabel={(number) => t('watch.serverNumber', { number })}
+                                          headerAction={renderHosterPin(group[0]?.type)}
+                                          renderSourceMeta={(source, active) => renderSourceQualityMeta(
+                                            source.url,
+                                            active,
+                                            undefined,
+                                            source.label,
+                                          )}
+                                          renderCopyAction={(source) => renderCopySourceButton(source.url)}
+                                        />
+                                      ))}
+
+                                      {/* Other Nexus HLS Sources */}
+                                      {nexusHlsSources && nexusHlsSources.length > 0 && otherNexusHlsMemo.map((nexusSource: any, index: number) => {
                                         const isNexusHlsActive = src === nexusSource.url;
+                                        const sourceIndex = nexusHlsSources.findIndex(
+                                          (source: { url?: string }) => source.url === nexusSource.url,
+                                        );
                                         return (
                                           <motion.div
-                                            key={`nexus_hls_${index}`}
+                                            key={`nexus_hls_${sourceIndex}`}
                                             initial={{ opacity: 0, x: -20 }}
                                             animate={{ opacity: 1, x: 0 }}
-                                            transition={{ duration: 0.2, delay: index * 0.03 }}
+                                            transition={getTransition({ duration: 0.2, delay: index * 0.03 })}
                                             className="mb-2 flex items-stretch gap-2"
                                           >
                                             <button
-                                              onClick={() => handleSourceChange('nexus_hls', `nexus_hls_${index}`, nexusSource.url || '')}
+                                              onClick={() => handleSourceChange('nexus_hls', `nexus_hls_${sourceIndex}`, nexusSource.url || '')}
                                               className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isNexusHlsActive ? 'bg-gray-800/80 border-l-2 border-red-600 pl-3' : 'bg-gray-900/40 text-gray-300'
                                                 }`}
                                             >
@@ -697,7 +806,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             key={`nexus_file_${index}`}
                                             initial={{ opacity: 0, x: -20 }}
                                             animate={{ opacity: 1, x: 0 }}
-                                            transition={{ duration: 0.2, delay: index * 0.03 }}
+                                            transition={getTransition({ duration: 0.2, delay: index * 0.03 })}
                                             className="mb-2 flex items-stretch gap-2"
                                           >
                                             <button
@@ -732,7 +841,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {omegaSources && omegaSources.length > 0 && (
@@ -749,7 +858,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             <motion.button
                                               initial={{ opacity: 0 }}
                                               animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
+                                              transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                               onClick={() => handleSourceChange('omega', `omega_${index}`, omegaSource.link || '')}
                                               className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isEmbedActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                             >
@@ -779,7 +888,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {coflixSources && coflixSources.length > 0 && coflixSources.map((coflixSource: any, index: number) => {
@@ -791,7 +900,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             <motion.button
                                               initial={{ opacity: 0 }}
                                               animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
+                                              transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                               onClick={() => handleSourceChange('coflix', `coflix_${index}`, coflixUrl)}
                                               className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isCoflixActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                             >
@@ -819,7 +928,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {fstreamSources && fstreamSources.length > 0 && (() => {
@@ -854,7 +963,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                                     <motion.button
                                                       initial={{ opacity: 0 }}
                                                       animate={{ opacity: 1 }}
-                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                                       onClick={() => handleSourceChange('fstream', `fstream_${index}`, fstreamSource.decoded_url || '')}
                                                       className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isFstreamActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                                     >
@@ -889,7 +998,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {wiflixSources && wiflixSources.length > 0 && (() => {
@@ -921,7 +1030,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                                     <motion.button
                                                       initial={{ opacity: 0 }}
                                                       animate={{ opacity: 1 }}
-                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                                       onClick={() => handleSourceChange('wiflix', `wiflix_${index}`, wiflixSource.url || '')}
                                                       className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isWiflixActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                                     >
@@ -956,7 +1065,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {j1fSources && j1fSources.length > 0 && (() => {
@@ -988,7 +1097,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                                     <motion.button
                                                       initial={{ opacity: 0 }}
                                                       animate={{ opacity: 1 }}
-                                                      transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                      transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                                       onClick={() => handleSourceChange('j1f', `j1f_${index}`, j1fSource.url || '')}
                                                       className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isJ1fActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                                     >
@@ -1015,6 +1124,73 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                   )}
                                 </AnimatePresence>
                               )}
+                              {/* Ajout du menu déroulant SwiftFlow */}
+                              {source.type === 'swiftflow_main' && (
+                                <AnimatePresence>
+                                  {showSwiftflowMenu && (
+                                    <motion.div
+                                      initial={{ opacity: 0, y: -5 }}
+                                      animate={{ opacity: 1, y: 0 }}
+                                      exit={{ opacity: 0 }}
+                                      transition={getTransition({ duration: 0.15 })}
+                                      className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
+                                    >
+                                      {swiftflowSources && swiftflowSources.length > 0 && (() => {
+                                        const sourcesByCategory = swiftflowSources.reduce((acc: Record<string, any[]>, s: any) => {
+                                          const category = s.category || 'Default';
+                                          if (!acc[category]) acc[category] = [];
+                                          acc[category].push(s);
+                                          return acc;
+                                        }, {} as Record<string, any[]>);
+                                        const categoryOrder = [
+                                          { key: 'VF', label: t('watch.french'), flagCode: 'FR' },
+                                          { key: 'VOSTFR', label: t('watch.voSubtitledFr'), flagCode: 'GB' },
+                                        ];
+                                        return categoryOrder.map((cat) => {
+                                          const categorySources = sourcesByCategory[cat.key];
+                                          if (!categorySources || categorySources.length === 0) return null;
+                                          return (
+                                            <div key={`swiftflow_category_${cat.key}`} className="mb-3">
+                                              <div className="flex items-center gap-2 mb-2 px-2">
+                                                <span className="text-lg"><ReactCountryFlag countryCode={cat.flagCode} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /></span>
+                                                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{cat.label} ({categorySources.length})</span>
+                                              </div>
+                                              {categorySources.map((swiftflowSource: any) => {
+                                                const index = swiftflowSources.findIndex((s: any) => s === swiftflowSource);
+                                                const isSwiftflowActive = embedType === 'swiftflow' && embedUrl === swiftflowSource.url;
+                                                const hosterId = detectHosterFromUrl(swiftflowSource.url, swiftflowSource.label);
+                                                return (
+                                                  <div key={`swiftflow_${index}`} className="mb-2 ml-4 flex items-stretch gap-2">
+                                                    <motion.button
+                                                      initial={{ opacity: 0 }}
+                                                      animate={{ opacity: 1 }}
+                                                      transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
+                                                      onClick={() => handleSourceChange('swiftflow', `swiftflow_${index}`, swiftflowSource.url || '')}
+                                                      className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isSwiftflowActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
+                                                    >
+                                                      <span>
+                                                        {swiftflowSource.label}
+                                                        {hosterId && pinnedHosterId === hosterId && (
+                                                          <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                                        )}
+                                                      </span>
+                                                      <div className="flex items-center gap-2">
+                                                        <span className="text-xs text-gray-500">{swiftflowSource.category}</span>
+                                                        {isSwiftflowActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                                      </div>
+                                                    </motion.button>
+                                                    {renderHosterPin(hosterId)}
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          );
+                                        }).filter(Boolean);
+                                      })()}
+                                    </motion.div>
+                                  )}
+                                </AnimatePresence>
+                              )}
                               {/* Ajout du menu déroulant Viper */}
                               {source.type === 'viper_main' && (
                                 <AnimatePresence>
@@ -1023,7 +1199,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {viperSources && viperSources.length > 0 && sortedViperMemo.map((viperSource: any, index: number) => {
@@ -1033,7 +1209,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             <motion.button
                                               initial={{ opacity: 0 }}
                                               animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
+                                              transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                               onClick={() => handleSourceChange('viper', `viper_${index}`, viperSource.url || '')}
                                               className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isViperActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                             >
@@ -1066,7 +1242,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, scale: 0.95, transformOrigin: "top" }}
                                       animate={{ opacity: 1, scale: 1 }}
                                       exit={{ opacity: 0, scale: 0.95 }}
-                                      transition={{ duration: 0.2, ease: "easeOut" }}
+                                      transition={getTransition({ duration: 0.2, ease: "easeOut" })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {sortedVoxMemo.map((vSource, index) => {
@@ -1076,7 +1252,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             <motion.button
                                               initial={{ opacity: 0, x: -20 }}
                                               animate={{ opacity: 1, x: 0 }}
-                                              transition={{ duration: 0.2, delay: index * 0.03 }}
+                                              transition={getTransition({ duration: 0.2, delay: index * 0.03 })}
                                               onClick={() => handleSourceChange('vox', index.toString(), vSource.link)}
                                               className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isVoxSourceActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                             >
@@ -1107,7 +1283,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {[
@@ -1142,7 +1318,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             key={`vostfr_${index}`}
                                             initial={{ opacity: 0 }}
                                             animate={{ opacity: 1 }}
-                                            transition={{ duration: 0.1, delay: index * 0.02 }}
+                                            transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                             onClick={() => handleSourceChange('vostfr', vostfrSource.id, sourceUrl)}
                                             className={`w-full px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg mb-2 flex justify-between items-center bg-gray-900/40 text-gray-300 ${isVostfrActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
                                           >
@@ -1164,7 +1340,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, scale: 0.95, transformOrigin: "top" }}
                                       animate={{ opacity: 1, scale: 1 }}
                                       exit={{ opacity: 0, scale: 0.95 }}
-                                      transition={{ duration: 0.2, ease: "easeOut" }}
+                                      transition={getTransition({ duration: 0.2, ease: "easeOut" })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {purstreamSources && purstreamSources.length > 0 ? (
@@ -1175,7 +1351,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                               key={`bravo_${index}`}
                                               initial={{ opacity: 0, x: -20 }}
                                               animate={{ opacity: 1, x: 0 }}
-                                              transition={{ duration: 0.2, delay: index * 0.03 }}
+                                              transition={getTransition({ duration: 0.2, delay: index * 0.03 })}
                                               className="mb-1 ml-4 flex items-stretch gap-2"
                                             >
                                               <button
@@ -1215,7 +1391,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {rivestreamSources && rivestreamSources.length > 0 ? (() => {
@@ -1265,7 +1441,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                                     key={`rivestream_${cat.key}_${index}`}
                                                     initial={{ opacity: 0 }}
                                                     animate={{ opacity: 1 }}
-                                                    transition={{ duration: 0.1, delay: index * 0.02 }}
+                                                    transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                                     className="mb-1 ml-4 flex items-stretch gap-2"
                                                   >
                                                     <button
@@ -1312,7 +1488,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                       initial={{ opacity: 0, y: -5 }}
                                       animate={{ opacity: 1, y: 0 }}
                                       exit={{ opacity: 0 }}
-                                      transition={{ duration: 0.15 }}
+                                      transition={getTransition({ duration: 0.15 })}
                                       className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                     >
                                       {sortedViperMemo.map((vSource, index) => {
@@ -1323,7 +1499,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                             <motion.button
                                               initial={{ opacity: 0 }}
                                               animate={{ opacity: 1 }}
-                                              transition={{ duration: 0.1, delay: index * 0.02 }}
+                                              transition={getTransition({ duration: 0.1, delay: index * 0.02 })}
                                               onClick={() => handleSourceChange('viper', index.toString(), vSource.url)}
                                               className={`w-full flex-1 px-3 py-2 text-xs text-left hover:bg-gray-800 rounded-md flex justify-between items-center ${isViperSourceActive ? 'bg-gray-800/80' : 'text-gray-300'
                                                 }`}
@@ -1364,7 +1540,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2"
                   >
                     <button
@@ -1492,7 +1668,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2"
                   >
                     {audioTracks.map((track) => (
@@ -1519,7 +1695,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2"
                   >
                     {/* Always show disable button */}
@@ -1889,7 +2065,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="w-full pr-2 space-y-4"
                   >
                     {/* Taille de police */}
@@ -1948,46 +2124,71 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <h3 className="text-base font-semibold text-white">{t('watch.textColor')}</h3>
                         <span className="text-sm text-gray-300 uppercase">{subtitleStyle.color}</span>
                       </div>
-                      <div className="flex items-center gap-3">
-                        <div className="relative flex-1">
-                          <input
-                            type="color"
-                            value={subtitleStyle.color}
-                            onChange={(e) => updateSubtitleColor(e.target.value)}
-                            className="w-full h-12 rounded cursor-pointer border-2 border-gray-700"
-                            style={{ backgroundColor: subtitleStyle.color }}
-                          />
-                        </div>
-                        <div className="flex gap-2">
+                      <div className="flex flex-col gap-2">
+                        <div className="flex flex-wrap gap-2 mb-1">
                           <motion.button
-                            whileTap={{ scale: 0.95 }}
+                            whileTap={tapProp({ scale: 0.95 })}
                             onClick={() => updateSubtitleColor('#ffffff')}
-                            className="w-10 h-10 rounded border-2 border-gray-700 hover:border-red-600 transition-colors"
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#ffffff' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
                             style={{ backgroundColor: '#ffffff' }}
                             title={t('watch.whiteColor')}
                           />
                           <motion.button
-                            whileTap={{ scale: 0.95 }}
+                            whileTap={tapProp({ scale: 0.95 })}
                             onClick={() => updateSubtitleColor('#fcd34d')}
-                            className="w-10 h-10 rounded border-2 border-gray-700 hover:border-red-600 transition-colors"
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#fcd34d' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
                             style={{ backgroundColor: '#fcd34d' }}
                             title={t('watch.yellowColor')}
                           />
                           <motion.button
-                            whileTap={{ scale: 0.95 }}
+                            whileTap={tapProp({ scale: 0.95 })}
                             onClick={() => updateSubtitleColor('#3b82f6')}
-                            className="w-10 h-10 rounded border-2 border-gray-700 hover:border-red-600 transition-colors"
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#3b82f6' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
                             style={{ backgroundColor: '#3b82f6' }}
                             title={t('watch.blueColor')}
                           />
                           <motion.button
-                            whileTap={{ scale: 0.95 }}
+                            whileTap={tapProp({ scale: 0.95 })}
                             onClick={() => updateSubtitleColor('#22c55e')}
-                            className="w-10 h-10 rounded border-2 border-gray-700 hover:border-red-600 transition-colors"
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#22c55e' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
                             style={{ backgroundColor: '#22c55e' }}
                             title={t('watch.greenColor')}
                           />
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.95 })}
+                            onClick={() => updateSubtitleColor('#ef4444')}
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#ef4444' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
+                            style={{ backgroundColor: '#ef4444' }}
+                            title={t('watch.redColor')}
+                          />
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.95 })}
+                            onClick={() => updateSubtitleColor('#06b6d4')}
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#06b6d4' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
+                            style={{ backgroundColor: '#06b6d4' }}
+                            title={t('watch.cyanColor')}
+                          />
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.95 })}
+                            onClick={() => updateSubtitleColor('#d946ef')}
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#d946ef' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
+                            style={{ backgroundColor: '#d946ef' }}
+                            title={t('watch.magentaColor')}
+                          />
+                          <motion.button
+                            whileTap={tapProp({ scale: 0.95 })}
+                            onClick={() => updateSubtitleColor('#000000')}
+                            className={`w-10 h-10 rounded border-2 transition-colors ${subtitleStyle.color.toLowerCase() === '#000000' ? 'border-red-600' : 'border-gray-700 hover:border-red-500'}`}
+                            style={{ backgroundColor: '#000000' }}
+                            title={t('watch.blackColor')}
+                          />
                         </div>
+                        <BgColorPickerPanel
+                          committedHex={subtitleStyle.color}
+                          hint={t('watch.customColorHint') || 'Choisissez une couleur de texte personnalisée.'}
+                          onCommit={updateSubtitleColor}
+                          layout="column"
+                        />
                       </div>
                     </div>
 
@@ -1997,7 +2198,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       <div className="mb-2 flex justify-between items-center px-2">
                         <span className="text-sm text-gray-300">{t('watch.currentLabel')} <span className="text-white font-medium">{formatDelay(subtitleStyle.delay)}</span></span>
                         <motion.button
-                          whileTap={{ scale: 0.95 }}
+                          whileTap={tapProp({ scale: 0.95 })}
                           onClick={resetSubtitleDelay}
                           className="px-3 py-1 text-sm rounded bg-red-600 text-white font-bold"
                         >
@@ -2006,28 +2207,28 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                       </div>
                       <div className="grid grid-cols-4 gap-2">
                         <motion.button
-                          whileTap={{ scale: 0.95 }}
+                          whileTap={tapProp({ scale: 0.95 })}
                           onClick={() => updateSubtitleDelay(-3)}
                           className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
                         >
                           {t('watch.subtitleDelayBackLong')}
                         </motion.button>
                         <motion.button
-                          whileTap={{ scale: 0.95 }}
+                          whileTap={tapProp({ scale: 0.95 })}
                           onClick={() => updateSubtitleDelay(-0.5)}
                           className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
                         >
                           {t('watch.subtitleDelayBackShort')}
                         </motion.button>
                         <motion.button
-                          whileTap={{ scale: 0.95 }}
+                          whileTap={tapProp({ scale: 0.95 })}
                           onClick={() => updateSubtitleDelay(0.5)}
                           className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
                         >
                           {t('watch.subtitleDelayForwardShort')}
                         </motion.button>
                         <motion.button
-                          whileTap={{ scale: 0.95 }}
+                          whileTap={tapProp({ scale: 0.95 })}
                           onClick={() => updateSubtitleDelay(3)}
                           className="px-3 py-2 text-sm rounded bg-gray-800 text-gray-300 hover:bg-gray-700"
                         >
@@ -2044,7 +2245,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2"
                   >
                     <button
@@ -2121,7 +2322,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="w-full pr-2 space-y-4"
                   >
                     {/* Toggle Save Progress */}
@@ -2137,7 +2338,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                           <motion.div
                             className="w-3.5 h-3.5 bg-white rounded-full shadow-md"
                             layout
-                            transition={{ type: "spring", stiffness: 700, damping: 30 }}
+                            transition={getTransition({ type: "spring", stiffness: 700, damping: 30 })}
                             style={{ marginLeft: saveProgressEnabled ? 'auto' : '0px' }}
                           />
                         </div>
@@ -2158,7 +2359,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                           <motion.div
                             className="w-3.5 h-3.5 bg-white rounded-full shadow-md"
                             layout
-                            transition={{ type: "spring", stiffness: 700, damping: 30 }}
+                            transition={getTransition({ type: "spring", stiffness: 700, damping: 30 })}
                             style={{ marginLeft: autoNextEpisodeEnabled ? 'auto' : '0px' }}
                           />
                         </div>
@@ -2175,7 +2376,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         <p className="text-xs text-gray-400 mb-2">{t('watch.showPopup')}</p>
                         <div className="flex gap-2">
                           <motion.button
-                            whileTap={{ scale: 0.98 }}
+                            whileTap={tapProp({ scale: 0.98 })}
                             onClick={() => setNextContentThresholdMode('percentage')}
                             className={`flex-1 px-3 py-2 text-sm rounded-lg transition-colors ${nextContentThresholdMode === 'percentage'
                               ? 'bg-red-600 text-white font-medium'
@@ -2185,7 +2386,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                             {t('watch.percentage')}
                           </motion.button>
                           <motion.button
-                            whileTap={{ scale: 0.98 }}
+                            whileTap={tapProp({ scale: 0.98 })}
                             onClick={() => setNextContentThresholdMode('timeBeforeEnd')}
                             className={`flex-1 px-3 py-2 text-sm rounded-lg transition-colors ${nextContentThresholdMode === 'timeBeforeEnd'
                               ? 'bg-red-600 text-white font-medium'
@@ -2277,7 +2478,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2 space-y-3"
                   >
                     <div className="mb-2">
@@ -2531,7 +2732,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                     initial={{ opacity: 0, x: 50 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -50 }}
-                    transition={{ duration: 0.25 }}
+                    transition={getTransition({ duration: 0.25 })}
                     className="pr-2 space-y-3"
                   >
                     <div className="mb-2">

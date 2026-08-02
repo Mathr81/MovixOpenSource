@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.10
+// @version      1.4.11
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -45,7 +45,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-    version: "1.4.10",
+    version: "1.4.11",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -237,6 +237,102 @@
 
     return merged;
   }
+
+  // Must remain aligned with MediaProxyPolicy.allowedRequestHeaders. The Cast
+  // relay is the only later consumer of this descriptor, so never expose
+  // arbitrary page-provided headers through this boundary.
+  const CAST_MEDIA_HEADER_NAMES = {
+    accept: "Accept",
+    "accept-language": "Accept-Language",
+    "content-type": "Content-Type",
+    "if-modified-since": "If-Modified-Since",
+    "if-none-match": "If-None-Match",
+    origin: "Origin",
+    range: "Range",
+    referer: "Referer",
+    "user-agent": "User-Agent",
+  };
+  const CAST_SOURCE_MAX_URL_LENGTH = 16384;
+  const CAST_SOURCE_MAX_HEADER_VALUE_LENGTH = 8192;
+
+  function prepareCastSource(request) {
+    if (request?.type !== "CAST_PREPARE_SOURCE") return null;
+
+    const url = String(request.url || "").trim();
+    if (!url || url.length > CAST_SOURCE_MAX_URL_LENGTH) return null;
+
+    let normalizedUrl;
+    let loopbackHandoff = false;
+    try {
+      const parsedUrl = new URL(url);
+      loopbackHandoff =
+        parsedUrl.protocol === "http:" &&
+        parsedUrl.hostname === "127.0.0.1" &&
+        !parsedUrl.username &&
+        !parsedUrl.password &&
+        /^\d{1,5}$/.test(parsedUrl.port) &&
+        /^\/p\/[A-Za-z0-9_-]{8,128}\/[A-Za-z0-9_-]{8,128}\/[A-Za-z0-9_-]{8,128}$/.test(
+          parsedUrl.pathname,
+        ) &&
+        !parsedUrl.search &&
+        !parsedUrl.hash;
+      if (!loopbackHandoff && (
+        parsedUrl.protocol !== "https:" ||
+        parsedUrl.username ||
+        parsedUrl.password ||
+        (parsedUrl.port && parsedUrl.port !== "443")
+      )) {
+        return null;
+      }
+      normalizedUrl = parsedUrl.toString();
+    } catch {
+      return null;
+    }
+
+    const resolvedHeaders = loopbackHandoff
+      ? {}
+      : applyDynamicRequestHeaders(normalizedUrl, {}, "xmlhttprequest");
+    const headers = {};
+    for (const [rawName, rawValue] of Object.entries(resolvedHeaders)) {
+      const canonicalName = CAST_MEDIA_HEADER_NAMES[
+        String(rawName).trim().toLowerCase()
+      ];
+      const value = String(rawValue || "").trim();
+      if (
+        !canonicalName ||
+        !value ||
+        value.length > CAST_SOURCE_MAX_HEADER_VALUE_LENGTH ||
+        /[\r\n]/.test(value)
+      ) {
+        continue;
+      }
+      headers[canonicalName] = value;
+    }
+
+    const result = {
+      url: normalizedUrl,
+      headers,
+      protocolVersion: 1,
+    };
+    if (typeof request.contentType === "string") {
+      const contentType = request.contentType.trim();
+      if (
+        contentType &&
+        contentType.length <= CAST_SOURCE_MAX_HEADER_VALUE_LENGTH &&
+        !/[\r\n]/.test(contentType)
+      ) {
+        result.contentType = contentType;
+      }
+    }
+    return result;
+  }
+
+  Object.defineProperty(pageWindow, "__MOVIX_PREPARE_CAST_SOURCE__", {
+    configurable: false,
+    enumerable: false,
+    value: prepareCastSource,
+    writable: false,
+  });
 
   function toArrayBuffer(value) {
     if (value instanceof ArrayBuffer) {
@@ -1088,7 +1184,7 @@
     sibnet: new TTLCache(500, 7200000),
     uqload: new TTLCache(500, 7200000),
     doodstream: new TTLCache(500, 3600000),
-    seekstreaming: new TTLCache(500, 7200000),
+    seekstreaming: new TTLCache(500, 300000),
   };
 
   // ===== Utility Functions =====
@@ -2123,8 +2219,11 @@
       const passMatch = html.match(/\/pass_md5\/[\w-]+\/(?<token>[\w-]+)/);
       if (!passMatch) {
         clearTimeout(timer);
-        console.error("[EXT-DOODSTREAM] pass_md5 pattern not found");
-        return { success: false, error: "DoodStream: pass_md5 not found" };
+        return {
+          success: false,
+          error: "DoodStream: File was deleted",
+          reason: "deleted",
+        };
       }
 
       const parsedUrl = new URL(doodUrl);
@@ -2169,112 +2268,212 @@
   }
 
   /**
-   * Extract HLS URL from SeekStreaming (embed4me / embedseek) embed
+   * Extract HLS URL from a SeekStreaming root-fragment embed
    */
-  async function extractSeekStreaming(seekUrl) {
-    console.log(`[EXT-SEEKSTREAMING] Extracting from: ${seekUrl}`);
+  const SEEKSTREAMING_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
 
-    // Extract video ID
-    let videoId = null;
-    const decoded = decodeURIComponent(seekUrl);
-
-    if (decoded.includes("#")) {
-      videoId = decoded.split("#").pop().trim();
-    } else if (decoded.toLowerCase().includes("/embed/")) {
-      videoId = decoded.replace(/\/$/, "").split("/").pop().trim();
-    } else {
+  function safelyDecodeSeekStreamingUrl(value) {
+    let decoded = String(value || "").trim();
+    for (let index = 0; index < 2; index += 1) {
       try {
-        const parsed = new URL(decoded);
-        if (parsed.hash) videoId = parsed.hash.replace("#", "").trim();
-        else if (parsed.pathname && parsed.pathname !== "/") {
-          videoId = parsed.pathname.replace(/\/$/, "").split("/").pop().trim();
-        }
-      } catch {}
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch {
+        return null;
+      }
     }
+    return decoded;
+  }
 
-    if (!videoId) {
+  function parseSeekStreamingEmbedUrl(input) {
+    const decoded = safelyDecodeSeekStreamingUrl(input);
+    if (!decoded || /[\u0000-\u001f\u007f]/.test(decoded)) return null;
+    try {
+      const url = new URL(decoded);
+      if (
+        !["http:", "https:"].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        url.pathname !== "/" ||
+        url.search
+      )
+        return null;
+      const videoId = url.hash.slice(1);
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return null;
+      const origin = url.origin;
+      return {
+        embedUrl: `${origin}/#${videoId}`,
+        hostname: url.hostname.toLowerCase(),
+        videoId,
+        origin,
+        referer: `${origin}/`,
+        cacheKey: `${url.hostname.toLowerCase()}:${videoId}`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function selectSeekStreamingPlaybackSource(data) {
+    if (!data || typeof data !== "object") return null;
+    for (const kind of ["source", "master", "masterUrl"]) {
+      const rawUrl = data[kind];
+      if (typeof rawUrl !== "string") continue;
+      try {
+        const url = new URL(rawUrl);
+        if (
+          !["http:", "https:"].includes(url.protocol) ||
+          url.username ||
+          url.password
+        )
+          continue;
+        return { kind, url: url.href };
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  function selectSeekStreamingPlaybackSources(data) {
+    if (!data || typeof data !== "object") return [];
+    const candidates = [];
+    const seen = new Set();
+    const add = (kind, rawUrl) => {
+      if (typeof rawUrl !== "string") return;
+      try {
+        const url = new URL(rawUrl);
+        if (
+          !["http:", "https:"].includes(url.protocol) ||
+          url.username ||
+          url.password
+        )
+          return;
+        if (seen.has(url.href)) return;
+        seen.add(url.href);
+        candidates.push({ kind, url: url.href });
+      } catch {
+        // Ignore invalid playback candidates.
+      }
+    };
+
+    add("cfNative", data.cfNative);
+    const source = selectSeekStreamingPlaybackSource(data);
+    if (source) add("source", source.url);
+    return candidates;
+  }
+
+  function getSeekStreamingRequestHeaders(embedUrl) {
+    const parsed =
+      typeof embedUrl === "object" && embedUrl?.origin
+        ? embedUrl
+        : parseSeekStreamingEmbedUrl(embedUrl);
+    if (!parsed) return null;
+    return { Origin: parsed.origin, Referer: parsed.referer };
+  }
+
+  function getSeekStreamingPlaybackRulePattern(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (!["http:", "https:"].includes(parsed.protocol)) return null;
+      const pathSegments = parsed.pathname.split("/").filter(Boolean);
+      const directorySegments = parsed.pathname.endsWith("/")
+        ? pathSegments
+        : pathSegments.slice(0, -1);
+      const mediaTypeIndex = directorySegments.length - 2;
+      const mediaType = directorySegments[mediaTypeIndex];
+      const videoId = directorySegments[mediaTypeIndex + 1];
+      const v4Index = directorySegments.indexOf("v4");
+      if (
+        v4Index !== -1 &&
+        mediaTypeIndex > v4Index &&
+        /^[a-z0-9_-]+$/i.test(mediaType || "") &&
+        /^[a-z0-9_-]+$/i.test(videoId || "")
+      ) {
+        return `*://*/${mediaType}/${videoId}/*`;
+      }
+      const slash = parsed.pathname.lastIndexOf("/");
+      const directory =
+        slash >= 0 ? parsed.pathname.slice(0, slash + 1) : "/";
+      return `*://${parsed.host}${directory}*`;
+    } catch {
+      return null;
+    }
+  }
+
+  async function extractSeekStreaming(seekUrl) {
+    const parsed = parseSeekStreamingEmbedUrl(seekUrl);
+    if (!parsed) {
       return {
         success: false,
-        error: "SeekStreaming: Could not extract video ID",
+        error: "SeekStreaming: invalid embed URL",
       };
     }
-
-    const cacheKey = md5Hash(videoId);
+    const cacheKey = md5Hash(parsed.cacheKey);
     const cached = caches.seekstreaming.get(cacheKey);
     if (cached) return { ...cached, fromCache: true };
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-
-      // Determine API domain from URL
-      let apiDomain = "lpayer.embed4me.com";
-      try {
-        apiDomain = new URL(decoded).host;
-      } catch {}
-
-      const apiUrl = `https://${apiDomain}/api/v1/video?id=${videoId}&w=1920&h=1080&r=`;
+      const apiUrl = new URL("/api/v1/video", parsed.origin);
+      apiUrl.search = new URLSearchParams({
+        id: parsed.videoId,
+        w: "1920",
+        h: "1080",
+        r: "",
+      }).toString();
       const headers = {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": SEEKSTREAMING_USER_AGENT,
         Accept: "*/*",
         "Accept-Language": "en-US,en;q=0.5",
-        Referer: `https://${apiDomain}/`,
-        Origin: `https://${apiDomain}`,
+        ...getSeekStreamingRequestHeaders(parsed),
       };
-
-      const resp = await fetch(apiUrl, { headers, signal: controller.signal });
-      clearTimeout(timer);
-      if (!resp.ok)
+      const response = await fetch(apiUrl.href, {
+        headers,
+        signal: controller.signal,
+      });
+      if (!response.ok)
         return {
           success: false,
-          error: `SeekStreaming: API HTTP ${resp.status}`,
+          error: `SeekStreaming: API HTTP ${response.status}`,
         };
-      const encryptedText = await resp.text();
-
-      // Decrypt AES-CBC response
       const decryptedRaw = await decryptAesCbc(
-        encryptedText,
+        await response.text(),
         SEEKSTREAMING_AES_KEY_RAW,
         SEEKSTREAMING_AES_IV_RAW,
       );
-      if (!decryptedRaw) {
+      const selected = selectSeekStreamingPlaybackSources(
+        JSON.parse(decryptedRaw),
+      );
+      if (selected.length === 0) {
         return {
           success: false,
-          error: "SeekStreaming: AES decryption failed",
+          error: "SeekStreaming: no direct source found",
         };
       }
-
-      const data = JSON.parse(decryptedRaw);
-      const cfUrl = data.cf || "";
-      const sourceUrl = data.source || "";
-
-      if (!cfUrl && !sourceUrl) {
-        return {
-          success: false,
-          error: "SeekStreaming: No video source found",
-        };
-      }
-
-      // Prefer CF (CDN) URL
-      const videoUrl = cfUrl || sourceUrl;
       const result = {
-        hlsUrl: videoUrl,
+        hlsUrl: selected[0].url,
+        hlsCandidates: selected,
         success: true,
         source: "seekstreaming",
-        // Also provide both URLs
-        cfUrl: cfUrl || undefined,
-        ipUrl: sourceUrl || undefined,
+        origin: parsed.origin,
+        referer: parsed.referer,
       };
-
       caches.seekstreaming.set(cacheKey, result);
       return result;
-    } catch (e) {
-      console.error("[EXT-SEEKSTREAMING] Error:", e);
+    } catch (error) {
       return {
         success: false,
-        error: e.message || "SeekStreaming extraction failed",
+        error:
+          error?.name === "AbortError"
+            ? "SeekStreaming: upstream timeout"
+            : "SeekStreaming extraction failed",
       };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -2310,14 +2509,7 @@
         lower.includes("doply.net")
       );
     },
-    seekstreaming: (url) => {
-      const lower = url.toLowerCase();
-      return (
-        lower.includes("embedseek.com") ||
-        lower.includes("embed4me.com") ||
-        lower.includes("seekstreaming")
-      );
-    },
+    seekstreaming: (url) => Boolean(parseSeekStreamingEmbedUrl(url)),
   };
 
   const EXTRACT_FN = {
@@ -2476,6 +2668,11 @@
         return null;
       }
     }
+    const seekHeaders =
+      type === "seekstreaming"
+        ? getSeekStreamingRequestHeaders(referer || url)
+        : null;
+    if (type === "seekstreaming" && !seekHeaders) return null;
 
     const headerMap = {
       voe: { Referer: "https://voe.sx/", Origin: "https://voe.sx" },
@@ -2497,12 +2694,7 @@
         Referer: referer || "https://d0000d.com/",
         Origin: referer ? new URL(referer).origin : "https://d0000d.com",
       },
-      seekstreaming: {
-        Referer: referer || "https://lpayer.embed4me.com/",
-        Origin: referer
-          ? new URL(referer).origin
-          : "https://lpayer.embed4me.com",
-      },
+      seekstreaming: seekHeaders,
       cinep: {
         Referer: "https://purstream.mx/",
         Origin: "https://purstream.mx",
@@ -2517,7 +2709,12 @@
       // Sibnet redirects to CDN subdomains (e.g. dv97.sibnet.ru),
       // so we use a wildcard pattern to cover all subdomains.
       const domainPattern =
-        type === "sibnet" ? "*://*.sibnet.ru/*" : `*://${parsedUrl.hostname}/*`;
+        type === "seekstreaming"
+          ? getSeekStreamingPlaybackRulePattern(url)
+          : type === "sibnet"
+            ? "*://*.sibnet.ru/*"
+            : `*://${parsedUrl.hostname}/*`;
+      if (!domainPattern) return null;
       return { domainPattern, headers: hdrs };
     } catch (e) {
       console.error(`[EXT-EXTRACT] Failed to setup headers for ${type}:`, e);
@@ -3006,6 +3203,24 @@
 
   // === NEXUS M3U8 EXTRACTION HANDLERS ===
 
+  function getSeekStreamingPlaybackUrls(result) {
+    const urls = [];
+    const seen = new Set();
+    const add = (url) => {
+      if (typeof url !== "string" || !url || seen.has(url)) return;
+      seen.add(url);
+      urls.push(url);
+    };
+    if (Array.isArray(result?.hlsCandidates)) {
+      for (const candidate of result.hlsCandidates) {
+        add(candidate?.url);
+      }
+    }
+    add(result?.hlsUrl);
+    add(result?.m3u8Url);
+    return urls;
+  }
+
   /**
    * Handle single embed extraction request
    * payload: { type: 'voe'|'fsvid'|..., url: 'https://...' }
@@ -3017,6 +3232,36 @@
     // Auto-detect type if not provided
     const embedType = type || Extractors.detectEmbedType(url);
     if (!embedType) return { success: false, error: "Unknown embed type" };
+
+    if (embedType === "seekstreaming") {
+      let extractionRuleId = null;
+      try {
+        const extractionHeaders = await Extractors.setupHeadersForService(
+          embedType,
+          url,
+          url,
+        );
+        if (extractionHeaders) {
+          extractionRuleId = await addHeadersRule(
+            extractionHeaders.domainPattern,
+            extractionHeaders.headers,
+          );
+        }
+        const result = await Extractors.extractSingle(embedType, url);
+        if (result.success) {
+          for (const videoUrl of getSeekStreamingPlaybackUrls(result)) {
+            const playbackHeaders =
+              await Extractors.setupHeadersForService(embedType, videoUrl, url);
+            if (playbackHeaders) {
+              await replaceSeekPlaybackRule(playbackHeaders);
+            }
+          }
+        }
+        return result;
+      } finally {
+        await removeHeadersRule(extractionRuleId);
+      }
+    }
 
     // Set up DNR headers BEFORE extraction so the fetch request succeeds
     try {
@@ -3045,6 +3290,7 @@
         const headerInfo = await Extractors.setupHeadersForService(
           embedType,
           videoUrl,
+          url,
         );
         if (headerInfo) {
           await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
@@ -3070,6 +3316,8 @@
 
     console.log(`[NEXUS] Extracting all from ${sources.length} sources`);
 
+    const seekExtractionRuleIds = [];
+
     // Set up DNR headers for all sources BEFORE extraction
     try {
       const detected = Extractors.detectSupportedEmbeds(sources);
@@ -3077,9 +3325,16 @@
         const headerInfo = await Extractors.setupHeadersForService(
           item.type,
           item.url,
+          item.url,
         );
         if (headerInfo) {
-          await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+          const ruleId = await addHeadersRule(
+            headerInfo.domainPattern,
+            headerInfo.headers,
+          );
+          if (item.type === "seekstreaming" && Number.isInteger(ruleId)) {
+            seekExtractionRuleIds.push(ruleId);
+          }
         }
       }
       console.log(
@@ -3092,31 +3347,46 @@
       );
     }
 
-    const results = await Extractors.extractAll(sources);
+    try {
+      const results = await Extractors.extractAll(sources);
 
-    // Set up DNR headers for all successful extractions (video URLs)
-    for (const result of results) {
-      if (result.success) {
-        const videoUrl = result.hlsUrl || result.m3u8Url;
-        if (videoUrl) {
-          const headerInfo = await Extractors.setupHeadersForService(
-            result.type,
-            videoUrl,
-          );
-          if (headerInfo) {
-            await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+      // Set up DNR headers for all successful extractions (video URLs)
+      for (const result of results) {
+        if (result.success) {
+          const videoUrls =
+            result.type === "seekstreaming"
+              ? getSeekStreamingPlaybackUrls(result)
+              : [result.hlsUrl || result.m3u8Url].filter(Boolean);
+          for (const videoUrl of videoUrls) {
+            const headerInfo = await Extractors.setupHeadersForService(
+              result.type,
+              videoUrl,
+              result.url,
+            );
+            if (headerInfo) {
+              if (result.type === "seekstreaming") {
+                await replaceSeekPlaybackRule(headerInfo);
+              } else {
+                await addHeadersRule(
+                  headerInfo.domainPattern,
+                  headerInfo.headers,
+                );
+              }
+            }
           }
         }
       }
-    }
 
-    const successCount = results.filter((r) => r.success).length;
-    return {
-      success: successCount > 0,
-      total: results.length,
-      successCount,
-      results,
-    };
+      const successCount = results.filter((r) => r.success).length;
+      return {
+        success: successCount > 0,
+        total: results.length,
+        successCount,
+        results,
+      };
+    } finally {
+      await Promise.all(seekExtractionRuleIds.map(removeHeadersRule));
+    }
   }
 
   /**
@@ -5149,6 +5419,17 @@
 
   // DNR Helper
   let ruleIdCounter = 100;
+  // Reserved below the general 100+ allocator; FCTV owns fixed rule 60.
+  const SEEK_PLAYBACK_RULE_ID_MIN = 61;
+  const SEEK_PLAYBACK_RULE_ID_MAX = 99;
+
+  function isSeekPlaybackRuleId(ruleId) {
+    return (
+      Number.isInteger(ruleId) &&
+      ruleId >= SEEK_PLAYBACK_RULE_ID_MIN &&
+      ruleId <= SEEK_PLAYBACK_RULE_ID_MAX
+    );
+  }
 
   async function addUserAgentRule(urlPattern, userAgent) {
     return addHeadersRule(urlPattern, { "User-Agent": userAgent });
@@ -5283,23 +5564,14 @@
     return `${parsed.origin}/token-${token}${parsed.pathname}${parsed.search}`;
   }
 
-  async function addHeadersRule(urlPattern, headers) {
-    const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
-    const existingIds = new Set(existingRules.map((r) => r.id));
-
-    let id = ruleIdCounter;
-    while (existingIds.has(id)) {
-      id++;
-    }
-    ruleIdCounter = id + 1;
-
+  function createHeadersRule(id, urlPattern, headers) {
     const requestHeaders = Object.entries(headers).map(([header, value]) => ({
       header: header,
       operation: "set",
       value: value,
     }));
 
-    const rule = {
+    return {
       id: id,
       priority: 10,
       action: {
@@ -5318,14 +5590,98 @@
         ],
       },
     };
+  }
+
+  async function addHeadersRule(urlPattern, headers) {
+    const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
+    const existingIds = new Set(existingRules.map((r) => r.id));
+
+    let id = ruleIdCounter;
+    while (existingIds.has(id)) {
+      id++;
+    }
+    ruleIdCounter = id + 1;
+
+    const rule = createHeadersRule(id, urlPattern, headers);
 
     try {
       await chrome.declarativeNetRequest.updateDynamicRules({
         addRules: [rule],
       });
+      return id;
     } catch (e) {
       console.error("Failed to add dynamic rule:", e);
+      return null;
     }
+  }
+
+  async function removeHeadersRule(ruleId) {
+    if (!Number.isInteger(ruleId)) return;
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+    });
+  }
+
+  async function persistSeekPlaybackRule(headerInfo) {
+    try {
+      const existingRules =
+        await chrome.declarativeNetRequest.getDynamicRules();
+      const seekRules = existingRules.filter((rule) =>
+        isSeekPlaybackRuleId(rule.id),
+      );
+      const matchingRule = seekRules.find(
+        (rule) => rule.condition?.urlFilter === headerInfo.domainPattern,
+      );
+      const usedIds = new Set(seekRules.map((rule) => rule.id));
+      let ruleId = matchingRule?.id ?? null;
+
+      if (ruleId === null) {
+        for (
+          let candidate = SEEK_PLAYBACK_RULE_ID_MIN;
+          candidate <= SEEK_PLAYBACK_RULE_ID_MAX;
+          candidate += 1
+        ) {
+          if (!usedIds.has(candidate)) {
+            ruleId = candidate;
+            break;
+          }
+        }
+      }
+
+      if (ruleId === null) {
+        ruleId = SEEK_PLAYBACK_RULE_ID_MIN;
+        console.warn(
+          "[NEXUS] Seek playback rule capacity reached; evicting oldest slot",
+        );
+      }
+
+      const rule = createHeadersRule(
+        ruleId,
+        headerInfo.domainPattern,
+        headerInfo.headers,
+      );
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [ruleId],
+        addRules: [rule],
+      });
+      return ruleId;
+    } catch (e) {
+      console.error("Failed to persist Seek playback rule:", e);
+      return null;
+    }
+  }
+
+  let seekPlaybackRuleUpdateQueue = Promise.resolve();
+
+  function replaceSeekPlaybackRule(headerInfo) {
+    const update = seekPlaybackRuleUpdateQueue.then(() =>
+      persistSeekPlaybackRule(headerInfo),
+    );
+    seekPlaybackRuleUpdateQueue = update.then(
+      () => undefined,
+      () => undefined,
+    );
+    return update;
   }
   // --- END extension/Chrome/background.js ---
 

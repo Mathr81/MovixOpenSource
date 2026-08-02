@@ -170,8 +170,8 @@ test('publishes updated userscript and extension versions', async () => {
     ),
   );
 
-  assert.match(userscript, /^\/\/ @version\s+1\.4\.10$/m);
-  assert.match(userscript, /version:\s*"1\.4\.10"/);
-  assert.equal(chromeManifest.version, '1.3.11');
-  assert.equal(firefoxManifest.version, '1.5.8');
+  assert.match(userscript, /^\/\/ @version\s+1\.4\.11$/m);
+  assert.match(userscript, /version:\s*"1\.4\.11"/);
+  assert.equal(chromeManifest.version, '1.3.12');
+  assert.equal(firefoxManifest.version, '1.5.9');
 });

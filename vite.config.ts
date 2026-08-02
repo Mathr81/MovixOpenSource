@@ -7,7 +7,24 @@ import { visualizer } from 'rollup-plugin-visualizer'
 const buildId = process.env.CF_PAGES_COMMIT_SHA || process.env.COMMIT_REF || new Date().toISOString()
 process.env.VITE_APP_BUILD_ID = buildId
 
-function injectSwConfig(): Plugin {
+const normalizeSiteUrl = (value?: string): string => {
+  const candidate = value?.trim()
+  if (!candidate) {
+    throw new Error('VITE_SITE_URL is required')
+  }
+
+  try {
+    const url = new URL(candidate.includes('://') ? candidate : `https://${candidate}`)
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error()
+    return url.origin
+  } catch {
+    throw new Error('VITE_SITE_URL must contain a valid public URL')
+  }
+}
+
+function injectPublicConfig(): Plugin {
+  let siteUrl: string | undefined
+
   const replacePlaceholders = (source: string): string => {
     const mirrors = (process.env.VITE_DEFAULT_MIRRORS || 'movix.health')
       .split(',')
@@ -18,27 +35,53 @@ function injectSwConfig(): Plugin {
     return source
       .replace(/__MOVIX_DEFAULT_MIRRORS__/g, JSON.stringify(mirrors))
       .replace(/__MOVIX_CONFIG_URL__/g, JSON.stringify(configUrl))
+      .replace(/__MOVIX_SITE_URL__/g, () => {
+        if (!siteUrl) throw new Error('VITE_SITE_URL was not resolved')
+        return siteUrl
+      })
   }
   return {
-    name: 'movix-sw-inject',
+    name: 'movix-public-config-inject',
+    configResolved(config) {
+      siteUrl = normalizeSiteUrl(config.env.VITE_SITE_URL)
+    },
+    transformIndexHtml(html) {
+      return replacePlaceholders(html)
+    },
     // Mode build : transforme dist/sw.js après que Vite ait copié public/sw.js
     closeBundle() {
-      const swPath = resolve(__dirname, 'dist/sw.js')
-      if (!existsSync(swPath)) return
-      const contents = readFileSync(swPath, 'utf-8')
-      writeFileSync(swPath, replacePlaceholders(contents), 'utf-8')
+      for (const fileName of ['sw.js', 'sitemap.xml', 'robots.txt']) {
+        const outputPath = resolve(__dirname, 'dist', fileName)
+        if (!existsSync(outputPath)) continue
+        const contents = readFileSync(outputPath, 'utf-8')
+        writeFileSync(outputPath, replacePlaceholders(contents), 'utf-8')
+      }
     },
     // Mode dev : intercepte GET /sw.js et sert une version transformée
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const pathOnly = (req.url || '').split('?')[0]
-        if (pathOnly !== '/sw.js') {
-          return next()
+        const publicFiles: Record<string, { fileName: string; contentType: string }> = {
+          '/sw.js': {
+            fileName: 'sw.js',
+            contentType: 'application/javascript; charset=utf-8',
+          },
+          '/sitemap.xml': {
+            fileName: 'sitemap.xml',
+            contentType: 'application/xml; charset=utf-8',
+          },
+          '/robots.txt': {
+            fileName: 'robots.txt',
+            contentType: 'text/plain; charset=utf-8',
+          },
         }
-        const swPath = resolve(__dirname, 'public/sw.js')
-        if (!existsSync(swPath)) return next()
-        const contents = readFileSync(swPath, 'utf-8')
-        res.setHeader('Content-Type', 'application/javascript; charset=utf-8')
+        const publicFile = publicFiles[pathOnly]
+        if (!publicFile) return next()
+
+        const publicPath = resolve(__dirname, 'public', publicFile.fileName)
+        if (!existsSync(publicPath)) return next()
+        const contents = readFileSync(publicPath, 'utf-8')
+        res.setHeader('Content-Type', publicFile.contentType)
         res.setHeader('Cache-Control', 'no-store')
         res.end(replacePlaceholders(contents))
       })
@@ -50,7 +93,7 @@ export default defineConfig({
   logLevel: 'warn',
   plugins: [
     react(),
-    injectSwConfig(),
+    injectPublicConfig(),
     ...(process.env.ANALYZE === 'true'
       ? [
           visualizer({
@@ -68,9 +111,41 @@ export default defineConfig({
     port: 3000,
     hmr: true,
     watch: {
-      usePolling: true,
+      // Polling utile sur WSL/Docker/FS réseau où inotify/FSEvents ne remontent
+      // pas les changements. Sur Windows natif ou macOS, il faut le couper :
+      // chokidar scanne TOUS les fichiers à `interval` ms → démarrage Vite
+      // qui prend plusieurs minutes + CPU saturé. Override possible avec
+      // VITE_USE_POLLING=1 pour ceux qui codent en WSL2 vers un dossier
+      // monté sur le FS Windows (cas où linux+polling ne suffit pas).
+      usePolling: process.env.VITE_USE_POLLING === '1' || process.platform === 'linux',
       interval: 100,
-      ignored: ['**/node_modules/**', '**/.git/**'],
+      // Exclut tout ce qui n'est PAS source Vite. Sans ça, chokidar passe
+      // le démarrage à indexer 150MB d'avatars + le dist + les API Node +
+      // l'app mobile + les extensions — autant de fichiers qui sont soit
+      // servis tels quels (public/), soit n'ont rien à voir avec le bundle
+      // frontend (API/, app/, extension/, etc.).
+      ignored: [
+        '**/node_modules/**',
+        '**/.git/**',
+        '**/dist/**',
+        '**/public/avatars/**',
+        '**/public/WatchpartyTutorial/**',
+        '**/public/help/**',
+        '**/public/live/**',
+        '**/public/wasm/**',
+        '**/API/**',
+        '**/app/**',
+        '**/extension/**',
+        '**/PreMid/**',
+        '**/cloudflareproxy/**',
+        '**/RivestreamCloudflareProxy/**',
+        '**/functions/**',
+        '**/baddomain/**',
+        '**/docs/**',
+        '**/wasm/**',
+        '**/userscript/**',
+        '**/others/**',
+      ],
     },
   },
   preview: {
@@ -114,7 +189,19 @@ export default defineConfig({
             },
             {
               name: 'markdown',
-              test: /[\\/]node_modules[\\/](react-markdown|remark-emoji|remark-gfm)[\\/]/,
+              test: /[\\/]node_modules[\\/](react-markdown|remark-emoji)[\\/]/,
+            },
+            // remark-gfm + its mdast-util-gfm-* / micromark-extension-gfm-* deps are
+            // kept in their own chunk so they only load on engines that support regex
+            // lookbehinds. Bundling them with react-markdown would force-evaluate
+            // mdast-util-gfm-autolink-literal's lookbehind regex on Safari < 16.4 and
+            // crash with "Invalid regular expression: invalid group specifier name".
+            // Shared deps (ccount, mdast-util-find-and-replace, unified, etc.) are left
+            // out of this rule so Rollup can keep them in the static markdown chunk
+            // and avoid making the static chunk depend on this dynamic one.
+            {
+              name: 'remark-gfm',
+              test: /[\\/]node_modules[\\/](remark-gfm|mdast-util-gfm[^\\/]*|micromark-extension-gfm[^\\/]*)[\\/]/,
             },
           ],
         },

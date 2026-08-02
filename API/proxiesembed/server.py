@@ -12,6 +12,8 @@ import re
 import urllib.parse
 from urllib.parse import urlparse, urljoin
 from aiohttp import web, ClientTimeout, TCPConnector
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 from aiohttp.web import Request, Response
 import logging
 import sys
@@ -45,9 +47,45 @@ from uqload_utils import (
     normalize_uqload_embed_url,
     parse_allowed_uqload_url,
 )
+from seekstreaming_utils import (
+    build_seekstreaming_cache_key,
+    build_seekstreaming_result,
+    decrypt_seekstreaming_payload,
+    extract_seekstreaming_candidates,
+    has_hls_manifest_signature,
+    is_hls_response,
+    normalize_seekstreaming_origin,
+    parse_seekstreaming_embed_url,
+    redact_url_for_log,
+    validate_seekstreaming_media_url,
+    validate_seekstreaming_resolved_address,
+)
 
 # Load local .env from proxiesembed folder
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
+
+class PublicOnlyResolver(AbstractResolver):
+    """Resolve once, reject non-public answers, and return only verified IPs."""
+
+    def __init__(self, delegate: Optional[AbstractResolver] = None):
+        self._delegate = delegate or DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        resolved = await self._delegate.resolve(host, port, family)
+        if not resolved:
+            raise OSError("SeekStreaming DNS resolution returned no addresses")
+        for item in resolved:
+            try:
+                validate_seekstreaming_resolved_address(item.get("host"))
+            except (AttributeError, ValueError) as exc:
+                raise OSError(
+                    "SeekStreaming DNS resolution returned a non-public address"
+                ) from exc
+        return resolved
+
+    async def close(self):
+        await self._delegate.close()
 
 
 def _load_json_env(env_name: str, fallback: Any) -> Any:
@@ -670,6 +708,10 @@ PROBLEMATIC_DOMAINS = frozenset([
 # AES decryption constants for seekstreaming (embed4me)
 SEEKSTREAMING_AES_KEY = b"kiemtienmua911ca"
 SEEKSTREAMING_AES_IV = b"1234567890oiuytr"
+SEEKSTREAMING_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+)
 
 # Chunk sizes - OPTIMIZED for high-throughput streaming
 CHUNK_TS = 32768      # 32KB for TS segments (doubled for speed)
@@ -760,6 +802,9 @@ class TTLCache:
         elif len(self._cache) >= self._maxsize:
             self._cache.popitem(last=False)
         self._cache[key] = (value, time.time())
+
+    def delete(self, key: str) -> bool:
+        return self._cache.pop(key, None) is not None
     
     def clear_expired(self) -> None:
         now = time.time()
@@ -1027,7 +1072,6 @@ class ProxyServer:
     RE_NUMERIC_CDN = re.compile(r'([a-z0-9]+\.\d+\.net|epicquest|questher|hero.*\.com|trainer\.net|dishtrainer)', re.IGNORECASE)
     RE_DOODSTREAM = re.compile(r'd0000d\.com|doodstream\.com|dood\.(cx|la|pm|sh|so|to|watch|wf|yt|re)|cloudatacdn\.com|dsvplay\.com|doply\.net', re.IGNORECASE)
     RE_DOODSTREAM_PASS = re.compile(r'/pass_md5/[\w-]+/(?P<token>[\w-]+)')
-    RE_SEEKSTREAMING = re.compile(r'embed4me\.com|lpayer\.embed4me\.com|servicecatalog\.site|technicalcatalog\.site|embedseek\.com|embedseek\.online|embedseek\.xyz|seekplayer\.me|seekplayer\.vip|seeks\.cloud|seekplays\.com|seekplays\.ink|seekplays\.online|seekplays\.pro', re.IGNORECASE)
     RE_RANGE = re.compile(r'bytes=(\d+)-(\d*)')
     RE_M3U8_URI_DQ = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
     RE_M3U8_URI_SQ = re.compile(r"URI='([^']+)'", re.IGNORECASE)
@@ -1052,7 +1096,7 @@ class ProxyServer:
         self.uqload_cache = TTLCache(maxsize=2500, ttl=7200)  # Was saturating at 1003/500
         self.uqload_mp4_cache = TTLCache(maxsize=2500, ttl=7200)
         self.doodstream_cache = TTLCache(maxsize=500, ttl=3600)    # 1h - doodstream links expire
-        self.seekstreaming_cache = TTLCache(maxsize=500, ttl=7200)  # 2h - embed4me/seekstreaming
+        self.seekstreaming_cache = TTLCache(maxsize=500, ttl=300)
         self.vip_cache = TTLCache(maxsize=5000, ttl=VIP_CACHE_TTL)  # VIP access key verification cache
         self.m3u8_response_cache = TTLCache(maxsize=2000, ttl=M3U8_CACHE_TTL)  # Short-lived M3U8 response cache
         self.m3u8_vod_cache = TTLCache(maxsize=1000, ttl=M3U8_VOD_CACHE_TTL)   # Longer-lived VOD M3U8 cache
@@ -1132,6 +1176,19 @@ class ProxyServer:
                 **base_connector_args
             ),
             timeout=ClientTimeout(total=None),  # No global timeout
+            read_bufsize=SOCKET_READ_BUFFER,
+        )
+
+        # SeekStreaming URLs are user-controlled. This connector validates the
+        # exact DNS answers that it subsequently connects to, avoiding a
+        # separate check/connect lookup that would be vulnerable to rebinding.
+        self.sessions['seekstreaming'] = aiohttp.ClientSession(
+            connector=TCPConnector(
+                ssl=True,
+                resolver=PublicOnlyResolver(),
+                **base_connector_args,
+            ),
+            timeout=ClientTimeout(total=None),
             read_bufsize=SOCKET_READ_BUFFER,
         )
         
@@ -1791,7 +1848,11 @@ class ProxyServer:
             return 'uqload_embed'
         if self.RE_DOODSTREAM.search(url):
             return 'doodstream'
-        if self.RE_SEEKSTREAMING.search(url):
+        try:
+            parse_seekstreaming_embed_url(url)
+        except ValueError:
+            pass
+        else:
             return 'seekstreaming'
         return 'generic'
     
@@ -1810,6 +1871,20 @@ class ProxyServer:
                 target_url = request.query.get('url', '')
                 if not target_url:
                     return web.json_response({'error': 'No URL provided'}, status=400)
+
+            # SeekStreaming must use its dedicated route, which enforces strict
+            # URL validation and a public-only DNS connector. Reject it before
+            # processing caller headers, logging, or dispatching upstream.
+            try:
+                parse_seekstreaming_embed_url(target_url)
+            except ValueError:
+                pass
+            else:
+                return web.json_response(
+                    {"error": "Unsupported proxy target"},
+                    status=400,
+                    headers=CORS_HEADERS,
+                )
             
             # Parse use_proxy parameter (0=first SOCKS5, 1=second, etc.)
             use_proxy_param = request.query.get('use_proxy')
@@ -2689,15 +2764,6 @@ class ProxyServer:
                 'Connection': 'keep-alive'
             }
         
-        if self.RE_SEEKSTREAMING.search(target_url):
-            return {
-                'Accept': '*/*',
-                'Host': target_host,
-                'Referer': 'https://lpayer.embed4me.com/',
-                'Origin': 'https://lpayer.embed4me.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-            }
-        
         # Numeric CDN domains (e.g., 8nwwqrar.12703830.net) - used by various streaming services
         if self.RE_NUMERIC_CDN.search(target_url):
             return {
@@ -3508,7 +3574,14 @@ class ProxyServer:
             # Step 2: Extract pass_md5 URL and token
             extracted = self._extract_doodstream_video_url(html_content, url)
             if not extracted:
-                return web.json_response({'error': 'Could not extract video URL', 'details': 'Regex match failed check server logs'}, status=404, headers=CORS_HEADERS)
+                return web.json_response(
+                    {
+                        'error': 'DoodStream: File was deleted',
+                        'reason': 'deleted',
+                    },
+                    status=410,
+                    headers=CORS_HEADERS,
+                )
             
             domain, pass_md5_url, token = extracted
             
@@ -3543,130 +3616,123 @@ class ProxyServer:
     
     # ===== SeekStreaming (Embed4me) Extraction =====
     
-    def _decrypt_seekstreaming_data(self, hex_str: str) -> Optional[str]:
-        """Decrypt AES-CBC encrypted data from seekstreaming/embed4me API"""
-        try:
-
-            
-            hex_str = hex_str.strip().replace('"', '')
-            data = binascii.unhexlify(hex_str)
-            cipher = AES.new(SEEKSTREAMING_AES_KEY, AES.MODE_CBC, SEEKSTREAMING_AES_IV)
-            decrypted = unpad(cipher.decrypt(data), AES.block_size)
-            return decrypted.decode('utf-8')
-        except Exception as e:
-            logger.error(f'[SEEKSTREAMING] Decryption error: {e}')
-            return None
-    
     async def seekstreaming_extract_handler(self, request: Request) -> Response:
         """SeekStreaming (embed4me) extraction handler - accepts full URL"""
         if not await self._check_vip(request):
             return self._vip_denied_response()
-        try:
-            url = request.query.get('url')
-            if not url:
-                return web.json_response({'error': 'Missing url parameter'}, status=400, headers=CORS_HEADERS)
-            
-            # Decode %23 -> # so fragment-based IDs are properly extracted
-            url = urllib.parse.unquote(url)
-            
-            # Extract video ID from URL (e.g., https://lpayer.embed4me.com/#xv8jw -> xv8jw)
-            video_id = None
-            if '#' in url:
-                video_id = url.split('#')[-1].strip()
-            elif '/embed/' in url.lower():
-                video_id = url.rstrip('/').split('/')[-1].strip()
-            else:
-                # Try to get ID from the last path segment or fragment
-                try:
-                    parsed = urlparse(url)
-                    if parsed.fragment:
-                        video_id = parsed.fragment.strip()
-                    elif parsed.path and parsed.path != '/':
-                        video_id = parsed.path.rstrip('/').split('/')[-1].strip()
-                except:
-                    pass
-            
-            if not video_id:
-                error_msg = 'Could not extract video ID from URL'
-                if 'embedseek.com' in url or 'embed4me.com' in url:
-                    error_msg += '. If the URL uses a hash (#), ensure it is URL-encoded (%23) in your request.'
-                return web.json_response({'error': error_msg}, status=400, headers=CORS_HEADERS)
-            
-            cache_key = hashlib.md5(video_id.encode()).hexdigest()
-            cached = self.seekstreaming_cache.get(cache_key)
-            if cached:
-                self._cache_hits += 1
-                resp = web.json_response(cached)
-                resp.headers['X-Cache'] = 'HIT'
-                return resp
-            
-            # Call embed4me/embedseek API (dynamic domain)
-            try:
-                parsed_url = urlparse(url)
-                api_domain = parsed_url.netloc
-                if not api_domain:
-                    api_domain = 'lpayer.embed4me.com'
-            except:
-                api_domain = 'lpayer.embed4me.com'
-                
-            api_url = f"https://{api_domain}/api/v1/video?id={video_id}&w=1920&h=1080&r="
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Referer': f'https://{api_domain}/',
-                'Origin': f'https://{api_domain}',
-            }
-            
-            session = self.sessions['normal']
-            timeout = ClientTimeout(total=2, connect=2, sock_connect=2, sock_read=2)
 
-            try:
-                async with session.get(api_url, headers=headers, timeout=timeout) as response:
-                    if response.status != 200:
-                        return web.json_response({'error': f'API error: {response.status}'}, status=502, headers=CORS_HEADERS)
-                    encrypted_text = await asyncio.wait_for(response.text(), timeout=2)
-            except asyncio.TimeoutError:
-                return web.json_response({'error': 'Upstream API timeout'}, status=504, headers=CORS_HEADERS)
-            except aiohttp.ClientConnectorError as e:
-                return web.json_response({'error': f'Connection failed: {e}'}, status=502, headers=CORS_HEADERS)
-            
-            # Decrypt the response
-            decrypted_raw = self._decrypt_seekstreaming_data(encrypted_text)
-            if not decrypted_raw:
-                return web.json_response({'error': 'AES decryption failed'}, status=500, headers=CORS_HEADERS)
-            
-            data = json.loads(decrypted_raw)
-            
-            # Extract URLs
-            raw_cf = data.get('cf', '')
-            raw_source = data.get('source', '')
-            
-            result = {
-                'source': 'seekstreaming'
-            }
-            
-            # Pass the correct origin/referer to the proxy
-            proxy_queries = f"&referer=https%3A//{api_domain}/&origin=https%3A//{api_domain}"
-            
-            if raw_cf:
-                result['url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_cf)}{proxy_queries}"
-            if raw_source:
-                result['ip_url'] = f"{PROXY_BASE}/seekstreaming-proxy?url={urllib.parse.quote(raw_source)}{proxy_queries}"
-            
-            if not raw_cf and not raw_source:
-                return web.json_response({'error': 'No video source found'}, status=404, headers=CORS_HEADERS)
-            
-            self.seekstreaming_cache.set(cache_key, result)
-            resp = web.json_response(result)
-            resp.headers['X-Cache'] = 'MISS'
-            return resp
-            
+        try:
+            embed = parse_seekstreaming_embed_url(request.query.get("url", ""))
+        except ValueError:
+            return web.json_response(
+                {"error": "Invalid SeekStreaming extraction request"},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+
+        cache_key = build_seekstreaming_cache_key(embed.host, embed.video_id)
+        cached = self.seekstreaming_cache.get(cache_key)
+        if cached:
+            self._cache_hits += 1
+            response = web.json_response(cached, headers=CORS_HEADERS)
+            response.headers["X-Cache"] = "HIT"
+            return response
+
+        api_url = f"{embed.origin}/api/v1/video?" + urllib.parse.urlencode({
+            "id": embed.video_id,
+            "w": "1920",
+            "h": "1080",
+            "r": "",
+        })
+        headers = {
+            "User-Agent": SEEKSTREAMING_USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": embed.referer,
+            "Origin": embed.origin,
+        }
+        timeout = ClientTimeout(
+            total=10,
+            connect=5,
+            sock_connect=5,
+            sock_read=8,
+        )
+
+        try:
+            session = self.sessions.get("seekstreaming")
+            if session is None or getattr(session, "closed", False):
+                return web.json_response(
+                    {"error": "SeekStreaming upstream unavailable"},
+                    status=503,
+                    headers=CORS_HEADERS,
+                )
+            async with session.get(
+                api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            ) as upstream:
+                if upstream.status != 200:
+                    return web.json_response(
+                        {
+                            "error": (
+                                "SeekStreaming upstream HTTP "
+                                f"{upstream.status}"
+                            )
+                        },
+                        status=502,
+                        headers=CORS_HEADERS,
+                    )
+                encrypted_text = await upstream.text()
         except asyncio.TimeoutError:
-            return web.json_response({'error': 'Timeout'}, status=504, headers=CORS_HEADERS)
-        except Exception as e:
-            logger.error(f'[SEEKSTREAMING] Error: {e}')
-            return web.json_response({'error': str(e)}, status=500, headers=CORS_HEADERS)
+            logger.warning(
+                "[SEEKSTREAMING] Upstream timeout for %s",
+                redact_url_for_log(api_url),
+            )
+            return web.json_response(
+                {"error": "SeekStreaming upstream timeout"},
+                status=504,
+                headers=CORS_HEADERS,
+            )
+        except aiohttp.ClientError:
+            logger.warning(
+                "[SEEKSTREAMING] Upstream request failed for %s",
+                redact_url_for_log(api_url),
+            )
+            return web.json_response(
+                {"error": "SeekStreaming upstream request failed"},
+                status=502,
+                headers=CORS_HEADERS,
+            )
+
+        try:
+            payload = decrypt_seekstreaming_payload(
+                encrypted_text,
+                SEEKSTREAMING_AES_KEY,
+                SEEKSTREAMING_AES_IV,
+            )
+            candidates = extract_seekstreaming_candidates(payload)
+            result = build_seekstreaming_result(
+                candidates,
+                proxy_base=PROXY_BASE,
+                embed_origin=embed.origin,
+                cache_key=cache_key,
+            )
+        except (ValueError, UnicodeError, json.JSONDecodeError):
+            logger.warning(
+                "[SEEKSTREAMING] Invalid upstream payload from %s",
+                redact_url_for_log(api_url),
+            )
+            return web.json_response(
+                {"error": "Invalid SeekStreaming upstream payload"},
+                status=502,
+                headers=CORS_HEADERS,
+            )
+
+        self.seekstreaming_cache.set(cache_key, result)
+        response = web.json_response(result, headers=CORS_HEADERS)
+        response.headers["X-Cache"] = "MISS"
+        return response
     
     # ===== Service-Specific Proxy Routes =====
     
@@ -3732,9 +3798,19 @@ class ProxyServer:
         
         return '\n'.join(rewrite_line(l) for l in content.split('\n'))
     
+    @staticmethod
+    def _with_browser_fetch_metadata(headers: Dict) -> Dict:
+        return {
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            **headers,
+        }
+
     async def _service_proxy(self, request: Request, service_name: str,
                               default_headers: Dict, session_key: str = 'normal',
-                              proxy_route: str = None) -> Response:
+                              proxy_route: str = None,
+                              trusted_proxy_params: Optional[Dict[str, str]] = None) -> Response:
         """
         Generic service-specific proxy handler.
         Each service route calls this with its own headers and session.
@@ -3746,16 +3822,30 @@ class ProxyServer:
         target_url = request.query.get('url')
         if not target_url:
             return web.json_response({'error': 'Missing url parameter'}, status=400, headers=CORS_HEADERS)
+
+        if service_name == "seekstreaming":
+            try:
+                target_url = validate_seekstreaming_media_url(target_url)
+                seek_origin = normalize_seekstreaming_origin(
+                    default_headers.get("Origin")
+                    or default_headers.get("Referer")
+                    or "https://embedseek.com/"
+                )
+            except ValueError:
+                return web.json_response(
+                    {"error": "Invalid SeekStreaming proxy request"},
+                    status=400,
+                    headers=CORS_HEADERS,
+                )
+            default_headers = {
+                **default_headers,
+                "Origin": seek_origin,
+                "Referer": f"{seek_origin}/",
+            }
         
         self._request_count += 1
         
-        # Build headers with correct Host
-        headers = dict(default_headers)
-        try:
-            parsed = urlparse(target_url)
-            headers['Host'] = parsed.netloc
-        except:
-            pass
+        headers = self._with_browser_fetch_metadata(default_headers)
         
         # Detect content type
         content = detect_content_type(target_url, request.headers.get('accept', ''))
@@ -3767,12 +3857,26 @@ class ProxyServer:
         if range_header and not content.is_m3u8:
             headers['Range'] = range_header
 
-        # Capture extra query params (referer, origin) to pass to rewritten segments
-        extra_params = []
-        for k, v in request.query.items():
-            if k != 'url':
-                extra_params.append(f"{k}={urllib.parse.quote(v)}")
-        extra_query = "&".join(extra_params)
+        # Capture only caller-approved query params for rewritten resources.
+        if trusted_proxy_params is not None:
+            forwarded_proxy_params = {}
+            if service_name == "seekstreaming":
+                for name in ("origin", "referer"):
+                    value = trusted_proxy_params.get(name)
+                    if value:
+                        forwarded_proxy_params[name] = value
+                cache_key = trusted_proxy_params.get("cache_key", "")
+                if re.fullmatch(r"[a-f0-9]{64}", cache_key):
+                    forwarded_proxy_params["cache_key"] = cache_key
+                if trusted_proxy_params.get("vttwrap") == "1":
+                    forwarded_proxy_params["vttwrap"] = "1"
+            else:
+                forwarded_proxy_params = dict(trusted_proxy_params)
+        else:
+            forwarded_proxy_params = {
+                k: v for k, v in request.query.items() if k != "url"
+            }
+        extra_query = urllib.parse.urlencode(forwarded_proxy_params)
 
         # Timeouts based on content
         if content.is_mp4 and range_header:
@@ -3786,7 +3890,16 @@ class ProxyServer:
         else:
             timeout = ClientTimeout(total=30, connect=10, sock_read=20)
         
-        if session_key in self.sessions:
+        if service_name == "seekstreaming":
+            session = self.sessions.get("seekstreaming")
+            if session is None or getattr(session, "closed", False):
+                return web.json_response(
+                    {"error": "SeekStreaming proxy unavailable"},
+                    status=503,
+                    headers=CORS_HEADERS,
+                )
+            actual_session_key = "seekstreaming"
+        elif session_key in self.sessions:
             session = self.sessions[session_key]
             actual_session_key = session_key
         else:
@@ -3800,10 +3913,14 @@ class ProxyServer:
         # hls.js expects that URI to be an m3u8 playlist, so synthesize a
         # one-segment playlist that references the real VTT (fetched normally
         # on the follow-up request without the marker).
-        if request.query.get('vttwrap'):
-            inner_params = [f"{k}={urllib.parse.quote(v)}" for k, v in request.query.items()
-                            if k not in ('url', 'vttwrap')]
-            inner_suffix = ('&' + '&'.join(inner_params)) if inner_params else ''
+        if forwarded_proxy_params.get("vttwrap") == "1":
+            inner_params = {
+                k: v
+                for k, v in forwarded_proxy_params.items()
+                if k != "vttwrap"
+            }
+            inner_query = urllib.parse.urlencode(inner_params)
+            inner_suffix = f"&{inner_query}" if inner_query else ""
             inner_url = f"{route}?url={urllib.parse.quote(target_url)}{inner_suffix}"
             playlist = (
                 "#EXTM3U\n"
@@ -3820,11 +3937,16 @@ class ProxyServer:
                 'Cache-Control': 'no-cache',
             })
 
-        logger.info(f'[{service_name.upper()}-PROXY] â†’ session={actual_session_key} url={target_url} headers={headers}')
+        logger.info(
+            "[%s-PROXY] session=%s url=%s",
+            service_name.upper(),
+            actual_session_key,
+            redact_url_for_log(target_url),
+        )
 
         try:
             # â”€â”€ Segment cache check (before upstream request) â”€â”€
-            if content.is_ts or content.is_m4s:
+            if (content.is_ts or content.is_m4s) and not range_header:
                 cached_data = self.segment_buffer.get(target_url)
                 if cached_data is not None:
                     self._segment_cache_hits += 1
@@ -3843,92 +3965,158 @@ class ProxyServer:
                 timeout_s = timeout.total or timeout.sock_read or 30
                 upstream_cm = _CurlCffiUpstream(self.curl_session, target_url, headers, timeout_s, service_name)
             else:
-                upstream_cm = session.get(target_url, headers=headers, timeout=timeout)
+                upstream_cm = session.get(
+                    target_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
 
             async with upstream_cm as response:
+                response_url = str(getattr(response, "url", "") or target_url)
                 resp_headers = self._prepare_stream_headers(response.headers)
 
                 # Pass through redirects while keeping the client inside this service proxy route
                 if 300 <= response.status < 400:
                     location = response.headers.get('location') or response.headers.get('Location')
-                    if location:
-                        try:
-                            abs_location = location
-                            if not abs_location.startswith(('http://', 'https://')):
-                                abs_location = urljoin(target_url, abs_location)
-                            suffix = f"&{extra_query}" if extra_query else ''
-                            proxied_location = f"{route}?url={urllib.parse.quote(abs_location)}{suffix}"
-                        except Exception as e:
-                            logger.warning(f'[{service_name.upper()}-PROXY] Failed to rewrite redirect Location: {e}')
-                            proxied_location = location
-
-                        return web.Response(
-                            status=response.status,
-                            headers={
-                                **CORS_HEADERS,
-                                'Location': proxied_location,
-                                'Cache-Control': 'no-cache',
-                            },
+                    if not location:
+                        return web.json_response(
+                            {"error": "Invalid upstream redirect"},
+                            status=502,
+                            headers=CORS_HEADERS,
                         )
+                    redirected = urljoin(response_url, location)
+                    if service_name == "seekstreaming":
+                        try:
+                            redirected = validate_seekstreaming_media_url(
+                                redirected
+                            )
+                        except ValueError:
+                            return web.json_response(
+                                {"error": "Invalid upstream redirect"},
+                                status=502,
+                                headers=CORS_HEADERS,
+                            )
+                    proxied_location = f"{route}?" + urllib.parse.urlencode({
+                        "url": redirected,
+                        **forwarded_proxy_params,
+                    })
+                    return web.Response(
+                        status=response.status,
+                        headers={
+                            **CORS_HEADERS,
+                            "Location": proxied_location,
+                            "Cache-Control": "no-cache",
+                        },
+                    )
                 
                 # Convert upstream HTTP failures to error for consistent client handling
                 if response.status >= 400:
-                    err_body = await response.read()
-                    err_text = err_body.decode('utf-8', errors='replace') if err_body else '(empty)'
-                    logger.warning(f'[{service_name.upper()}-PROXY] Upstream HTTP {response.status} for {target_url} â€” body: {err_text[:200]}')
+                    if (
+                        service_name == "seekstreaming"
+                        and response.status in (401, 403, 404)
+                    ):
+                        cache_key = forwarded_proxy_params.get("cache_key")
+                        if cache_key:
+                            self.seekstreaming_cache.delete(cache_key)
+                    logger.warning(
+                        "[%s-PROXY] Upstream HTTP %s for %s",
+                        service_name.upper(),
+                        response.status,
+                        redact_url_for_log(response_url),
+                    )
                     return web.json_response(
                         {
                             'error': f'Upstream HTTP error: {response.status}',
                             'upstream_status': response.status,
-                            'upstream_url': target_url,
-                            'upstream_body': err_text[:2000]
                         },
                         status=response.status,
                         headers=CORS_HEADERS
                     )
                 
-                # M3U8 - rewrite URLs to go through same service proxy
-                if content.is_m3u8:
+                known_hls = is_hls_response(
+                    target_url,
+                    response_url,
+                    response.headers.get("Content-Type", ""),
+                )
+                if known_hls:
                     body = await response.read()
                     try:
-                        text = body.decode('utf-8')
-                        if self._is_valid_m3u8(text):
-                            rewritten = self._rewrite_m3u8_for_service(text, target_url, route, extra_query)
-                            resp_body = rewritten.encode('utf-8')
-                            resp_headers['Content-Type'] = 'application/vnd.apple.mpegurl'
-                            resp_headers.pop('Content-Length', None)
-                            resp_headers.pop('content-length', None)
-                            
-                            is_vod = '#EXT-X-ENDLIST' in text
-                            resp_headers['Cache-Control'] = f'public, max-age={M3U8_VOD_CACHE_TTL}' if is_vod else 'no-cache'
-                            resp_headers['Content-Length'] = str(len(resp_body))
-                            return _safe_response(resp_body, response.status, resp_headers)
-
-                        # Not valid M3U8 â€” return error so player fails fast
-                        logger.warning(f'[{service_name.upper()}-PROXY] M3U8 URL returned non-M3U8 content (status={response.status}): {target_url} â€” preview: {text[:200]}')
-                        return web.json_response(
-                            {
-                                'error': 'Invalid stream: upstream did not return valid M3U8 content',
-                                'upstream_status': response.status,
-                                'upstream_url': target_url,
-                                'upstream_body': text[:2000]
-                            },
-                            status=502, headers=CORS_HEADERS
+                        if not has_hls_manifest_signature(body):
+                            raise ValueError("Invalid HLS response")
+                        text = body.decode("utf-8")
+                    except (UnicodeDecodeError, ValueError):
+                        logger.warning(
+                            "[%s-PROXY] Invalid HLS response from %s",
+                            service_name.upper(),
+                            redact_url_for_log(response_url),
                         )
-                             
-                    except UnicodeDecodeError:
-                        pass
-                    # Binary/non-decodable body for an M3U8 URL â€” return error
-                    body_text = body.decode('utf-8', errors='replace')[:2000] if body else '(empty)'
-                    logger.warning(f'[{service_name.upper()}-PROXY] M3U8 URL returned non-text content: {target_url}')
-                    return web.json_response(
-                        {
-                            'error': 'Invalid stream: non-text response for M3U8 URL',
-                            'upstream_status': response.status,
-                            'upstream_url': target_url,
-                            'upstream_body': body_text
-                        },
-                        status=502, headers=CORS_HEADERS
+                        return web.json_response(
+                            {"error": "Invalid HLS response"},
+                            status=502,
+                            headers=CORS_HEADERS,
+                        )
+                    rewritten = self._rewrite_m3u8_for_service(
+                        text,
+                        response_url,
+                        route,
+                        extra_query,
+                    )
+                    payload = rewritten.encode("utf-8")
+                    return _safe_response(payload, response.status, {
+                        **resp_headers,
+                        "Content-Type": "application/vnd.apple.mpegurl",
+                        "Content-Length": str(len(payload)),
+                        "Cache-Control": (
+                            "public, max-age=300"
+                            if "#EXT-X-ENDLIST" in text
+                            else "no-cache"
+                        ),
+                    })
+
+                if not (
+                    content.is_ts
+                    or content.is_m4s
+                    or content.is_mp4
+                    or content.is_mpd
+                ):
+                    if not hasattr(response.content, "read"):
+                        return await self._stream_response(
+                            request,
+                            response,
+                            resp_headers,
+                            CHUNK_DEFAULT,
+                        )
+                    prefix = await response.content.read(32)
+                    if has_hls_manifest_signature(prefix):
+                        body = prefix + await response.read()
+                        try:
+                            text = body.decode("utf-8")
+                        except UnicodeDecodeError:
+                            return web.json_response(
+                                {"error": "Invalid HLS response"},
+                                status=502,
+                                headers=CORS_HEADERS,
+                            )
+                        rewritten = self._rewrite_m3u8_for_service(
+                            text,
+                            response_url,
+                            route,
+                            extra_query,
+                        )
+                        payload = rewritten.encode("utf-8")
+                        return _safe_response(payload, response.status, {
+                            **resp_headers,
+                            "Content-Type": "application/vnd.apple.mpegurl",
+                            "Content-Length": str(len(payload)),
+                            "Cache-Control": "no-cache",
+                        })
+                    return await self._stream_response_with_prefix(
+                        request,
+                        response,
+                        resp_headers,
+                        prefix,
+                        CHUNK_DEFAULT,
                     )
                 
                 # TS segments â€” buffer + cache (shared with main proxy segment buffer)
@@ -3975,42 +4163,73 @@ class ProxyServer:
                 # Default streaming
                 return await self._stream_response(request, response, resp_headers, CHUNK_DEFAULT)
 
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s-PROXY] Upstream timeout for %s",
+                service_name.upper(),
+                redact_url_for_log(target_url),
+            )
             return web.json_response(
-                {
-                    'error': 'Timeout',
-                    'exception': type(e).__name__,
-                    'message': str(e) or None,
-                    'upstream_url': target_url,
-                },
+                {'error': 'Upstream timeout'},
                 status=504,
                 headers=CORS_HEADERS,
             )
-        except (aiohttp.ClientError, _CurlRequestException) as e:
+        except (aiohttp.ClientError, _CurlRequestException):
+            logger.warning(
+                "[%s-PROXY] Upstream request failed for %s",
+                service_name.upper(),
+                redact_url_for_log(target_url),
+            )
             return web.json_response(
-                {
-                    'error': 'Upstream request failed',
-                    'exception': type(e).__name__,
-                    'message': str(e) or None,
-                    'details': repr(e),
-                    'upstream_url': target_url,
-                },
+                {'error': 'Upstream request failed'},
                 status=502,
                 headers=CORS_HEADERS,
             )
         except Exception as e:
-            logger.exception(f'[{service_name.upper()}-PROXY] Unexpected error')
+            logger.error(
+                "[%s-PROXY] Unexpected %s for %s",
+                service_name.upper(),
+                type(e).__name__,
+                redact_url_for_log(target_url),
+            )
             return web.json_response(
-                {
-                    'error': 'Unexpected proxy error',
-                    'exception': type(e).__name__,
-                    'message': str(e) or None,
-                    'details': repr(e),
-                    'upstream_url': target_url,
-                },
+                {'error': 'Unexpected proxy error'},
                 status=500,
                 headers=CORS_HEADERS,
             )
+
+    def _random_socks5_session_key(self) -> Optional[str]:
+        proxy_session_keys = sorted(
+            key
+            for key, session in self.sessions.items()
+            if re.fullmatch(r'proxy_\d+', key)
+            and not getattr(session, 'closed', False)
+        )
+        return random.choice(proxy_session_keys) if proxy_session_keys else None
+
+    async def _service_proxy_via_random_socks(
+        self,
+        request: Request,
+        service_name: str,
+        default_headers: Dict,
+    ) -> Response:
+        session_key = self._random_socks5_session_key()
+        if session_key is None:
+            logger.warning(
+                '[%s-PROXY] No SOCKS5 session available',
+                service_name.upper(),
+            )
+            return web.json_response(
+                {'error': 'SOCKS5 proxy unavailable'},
+                status=503,
+                headers=CORS_HEADERS,
+            )
+        return await self._service_proxy(
+            request,
+            service_name,
+            default_headers,
+            session_key=session_key,
+        )
     
     # --- Service proxy thin wrappers ---
     
@@ -4025,7 +4244,7 @@ class ProxyServer:
     
     async def fsvid_proxy_handler(self, request: Request) -> Response:
         """FSVID proxy"""
-        return await self._service_proxy(request, 'fsvid', {
+        return await self._service_proxy_via_random_socks(request, 'fsvid', {
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://fsvid.lol',
             'Referer': 'https://fsvid.lol/',
@@ -4034,12 +4253,12 @@ class ProxyServer:
 
     async def vidzy_proxy_handler(self, request: Request) -> Response:
         """Vidzy proxy"""
-        return await self._service_proxy(request, 'vidzy', {
+        return await self._service_proxy_via_random_socks(request, 'vidzy', {
             'Accept': 'application/vnd.apple.mpegurl,*/*',
             'Origin': 'https://vidzy.org',
             'Referer': 'https://vidzy.org/',
             'User-Agent': 'Mozilla/5.0 Chrome/141.0.0.0'
-        }, session_key='no_ssl')
+        })
     
     async def vidmoly_proxy_handler(self, request: Request) -> Response:
         """Vidmoly proxy"""
@@ -4241,19 +4460,48 @@ class ProxyServer:
 
     async def seekstreaming_proxy_handler(self, request: Request) -> Response:
         """SeekStreaming / embed4me proxy"""
-        referer = request.query.get('referer')
-        origin = request.query.get('origin')
-        
-        default_domain = 'lpayer.embed4me.com'
-        
-        headers = {
-            'Accept': '*/*',
-            'Referer': referer if referer else f'https://{default_domain}/',
-            'Origin': origin if origin else f'https://{default_domain}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+        try:
+            validate_seekstreaming_media_url(request.query.get("url"))
+            origin = normalize_seekstreaming_origin(
+                request.query.get("origin")
+                or request.query.get("referer")
+                or "https://embedseek.com/"
+            )
+        except ValueError:
+            return web.json_response(
+                {"error": "Invalid SeekStreaming proxy request"},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+
+        cache_key = request.query.get("cache_key", "")
+        if cache_key and not re.fullmatch(r"[a-f0-9]{64}", cache_key):
+            return web.json_response(
+                {"error": "Invalid SeekStreaming proxy request"},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+        trusted_proxy_params = {
+            "origin": origin,
+            "referer": f"{origin}/",
         }
-        
-        return await self._service_proxy(request, 'seekstreaming', headers)
+        if cache_key:
+            trusted_proxy_params["cache_key"] = cache_key
+        if request.query.get("vttwrap") == "1":
+            trusted_proxy_params["vttwrap"] = "1"
+
+        return await self._service_proxy(
+            request,
+            "seekstreaming",
+            {
+                "Accept": "*/*",
+                "Origin": origin,
+                "Referer": f"{origin}/",
+                "User-Agent": SEEKSTREAMING_USER_AGENT,
+            },
+            session_key="seekstreaming",
+            trusted_proxy_params=trusted_proxy_params,
+        )
 
     async def cinep_proxy_handler(self, request: Request) -> Response:
         """CinePulse proxy"""

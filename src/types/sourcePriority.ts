@@ -3,7 +3,7 @@
 /** Sources top-level disponibles pour Films/Séries. Ordre = default hardcodé actuel. */
 export const TOP_LEVEL_SOURCE_IDS = [
   'darkino', 'mp4', 'nexus_hls', 'bravo',
-  'fstream', 'wiflix', 'j1f', 'omega', 'coflix', 'frembed', 'vostfr',
+  'fstream', 'wiflix', 'j1f', 'swiftflow', 'omega', 'coflix', 'frembed', 'vostfr',
   'viper', 'vox', 'custom',
 ] as const;
 export type TopLevelSourceId = typeof TOP_LEVEL_SOURCE_IDS[number];

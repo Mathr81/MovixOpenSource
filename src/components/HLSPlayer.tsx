@@ -1,7 +1,8 @@
 import { motion, AnimatePresence } from 'framer-motion';
-import React, { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, memo, useMemo } from 'react';
+import { getFrembedBase } from '../utils/frembedConfig';
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, memo, useMemo } from 'react';
 import type HlsType from 'hls.js';
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, Rewind, FastForward, Volume1, ChevronRight, PictureInPicture, Users, Loader2, Repeat, Cast, Airplay, Info, X, Copy, Check, Lock } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, Settings, Rewind, FastForward, Volume1, ChevronRight, PictureInPicture, Users, Loader2, Repeat, Cast, Airplay, Info, X, Copy, Check, Lock, Gauge } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import type pakoType from 'pako';
@@ -26,7 +27,12 @@ import { toast } from 'sonner';
 import { isUserVip } from '../utils/authUtils';
 import { isExtensionAvailable } from '../utils/extensionProxy';
 import { isDnsLikeError, notifyDnsBlocked } from '../utils/dnsErrorDetection';
+import { isPlayerControlInteractionTarget } from '../utils/playerControlInteraction';
 import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
+import {
+  createHlsAutoFallbackGuard,
+  type HlsAutoFallbackGuard,
+} from '@/utils/hlsAutoFallbackGuard';
 import {
   initializeCastApi,
   requestCastSession,
@@ -39,6 +45,8 @@ import {
   isAirPlaySupported,
   isRemotePlaybackSupported,
 } from '../utils/castUtils';
+import { getLocalPlaybackInitPolicy } from '../utils/castLocalPlaybackRecovery';
+import { prepareCastSourceWithFallback } from '../utils/castSourcePreparation';
 import { useAntiSpoilerSettings } from '../hooks/useAntiSpoilerSettings';
 import { useTranslation } from 'react-i18next';
 import { encodeId } from '../utils/idEncoder';
@@ -47,6 +55,23 @@ import { PROXY_BASE_URL, PROXIES_EMBED_API } from '../config/runtime';
 import { getTmdbLanguage } from '../i18n';
 import { getCoflixPreferredUrl } from '../utils/coflix';
 import { safePlay } from '../utils/safePlay';
+import {
+  createLocalPlaybackAwakeLease,
+  shouldKeepLocalPlaybackAwake,
+} from '../utils/localPlaybackAwake';
+import {
+  createAndroidCastRemoteController,
+  createWebCastRemoteController,
+  isMovixAndroidCastBridgeCompatible,
+} from '../services/castRemoteController';
+import type {
+  CastRemoteController,
+  CastRemoteStatus,
+  CastSource,
+  MovixAndroidCastBridge,
+} from '../types/castRemote';
+import { CastRelayDisclosure } from './CastRelayDisclosure';
+import { shouldShowCastRelayDisclosure } from '../utils/castRelayDisclosure';
 import ReactCountryFlag from 'react-country-flag';
 import { PinButton } from './ui/PinButton';
 import {
@@ -62,6 +87,25 @@ import { sortHostersByPriority } from '../utils/sourceAutoSelect';
 import type {
   HosterId, TopLevelSourceId, LanguageId, PriorityCategory,
 } from '../types/sourcePriority';
+import {
+  buildHlsQualityOptions,
+  formatAvailableHlsQualities,
+  getFailingLevelIndex,
+  isVideoLevelFailure,
+  selectAudioTrackIndex,
+  selectLevelForPreference,
+} from '../utils/hlsQuality';
+import type {
+  HlsQualityOption,
+  HlsQualityPreference,
+} from '../utils/hlsQuality';
+import {
+  countLogicalNexusSources,
+  dedupeSeekStreamingEmbeds,
+  groupSeekStreamingSources,
+  isSeekStreamingEmbedUrl,
+} from '../utils/seekStreamingCandidates';
+import type { SeekStreamingHlsSource } from '../utils/seekStreamingCandidates';
 
 // Milestone 4 — mapping des `source.type` (top-level row) vers `TopLevelSourceId`.
 // Doit rester en phase avec `SOURCE_MAIN_TO_TOP_LEVEL` dans HLSPlayerSettingsPanel.tsx.
@@ -70,6 +114,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   fstream_main: 'fstream',
   wiflix_main: 'wiflix',
   j1f_main: 'j1f',
+  swiftflow_main: 'swiftflow',
   omega_main: 'omega',
   multi_main: 'coflix',
   viper_main: 'viper',
@@ -81,6 +126,107 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   mp4: 'mp4',
   custom: 'custom',
 };
+
+const hlsQualityPreferences = new Map<string, HlsQualityPreference>();
+const hlsAudioPreferences = new Map<string, { language: string; name: string }>();
+
+function getCastRelayErrorTranslationKey(error: unknown): string {
+  const code = typeof error === 'string'
+    ? error
+    : error instanceof Error
+      ? error.message
+      : '';
+  if (code.includes('MOVIX_RELAY_RELOAD_REQUIRED')) {
+    return 'watch.castRelayReloadRequired';
+  }
+  if (
+    code.includes('MOVIX_RELAY_WIFI_ROUTE_REQUIRED')
+    || code.includes('MOVIX_RELAY_NETWORK_LOST')
+  ) {
+    return 'watch.castRelayErrorSameWifi';
+  }
+  if (code.includes('MOVIX_RELAY_AP_ISOLATION')) {
+    return 'watch.castRelayErrorApIsolation';
+  }
+  if (code.includes('MOVIX_RELAY_ADDRESS_CHANGED')) {
+    return 'watch.castRelayErrorAddressChanged';
+  }
+  if (
+    code.includes('MOVIX_RELAY_START_FAILED')
+    || code.includes('MOVIX_RELAY_FOREGROUND')
+  ) {
+    return 'watch.castRelayErrorForegroundService';
+  }
+  if (
+    code.includes('MOVIX_CAST_LOAD_REJECTED')
+    || code.includes('MOVIX_CAST_RECEIVER_ERROR')
+  ) {
+    return 'watch.castRelayErrorReceiverLoadRejected';
+  }
+  if (code.includes('MOVIX_RELAY_UNSUPPORTED')) {
+    return 'watch.castRelayErrorUnsupportedSource';
+  }
+  if (
+    code.includes('MOVIX_RELAY_UPSTREAM')
+    || code.includes('MOVIX_RELAY_RESPONSE_TOO_LARGE')
+  ) {
+    return 'watch.castRelayErrorUpstreamFailure';
+  }
+  return 'watch.castError';
+}
+
+type HlsVideoFallbackDecision =
+  | { action: 'ignore' }
+  | { action: 'switch-source' }
+  | { action: 'switch-level'; level: number };
+
+function decideHlsAudioFailure(fatal: boolean): 'keep-source' | 'switch-source' {
+  return fatal ? 'switch-source' : 'keep-source';
+}
+
+function selectExactHlsFallbackLevel(
+  options: ReadonlyArray<Pick<HlsQualityOption, 'height' | 'index'>>,
+  targetHeight: number,
+): number {
+  return options.find(option => option.height === targetHeight)?.index ?? -1;
+}
+
+function decideHlsVideoFallback({
+  activeFallbackLevel,
+  failedHeight,
+  failedLevel,
+  failedLevels,
+  lowerHeight,
+  lowerLevel,
+}: {
+  activeFallbackLevel: number | null;
+  failedHeight: number | null;
+  failedLevel: number;
+  failedLevels: ReadonlySet<number>;
+  lowerHeight: number | null;
+  lowerLevel: number;
+}): HlsVideoFallbackDecision {
+  if (failedLevel >= 0 && failedLevels.has(failedLevel)) {
+    return { action: 'ignore' };
+  }
+
+  if (activeFallbackLevel !== null) {
+    if (failedLevel >= 0 && failedLevel !== activeFallbackLevel) {
+      return { action: 'ignore' };
+    }
+    return { action: 'switch-source' };
+  }
+
+  if (
+    failedHeight === 1080
+    && lowerLevel >= 0
+    && lowerHeight === 720
+  ) {
+    return { action: 'switch-level', level: lowerLevel };
+  }
+
+  return { action: 'switch-source' };
+}
 
 
 // Add TMDB API key
@@ -411,7 +557,16 @@ const clearFailed429Segments = () => {
 };
 
 // Utility function to handle 429 errors with smart retry logic
-const handle429Error = (hls: any, videoRef: React.RefObject<HTMLVideoElement>, data: any, currentSrc: string = '') => {
+const handle429Error = (
+  hls: any,
+  videoRef: React.RefObject<HTMLVideoElement>,
+  data: any,
+  currentSrc: string = '',
+  requestFallback?: (
+    performFallback?: () => void,
+    originatingSource?: string,
+  ) => unknown,
+) => {
   const failedUrl = data.frag?.url || data.url || 'unknown';
   const isTopstrime = failedUrl.includes('pulse.topstrime.online');
 
@@ -441,10 +596,12 @@ const handle429Error = (hls: any, videoRef: React.RefObject<HTMLVideoElement>, d
       }
     }
 
-    const sourceChangeEvent = new CustomEvent('sourceChange', {
-      detail: { type: 'rivestream_hls', url: newUrl, id: 'rivestream_retry', origin: 'auto-fallback', fromSrc: currentSrc || failedUrl }
+    requestFallback?.(() => {
+      const sourceChangeEvent = new CustomEvent('sourceChange', {
+        detail: { type: 'rivestream_hls', url: newUrl, id: 'rivestream_retry', origin: 'auto-fallback', fromSrc: currentSrc || failedUrl }
+      });
+      window.dispatchEvent(sourceChangeEvent);
     });
-    window.dispatchEvent(sourceChangeEvent);
     return;
   }
 
@@ -482,11 +639,7 @@ const handle429Error = (hls: any, videoRef: React.RefObject<HTMLVideoElement>, d
 
 
     setTimeout(() => {
-      // Déclencher le changement de source via un événement personnalisé
-      const sourceChangeEvent = new CustomEvent('forceSourceChange', {
-        detail: { reason: 'too_many_429_errors', url: failedUrl }
-      });
-      window.dispatchEvent(sourceChangeEvent);
+      requestFallback?.(undefined, currentSrc || failedUrl);
     }, 1000);
     return;
   }
@@ -535,37 +688,6 @@ const handle429Error = (hls: any, videoRef: React.RefObject<HTMLVideoElement>, d
   }, 5000); // Attendre 5 secondes pour éviter les 429 répétés
 };
 
-// Utility function to reset media element error state
-const resetMediaElementError = (videoElement: HTMLVideoElement): Promise<void> => {
-  return new Promise((resolve) => {
-    console.log('🔧 Resetting media element error state...');
-
-    // Clear any existing error
-    if (videoElement.error) {
-      console.log('🚨 Media element has error:', videoElement.error.message);
-    }
-
-    // Remove source and reload to clear error state
-    videoElement.removeAttribute('src');
-    videoElement.load();
-
-    // Wait for the element to be ready for new source
-    const onEmptied = () => {
-      console.log('✅ Media element error state cleared');
-      videoElement.removeEventListener('emptied', onEmptied);
-      resolve();
-    };
-
-    videoElement.addEventListener('emptied', onEmptied);
-
-    // Fallback timeout in case emptied event doesn't fire
-    setTimeout(() => {
-      videoElement.removeEventListener('emptied', onEmptied);
-      resolve();
-    }, 500);
-  });
-};
-
 // Type for next content threshold configuration
 type NextContentThreshold =
   | number // Percentage mode (0-100), e.g., 95 for 95%
@@ -609,7 +731,7 @@ interface HLSPlayerProps {
   subtitleUrl?: string; // Optional subtitle URL
   darkinoSources?: any[];
   mp4Sources?: { url: string; label?: string; language?: string; isVip?: boolean }[];
-  nexusHlsSources?: { url: string; label: string }[];
+  nexusHlsSources?: SeekStreamingHlsSource[];
   nexusFileSources?: { url: string; label: string }[];
   purstreamSources?: { url: string; label: string }[];
   rivestreamSources?: { url: string; label: string; quality: number; service: string; category: string }[];
@@ -622,6 +744,7 @@ interface HLSPlayerProps {
   fstreamSources?: { url: string; label: string; category: string }[];
   wiflixSources?: { url: string; label: string; category: string }[];
   j1fSources?: { url: string; label: string; category: string }[];
+  swiftflowSources?: { url: string; label: string; category: string }[];
   viperSources?: { url: string; label: string; quality: string; language: string }[];
   voxSources?: { name: string; link: string }[];
   onlyQualityMenu?: boolean; // Ajout pour l'affichage du menu qualité seul
@@ -662,6 +785,7 @@ interface HLSPlayerProps {
   //   - { mode: 'timeBeforeEnd', value: 120 } (120 seconds = 2 minutes before end)
   nextContentThreshold?: NextContentThreshold; // Default: 95 (percentage)
   onShowSources?: () => void; // Callback to show sources menu
+  autoFallbackGuard?: HlsAutoFallbackGuard;
 
   /**
    * Catégorie de priorité utilisateur appliquée au tri des hosters dans le panel
@@ -677,11 +801,6 @@ interface MovieInfo {
   releaseDate: string;
   rating: number;
   runtime: number;
-}
-
-interface Quality {
-  height: number;
-  url: string | string[];
 }
 
 interface AudioTrack {
@@ -875,6 +994,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   fstreamSources = [],
   wiflixSources = [],
   j1fSources = [],
+  swiftflowSources = [],
   viperSources = [],
   voxSources = [],
   onlyQualityMenu = false,
@@ -900,12 +1020,25 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   onPlayerEnded,
   onShowSources,
   priorityCategory,
+  autoFallbackGuard,
 }, ref) => {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<HlsType | null>(null);
+  const handleHlsErrorRef = useRef<(() => Promise<void>) | null>(null);
+  const onShowSourcesRef = useRef(onShowSources);
+  const playerAutoFallbackOwnerRef = useRef<object>({});
+  useLayoutEffect(() => {
+    onShowSourcesRef.current = onShowSources;
+  }, [onShowSources]);
+  const localAutoFallbackGuardRef = useRef<HlsAutoFallbackGuard | null>(null);
+  if (!localAutoFallbackGuardRef.current) {
+    localAutoFallbackGuardRef.current = createHlsAutoFallbackGuard(2);
+  }
+  const resolvedAutoFallbackGuard =
+    autoFallbackGuard ?? localAutoFallbackGuardRef.current;
   // Lazy-loaded HLS.js constructor — see loadHls() at top of file. Stored in state
   // so effects depending on it re-run after the first dynamic import resolves.
   // Initial value MUST be wrapped in `() => HlsLib`: once the dynamic import has
@@ -924,6 +1057,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     return () => { cancelled = true; };
   }, [Hls]);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [hasFatalPlaybackError, setHasFatalPlaybackError] = useState(false);
+  const awakeLeaseRef = useRef<ReturnType<
+    typeof createLocalPlaybackAwakeLease
+  > | null>(null);
+  if (!awakeLeaseRef.current) {
+    awakeLeaseRef.current = createLocalPlaybackAwakeLease();
+  }
   const [showVolumeSlider, setShowVolumeSlider] = useState(false);
   const [volume, setVolume] = useState(() => {
     const savedVolume = localStorage.getItem('playerVolume');
@@ -1009,13 +1149,107 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const bufferingTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Timeout ref for buffering indicator delay
   const sourceTimeoutRef = useRef<NodeJS.Timeout | null>(null); // Timeout ref for automatic source switching
   const [showSettings, setShowSettings] = useState(false);
-  const [, setQualities] = useState<Quality[]>([]);
-  const [currentQuality, setCurrentQuality] = useState<number | 'auto'>('auto');
+  const [settingsTab, setSettingsTab] = useState<'quality' | 'subtitles' | 'audio' | 'style' | 'format' | 'speed' | 'progression' | 'enhancer' | 'oled'>('quality'); // Add 'progression', 'enhancer', 'oled'
+  const requestHlsFallback = useCallback((
+    performFallback?: () => void,
+    originatingSource = src,
+  ) => {
+    const decision = resolvedAutoFallbackGuard.requestAutomaticSwitch(
+      originatingSource,
+      playerAutoFallbackOwnerRef.current,
+    );
+    if (decision === 'stale') return decision;
+    if (decision === 'limit-reached') {
+      setIsLoading(false);
+      setIsBuffering(false);
+      setHasFatalPlaybackError(true);
+      if (onShowSourcesRef.current) {
+        onShowSourcesRef.current();
+      } else {
+        setSettingsTab('quality');
+        setShowSettings(true);
+      }
+      return decision;
+    }
+
+    if (performFallback) {
+      performFallback();
+    } else {
+      void handleHlsErrorRef.current?.();
+    }
+    return decision;
+  }, [resolvedAutoFallbackGuard, src]);
+
+  useEffect(() => {
+    if (src.trim()) {
+      resolvedAutoFallbackGuard.syncActiveSource(
+        src,
+        playerAutoFallbackOwnerRef.current,
+      );
+    }
+  }, [resolvedAutoFallbackGuard, src]);
+  const contentQualityKey = movieId
+    ? `movie:${movieId}`
+    : `tv:${tvShowId || 'unknown'}:${seasonNumber || 0}:${episodeNumber || 0}`;
+  const [qualities, setQualities] = useState<HlsQualityOption[]>([]);
+  const qualitiesRef = useRef<HlsQualityOption[]>([]);
+  const [qualityPreference, setQualityPreference] = useState<HlsQualityPreference>(
+    () => hlsQualityPreferences.get(contentQualityKey) ?? 1080,
+  );
+  const contentQualityKeyRef = useRef(contentQualityKey);
+  const qualityPreferenceRef = useRef<HlsQualityPreference>(qualityPreference);
+  const [effectiveQualityHeight, setEffectiveQualityHeight] = useState<number | null>(null);
+  const failedLevelsRef = useRef(new Set<number>());
+  const fallbackLevelRef = useRef<number | null>(null);
   const [sourceStreamQualities, setSourceStreamQualities] = useState<Record<string, string>>(() => getInitialSourceQualityState());
   const [copiedSourceUrl, setCopiedSourceUrl] = useState<string | null>(null);
   const copiedSourceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [subtitles, setSubtitles] = useState<TextTrack[]>([]);
   const [currentSubtitle, setCurrentSubtitle] = useState<string>('off');
+
+  useEffect(() => {
+    contentQualityKeyRef.current = contentQualityKey;
+    const rememberedPreference = hlsQualityPreferences.get(contentQualityKey) ?? 1080;
+    qualityPreferenceRef.current = rememberedPreference;
+    setQualityPreference(rememberedPreference);
+  }, [contentQualityKey]);
+
+  useEffect(() => {
+    qualityPreferenceRef.current = qualityPreference;
+    hlsQualityPreferences.set(contentQualityKeyRef.current, qualityPreference);
+  }, [qualityPreference]);
+
+  useEffect(() => {
+    failedLevelsRef.current.clear();
+    fallbackLevelRef.current = null;
+    qualitiesRef.current = [];
+    setQualities([]);
+    setEffectiveQualityHeight(null);
+  }, [src]);
+
+  const handleQualityPreferenceChange = useCallback((preference: HlsQualityPreference) => {
+    const hls = hlsRef.current;
+    qualityPreferenceRef.current = preference;
+    failedLevelsRef.current.clear();
+    fallbackLevelRef.current = null;
+    setQualityPreference(preference);
+    hlsQualityPreferences.set(contentQualityKey, preference);
+    if (!hls) return;
+
+    const target = selectLevelForPreference(qualitiesRef.current, preference, 1080);
+    if (preference === 'auto') {
+      hls.autoLevelCapping = target;
+      hls.currentLevel = -1;
+      hls.nextLevel = -1;
+      hls.loadLevel = -1;
+    } else if (target >= 0) {
+      hls.autoLevelCapping = -1;
+      hls.currentLevel = target;
+      hls.nextLevel = target;
+      hls.loadLevel = target;
+    }
+  }, [contentQualityKey]);
+
   // External subtitles (OpenSubtitles) states
   const [availableExternalLangCodes, setAvailableExternalLangCodes] = useState<Set<string> | null>(null);
   const [externalLangsLoading, setExternalLangsLoading] = useState(false);
@@ -1049,7 +1283,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [currentAudioTrack, setCurrentAudioTrack] = useState<number>(0);
-  const [settingsTab, setSettingsTab] = useState<'quality' | 'subtitles' | 'audio' | 'style' | 'format' | 'speed' | 'progression' | 'enhancer' | 'oled'>('quality'); // Add 'progression', 'enhancer', 'oled'
   // Nouvel état pour la largeur du menu paramètres
   const [settingsMenuWidth, setSettingsMenuWidth] = useState(0);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
@@ -1240,6 +1473,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [showFstreamMenu, setShowFstreamMenu] = useState(false);
   const [showWiflixMenu, setShowWiflixMenu] = useState(false);
   const [showJ1fMenu, setShowJ1fMenu] = useState(false);
+  const [showSwiftflowMenu, setShowSwiftflowMenu] = useState(false);
   const [showViperMenu, setShowViperMenu] = useState(false);
   const [showVoxMenu, setShowVoxMenu] = useState(false);
   const [showRivestreamMenu, setShowRivestreamMenu] = useState(false);
@@ -1356,7 +1590,45 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   };
 
   // Chromecast states
-  const [isCasting, setIsCasting] = useState(false);
+  const [castController, setCastController] =
+    useState<CastRemoteController | null>(null);
+  const [castStatus, setCastStatus] = useState<CastRemoteStatus>({
+    connected: false,
+    deviceName: null,
+    mediaSessionId: null,
+    state: 'idle',
+    positionSec: 0,
+    durationSec: null,
+    canSeek: false,
+  });
+  const lastAuthoritativeCastStatusRef = useRef(castStatus);
+  const isCasting = castStatus.connected;
+  const postCastPlaybackSuppressedRef = useRef(isCasting);
+  const setIsCasting = useCallback((connected: boolean) => {
+    setCastStatus(current => ({
+      ...current,
+      connected,
+      state: connected && current.state === 'idle' ? 'loading' : current.state,
+    }));
+  }, []);
+
+  useEffect(() => {
+    awakeLeaseRef.current?.setActive(shouldKeepLocalPlaybackAwake({
+      isPlaying,
+      isCasting,
+      hasFatalError: hasFatalPlaybackError,
+      isClosed: false,
+    }));
+  }, [isPlaying, isCasting, hasFatalPlaybackError]);
+
+  useEffect(() => () => {
+    awakeLeaseRef.current?.release();
+  }, []);
+
+  useEffect(() => {
+    setHasFatalPlaybackError(false);
+  }, [src]);
+
   const [castSession, setCastSession] = useState<any>(null);
   const [castAvailable, setCastAvailable] = useState(false);
   // True once the Cast SDK has finished loading. Used to trigger the
@@ -1382,6 +1654,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [isAirPlayLoading, setIsAirPlayLoading] = useState(false);
   const castButtonRef = useRef<HTMLElement | null>(null);
   const lastLoadedCastSrcRef = useRef<string | null>(null);
+  const selectedCastSrcRef = useRef(src);
+  selectedCastSrcRef.current = src;
   // Single-flight guard: when a cast is started from startCasting(), the SDK
   // also fires SESSION_STARTED which triggers a second loadMedia for the same
   // src. Two concurrent LOAD requests race on the receiver (the first gets
@@ -1390,7 +1664,73 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // Native Android cast bridge (injected by the Movix Android app WebView).
   // When present, clicking cast routes through the Google Cast SDK on-device
   // instead of the web cast_sender.js SDK (which isn't available inside WebView).
-  const [nativeCastBridge, setNativeCastBridge] = useState<any>(null);
+  const [nativeCastBridge, setNativeCastBridge] =
+    useState<MovixAndroidCastBridge | null>(null);
+  const [nativeCastConfigured, setNativeCastConfigured] = useState(false);
+  const [relayDisclosureSuppressed, setRelayDisclosureSuppressedState] =
+    useState<boolean | null>(null);
+  const [showCastRelayDisclosure, setShowCastRelayDisclosure] = useState(false);
+
+  const applyAuthoritativeCastStatus = useCallback((status: CastRemoteStatus) => {
+    lastAuthoritativeCastStatusRef.current = status;
+    setCastStatus(status);
+    setCastCurrentTime(status.positionSec);
+    setCastDuration(status.durationSec ?? 0);
+    setIsCastLoading(
+      status.state === 'loading' || status.state === 'buffering',
+    );
+    if (status.errorCode) {
+      setCastError(t(getCastRelayErrorTranslationKey(status.errorCode)));
+      setShowCastMenu(true);
+    } else if (status.state !== 'error') {
+      setCastError(null);
+    }
+  }, [t]);
+
+  const runCastCommand = useCallback(async (
+    command: () => Promise<void>,
+    optimisticState?: CastRemoteStatus['state'],
+  ) => {
+    const controller = castController;
+    if (!controller) return;
+    if (optimisticState) {
+      setCastStatus(current => ({ ...current, state: optimisticState }));
+    }
+    try {
+      await command();
+    } catch {
+      applyAuthoritativeCastStatus(lastAuthoritativeCastStatusRef.current);
+      try {
+        applyAuthoritativeCastStatus(await controller.getStatus());
+      } catch {
+        // Preserve the last authoritative status when refresh is unavailable.
+      }
+      setCastError(t('watch.castCommandFailed'));
+      setShowCastMenu(true);
+    }
+  }, [applyAuthoritativeCastStatus, castController, t]);
+
+  useEffect(() => {
+    if (!castController) return;
+    let cancelled = false;
+    const unsubscribe = castController.subscribe(status => {
+      if (!cancelled) applyAuthoritativeCastStatus(status);
+    });
+    void castController.getStatus().then(status => {
+      if (cancelled) return;
+      if (status.connected) {
+        // Reattachment adopts the receiver's current media without reloading.
+        lastLoadedCastSrcRef.current = selectedCastSrcRef.current;
+      }
+      applyAuthoritativeCastStatus(status);
+    }).catch(() => {
+      // Status will reconcile through the native/web subscription.
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [applyAuthoritativeCastStatus, castController]);
 
   // Persist the last playback position across src changes so that switching
   // servers/players (e.g. anime source picker) keeps the viewer at the same
@@ -1587,6 +1927,91 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       <SourceQualityMeta qualityLabel={qualityLabel} isActive={isActive} />
     );
   }, [getSourceQualityLabel]);
+
+  // --- Bulk HLS quality scan (settings "Vérifier la qualité") ---
+  // Fills the per-source quality badges (resolution • bitrate) for every premium
+  // HLS link at once, instead of only the source currently playing. Reuses
+  // rememberSourceQuality so the existing badges light up as each link resolves.
+  const [hlsQualityScan, setHlsQualityScan] = useState<{ status: 'idle' | 'running'; done: number; total: number }>({ status: 'idle', done: 0, total: 0 });
+  const hlsQualityScanCancelledRef = useRef(false);
+  useEffect(() => () => { hlsQualityScanCancelledRef.current = true; }, []);
+
+  const probeM3u8Quality = useCallback((url: string, HlsCtor: typeof HlsType): Promise<void> => {
+    if (!url || url === '#') return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const hls = new HlsCtor(createHlsConfig(url));
+      const finish = () => { if (settled) return; settled = true; clearTimeout(timer); try { hls.destroy(); } catch { /* noop */ } resolve(); };
+      const timer = setTimeout(finish, 12000); // ponytail: 12s per link, dead links resolve empty instead of stalling the scan
+      hls.on(HlsCtor.Events.MANIFEST_PARSED, (_e, data) => {
+        const levels = data?.levels || [];
+        const qualityOptions = buildHlsQualityOptions(levels);
+        const top = [...levels].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+        const qualityLabel = qualityOptions.length > 1
+          ? formatAvailableHlsQualities(qualityOptions)
+          : formatDetectedStreamQuality(top);
+        rememberSourceQuality(url, qualityLabel);
+        finish();
+      });
+      hls.on(HlsCtor.Events.ERROR, (_e, data) => { if (data?.fatal) finish(); });
+      try { hls.loadSource(url); } catch { finish(); }
+    });
+  }, [formatDetectedStreamQuality, rememberSourceQuality]);
+
+  const probeFileQuality = useCallback((url: string): Promise<void> => {
+    if (!url || url === '#') return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.muted = true;
+      const finish = () => { if (settled) return; settled = true; clearTimeout(timer); video.removeAttribute('src'); video.load(); resolve(); };
+      const timer = setTimeout(finish, 12000);
+      video.addEventListener('loadedmetadata', () => {
+        rememberSourceQuality(url, formatDetectedStreamQuality({ width: video.videoWidth, height: video.videoHeight }));
+        finish();
+      });
+      video.addEventListener('error', finish);
+      video.src = url;
+    });
+  }, [formatDetectedStreamQuality, rememberSourceQuality]);
+
+  const runHlsQualityScan = useCallback(async () => {
+    const urls: string[] = [];
+    const pushUrl = (u?: string | null) => { if (u && u !== '#' && !urls.includes(u)) urls.push(u); };
+    pushUrl(adFreeM3u8Url);
+    (mp4Sources || []).forEach(s => pushUrl(s.url));
+    (darkinoSources || []).forEach(s => pushUrl(s.m3u8));
+    (nexusHlsSources || []).forEach(s => pushUrl(s.url));
+    (nexusFileSources || []).forEach(s => pushUrl(s.url));
+    (purstreamSources || []).forEach(s => pushUrl(s.url));
+
+    if (urls.length === 0) { setHlsQualityScan({ status: 'idle', done: 0, total: 0 }); return; }
+
+    hlsQualityScanCancelledRef.current = false;
+    setHlsQualityScan({ status: 'running', done: 0, total: urls.length });
+    const HlsCtor = Hls || await loadHls();
+
+    const isDirectFile = (u: string) => /\.(mp4|mkv|webm|avi|mov|m4v)(\?|$)/i.test(u);
+    const CONCURRENCY = 4; // ponytail: fixed pool, tune if proxies complain
+    let done = 0;
+    for (let i = 0; i < urls.length; i += CONCURRENCY) {
+      if (hlsQualityScanCancelledRef.current) break;
+      const chunk = urls.slice(i, i + CONCURRENCY);
+      await Promise.all(chunk.map(u =>
+        (isDirectFile(u) ? probeFileQuality(u) : probeM3u8Quality(u, HlsCtor))
+          .catch(() => { /* noop */ })
+          .finally(() => {
+            done += 1;
+            if (!hlsQualityScanCancelledRef.current) setHlsQualityScan(prev => ({ ...prev, done }));
+          })
+      ));
+    }
+    if (!hlsQualityScanCancelledRef.current) {
+      setHlsQualityScan({ status: 'idle', done: 0, total: 0 });
+      toast.success(t('watch.qualityCheckDone'));
+    }
+  }, [Hls, adFreeM3u8Url, mp4Sources, darkinoSources, nexusHlsSources, nexusFileSources, purstreamSources, probeM3u8Quality, probeFileQuality, t]);
 
   const handleCopySourceUrl = useCallback(async (event: React.MouseEvent<HTMLButtonElement>, sourceUrl?: string | null) => {
     event.stopPropagation();
@@ -1953,7 +2378,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
     // Process Nexus sources - Add only one main button
     if ((nexusHlsSources && nexusHlsSources.length > 0) || (nexusFileSources && nexusFileSources.length > 0)) {
-      const totalNexusSources = (nexusHlsSources?.length || 0) + (nexusFileSources?.length || 0);
+      const totalNexusSources = countLogicalNexusSources(
+        nexusHlsSources,
+        nexusFileSources,
+      );
       hlsSources.push({
         type: 'nexus_main',
         id: 'nexus_main',
@@ -1993,27 +2421,39 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           type: 'frembed',
           id: 'frembed_main',
           label: t('watch.frembedPlayer'),
-          url: `https://frembed.click/api/film.php?id=${movieId}`,
+          url: `${getFrembedBase()}/api/film.php?id=${movieId}`,
         });
       } else if (tvShowId && seasonNumber && episodeNumber) {
         embedSources.push({
           type: 'frembed',
           id: 'frembed_main',
           label: t('watch.frembedPlayer'),
-          url: `https://frembed.click/api/serie.php?id=${tvShowId}&sa=${seasonNumber}&epi=${episodeNumber}`,
+          url: `${getFrembedBase()}/api/serie.php?id=${tvShowId}&sa=${seasonNumber}&epi=${episodeNumber}`,
         });
       }
     }
 
     // Add custom sources (Movix players)
-    if (customSources && customSources.length > 0) {
-      customSources.forEach((source, index) => {
-        const srcLower = source.toLowerCase();
-        const isSeek = srcLower.includes('embedseek.') || srcLower.includes('seekplayer.') || srcLower.includes('seeks.cloud') || srcLower.includes('seekplays.');
+    const visibleCustomSources = dedupeSeekStreamingEmbeds(
+      customSources,
+      nexusHlsSources,
+    );
+    const seekStreamingCount = visibleCustomSources.filter(isSeekStreamingEmbedUrl).length;
+    let seekStreamingIndex = 0;
+    if (visibleCustomSources.length > 0) {
+      visibleCustomSources.forEach((source, index) => {
+        const isSeek = isSeekStreamingEmbedUrl(source);
+        if (isSeek) seekStreamingIndex += 1;
         embedSources.push({
           type: 'custom',
           id: `custom_${index}`,
-          label: isSeek ? t('watch.seekStreamingPlayer', { n: index + 1 }) : t('watch.movixPlayer', { n: index + 1 }),
+          label: isSeek
+            ? (
+              seekStreamingCount > 1
+                ? t('watch.seekStreamingPlayer', { n: seekStreamingIndex })
+                : t('watch.seekStreaming')
+            )
+            : t('watch.movixPlayer', { n: index + 1 }),
           url: source,
         });
       });
@@ -2071,6 +2511,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         type: 'j1f_main',
         id: 'j1f_main',
         label: t('watch.j1fPlayers', { count: j1fSources.length }),
+        url: '#',
+      });
+    }
+
+    // Add SwiftFlow sources
+    if (swiftflowSources && swiftflowSources.length > 0) {
+      embedSources.push({
+        type: 'swiftflow_main',
+        id: 'swiftflow_main',
+        label: t('watch.swiftflowPlayers', { count: swiftflowSources.length }),
         url: '#',
       });
     }
@@ -2231,6 +2681,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     fstreamSources?.length,
     wiflixSources?.length,
     j1fSources?.length,
+    swiftflowSources?.length,
     viperSources?.length,
     movieId,
     adFreeM3u8Url,
@@ -2241,6 +2692,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     showFstreamMenu,
     showWiflixMenu,
     showJ1fMenu,
+    showSwiftflowMenu,
     showViperMenu,
     showVostfrMenu,
     embedType,
@@ -2281,7 +2733,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // Fonction pour gérer le changement de source
   const handleSourceChange = (sourceType: string, sourceId: string, sourceUrl: string) => {
     // --- Dropdown Toggle Handling (Doesn't close settings) ---
-    if (sourceType === 'darkino_main' || sourceType === 'omega_main' || sourceType === 'multi_main' || sourceType === 'vostfr_main' || sourceType === 'nexus_main' || sourceType === 'fstream_main' || sourceType === 'wiflix_main' || sourceType === 'j1f_main' || sourceType === 'viper_main' || sourceType === 'vox_main' || sourceType === 'rivestream_main' || sourceType === 'bravo_main') {
+    if (sourceType === 'darkino_main' || sourceType === 'omega_main' || sourceType === 'multi_main' || sourceType === 'vostfr_main' || sourceType === 'nexus_main' || sourceType === 'fstream_main' || sourceType === 'wiflix_main' || sourceType === 'j1f_main' || sourceType === 'swiftflow_main' || sourceType === 'viper_main' || sourceType === 'vox_main' || sourceType === 'rivestream_main' || sourceType === 'bravo_main') {
       setShowDarkinoMenu(sourceType === 'darkino_main' ? !showDarkinoMenu : false);
       setShowOmegaMenu(sourceType === 'omega_main' ? !showOmegaMenu : false);
       setShowCoflixMenu(sourceType === 'multi_main' ? !showCoflixMenu : false);
@@ -2290,6 +2742,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       setShowFstreamMenu(sourceType === 'fstream_main' ? !showFstreamMenu : false);
       setShowWiflixMenu(sourceType === 'wiflix_main' ? !showWiflixMenu : false);
       setShowJ1fMenu(sourceType === 'j1f_main' ? !showJ1fMenu : false);
+      setShowSwiftflowMenu(sourceType === 'swiftflow_main' ? !showSwiftflowMenu : false);
       setShowViperMenu(sourceType === 'viper_main' ? !showViperMenu : false);
       setShowVoxMenu(sourceType === 'vox_main' ? !showVoxMenu : false);
       setShowRivestreamMenu(sourceType === 'rivestream_main' ? !showRivestreamMenu : false);
@@ -2340,6 +2793,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const index = parseInt(sourceId.split('_')[1], 10);
       if (j1fSources && j1fSources[index]) {
         targetUrl = j1fSources[index].url || '';
+      }
+    } else if (sourceType === 'swiftflow') {
+      const index = parseInt(sourceId.split('_')[1], 10);
+      if (swiftflowSources && swiftflowSources[index]) {
+        targetUrl = swiftflowSources[index].url || '';
       }
     } else if (sourceType === 'viper') {
       const index = parseInt(sourceId, 10);
@@ -2395,7 +2853,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }, 500);
 
     // Close settings panel for embed sources (keep open for HLS sources to allow quality selection)
-    const embedTypes = ['frembed', 'custom', 'omega', 'coflix', 'vostfr', 'adfree', 'fstream', 'wiflix', 'j1f', 'viper', 'vox'];
+    const embedTypes = ['frembed', 'custom', 'omega', 'coflix', 'vostfr', 'adfree', 'fstream', 'wiflix', 'j1f', 'swiftflow', 'viper', 'vox'];
     if (embedTypes.includes(sourceType)) {
       // For embed sources, always close settings
       setShowSettings(false);
@@ -2488,12 +2946,23 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [src, darkinoSources, nexusHlsSources, nexusFileSources, purstreamSources]);
 
   useEffect(() => {
+    if (isCasting) {
+      postCastPlaybackSuppressedRef.current = true;
+      return;
+    }
+
     const video = videoRef.current;
     if (!video) return;
     // Wait until HLS.js has been dynamically imported before we set up the player.
     // The non-HLS branches (MP4, native canPlayType) only need this guard for the
     // shared types in the cleanup; the effect re-runs once Hls is available.
     if (!Hls) return;
+
+    const playbackPolicy = getLocalPlaybackInitPolicy({
+      wasCasting: postCastPlaybackSuppressedRef.current,
+      isCasting,
+    });
+    if (!playbackPolicy.shouldInitialize) return;
 
     // Clear any existing timeouts when src changes or component unmounts
     const clearBufferingTimeout = () => {
@@ -2520,7 +2989,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       // Timeout long (45s) pour laisser le temps aux flux HLS lents de charger
       sourceTimeoutRef.current = setTimeout(() => {
         console.log('⏰ Source loading timeout after 45 seconds - triggering automatic source switch');
-        handleHlsError();
+        requestHlsFallback();
       }, 45000); // 45 secondes timeout - laisser le temps au lecteur HLS de charger
     };
 
@@ -2590,7 +3059,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
       // Restore position across source switches (e.g. anime player change).
       const mp4ResumeTime = lastKnownTimeRef.current;
-      if (mp4ResumeTime > 0.5) {
+      if (playbackPolicy.shouldRestorePosition && mp4ResumeTime > 0.5) {
         const restoreMp4Position = () => {
           const v = videoRef.current;
           if (!v) return;
@@ -2602,13 +3071,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         videoRef.current.addEventListener('loadedmetadata', restoreMp4Position);
       }
 
-      if (autoPlay) {
+      if (autoPlay && playbackPolicy.shouldAutoplay) {
         safePlay(videoRef.current).catch(e => console.error('Error autoplay:', e));
       }
 
       // Set default quality since no HLS qualities available
-      setQualities([{ height: 720, url: normalizedSrc }]);
-      setCurrentQuality('auto');
+      const initialMp4Options = buildHlsQualityOptions([{ height: 720 }]);
+      qualitiesRef.current = initialMp4Options;
+      setQualities(initialMp4Options);
+      setEffectiveQualityHeight(720);
 
       let mp4MetadataCancelled = false;
       const handleMp4LoadedMetadata = () => {
@@ -2616,8 +3087,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           ? Math.round(video.videoHeight)
           : 720;
 
-        setQualities([{ height: detectedHeight, url: normalizedSrc }]);
-        setCurrentQuality(detectedHeight > 0 ? detectedHeight : 'auto');
+        const detectedMp4Options = buildHlsQualityOptions([{ height: detectedHeight }]);
+        qualitiesRef.current = detectedMp4Options;
+        setQualities(detectedMp4Options);
+        setEffectiveQualityHeight(detectedHeight);
 
         void (async () => {
           const estimatedBitrate = await estimateAverageBitrate(normalizedSrc, video.duration);
@@ -2677,7 +3150,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       };
     } else if (Hls.isSupported()) {
       // Utiliser la configuration HLS optimisée selon le domaine
-      const hlsConfig: any = createHlsConfig(normalizedSrc);
+      const hlsConfig = {
+        ...createHlsConfig(normalizedSrc),
+        autoStartLoad: false,
+      };
       // Cinep/purstream masters can declare direct-.vtt subtitles that crash
       // hls.js — route them through the proxy vttwrap endpoint. Video stays direct.
       const isBravoSrc = Array.isArray(purstreamSources) && purstreamSources.some(s => s.url === normalizedSrc);
@@ -2697,7 +3173,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           ? levelIndex
           : (hls.currentLevel >= 0 ? hls.currentLevel : hls.firstLevel);
         const level = typeof fallbackIndex === 'number' && fallbackIndex >= 0 ? hls.levels[fallbackIndex] : undefined;
-        const qualityLabel = formatDetectedStreamQuality(level);
+        const qualityOptions = buildHlsQualityOptions(hls.levels);
+        const qualityLabel = qualityOptions.length > 1
+          ? formatAvailableHlsQualities(qualityOptions)
+          : formatDetectedStreamQuality(level);
 
         rememberSourceQuality(normalizedSrc, qualityLabel);
       };
@@ -2715,11 +3194,27 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           delete (window as any).fragParsingLateRetries;
         }
 
-        const availableQualities = data.levels.map(level => ({
-          height: level.height,
-          url: level.url
-        }));
-        setQualities(availableQualities);
+        const nextOptions = buildHlsQualityOptions(data.levels);
+        qualitiesRef.current = nextOptions;
+        setQualities(nextOptions);
+
+        const requested = nextOptions.length === 0 ? 'auto' : qualityPreferenceRef.current;
+        const targetLevel = selectLevelForPreference(nextOptions, requested, 1080);
+        if (requested === 'auto') {
+          hls.autoLevelCapping = targetLevel;
+          hls.startLevel = targetLevel;
+          hls.loadLevel = -1;
+        } else if (targetLevel >= 0) {
+          hls.autoLevelCapping = -1;
+          hls.startLevel = targetLevel;
+          hls.loadLevel = targetLevel;
+          hls.nextLoadLevel = targetLevel;
+        } else {
+          hls.autoLevelCapping = -1;
+          hls.startLevel = -1;
+          hls.loadLevel = -1;
+        }
+        hls.startLoad(-1);
         updateCurrentSourceStreamQuality();
 
         // Re-apply playback speed after manifest is parsed
@@ -2754,7 +3249,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
         // Restore position across source switches (e.g. anime player change).
         const hlsResumeTime = lastKnownTimeRef.current;
-        if (hlsResumeTime > 0.5 && videoRef.current) {
+        if (playbackPolicy.shouldRestorePosition && hlsResumeTime > 0.5 && videoRef.current) {
           const seekTarget = hlsResumeTime;
           const trySeek = () => {
             const v = videoRef.current;
@@ -2770,7 +3265,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           trySeek();
         }
 
-        if (autoPlay) {
+        if (autoPlay && playbackPolicy.shouldAutoplay) {
           safePlay(video).catch(e => console.error('Erreur de lecture automatique:', e));
         }
 
@@ -2783,6 +3278,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }));
         setAudioTracks(audioTracksList);
 
+        const rememberedAudio = hlsAudioPreferences.get(contentQualityKey) || null;
+        const restoredAudioIndex = selectAudioTrackIndex(data.audioTracks || [], rememberedAudio);
+        if (restoredAudioIndex >= 0) {
+          hls.audioTrack = restoredAudioIndex;
+          setCurrentAudioTrack(restoredAudioIndex);
+        }
+
         // Désactiver tous les sous-titres par défaut
         video.textTracks.addEventListener('addtrack', (event) => {
           const track = event.track;
@@ -2794,6 +3296,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         Array.from(video.textTracks).forEach(track => {
           track.mode = 'disabled';
         });
+      });
+
+      hls.on(Hls.Events.LEVELS_UPDATED, (_event, data) => {
+        const nextOptions = buildHlsQualityOptions(data.levels);
+        qualitiesRef.current = nextOptions;
+        setQualities(nextOptions);
       });
 
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_) => {
@@ -2836,6 +3344,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
       // Listener pour détecter les fragments chargés avec succès (pour nettoyer la liste des échecs 429)
       hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+        setEffectiveQualityHeight(hls.levels[data.level]?.height || null);
         updateCurrentSourceStreamQuality(data.level);
       });
 
@@ -2858,15 +3367,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
       });
 
-      // Surveillance de la santé du buffer pour prévenir les erreurs
-      hls.on(Hls.Events.BUFFER_APPENDING, () => {
-        // Vérifier l'état de l'élément média avant l'ajout au buffer
-        if (video.error) {
-          console.warn('⚠️ Media element has error state during buffer append, clearing...');
-          video.load(); // Reset l'élément média
-        }
-      });
-
       // Surveillance des niveaux de buffer
       hls.on(Hls.Events.BUFFER_APPENDED, (_event, data) => {
         if (data.type === 'video' || data.type === 'audio') {
@@ -2885,19 +3385,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        // Gestion de l'erreur 403 : auto-switch vers le prochain lecteur HLS disponible
-        if (data.response && (data.response.code === 403 || data.response.code === 4033)) {
-          console.warn('🚫 403/4033 Forbidden error detected - trying next HLS player...');
-          if (sourceTimeoutRef.current) {
-            clearTimeout(sourceTimeoutRef.current);
-            sourceTimeoutRef.current = null;
-          }
-          hls.destroy();
-          setIsLoading(false);
-          handleHlsError();
-          return;
-        }
-
         // A broken/unsupported subtitle must never kill video playback — drop
         // the subtitle track and continue instead of switching source.
         if (isSubtitleLoadError(data)) {
@@ -2909,9 +3396,88 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           return;
         }
 
+        const isAudioLoadError =
+          data.frag?.type === 'audio'
+          || data.details === Hls.ErrorDetails.AUDIO_TRACK_LOAD_ERROR
+          || data.details === Hls.ErrorDetails.AUDIO_TRACK_LOAD_TIMEOUT;
+        if (isAudioLoadError) {
+          console.warn('🔊 Audio track load error:', data.details);
+          const audioDecision = decideHlsAudioFailure(Boolean(data.fatal));
+          if (audioDecision === 'keep-source') {
+            return;
+          }
+          requestHlsFallback();
+          return;
+        }
+
+        if (isVideoLevelFailure(data)) {
+          const failedLevel = getFailingLevelIndex(data, hls);
+          const lowerLevel = selectExactHlsFallbackLevel(qualitiesRef.current, 720);
+          const failedHeight = hls.levels[failedLevel]?.height ?? null;
+          const lowerHeight = hls.levels[lowerLevel]?.height ?? null;
+          const fallbackDecision = decideHlsVideoFallback({
+            activeFallbackLevel: fallbackLevelRef.current,
+            failedHeight,
+            failedLevel,
+            failedLevels: failedLevelsRef.current,
+            lowerHeight,
+            lowerLevel,
+          });
+
+          if (fallbackDecision.action === 'ignore') {
+            return;
+          }
+
+          if (fallbackDecision.action === 'switch-source') {
+            if (failedLevel >= 0) {
+              failedLevelsRef.current.add(failedLevel);
+            }
+            requestHlsFallback();
+            return;
+          }
+
+          if (failedLevel >= 0) {
+            failedLevelsRef.current.add(failedLevel);
+          }
+          fallbackLevelRef.current = fallbackDecision.level;
+          hls.currentLevel = fallbackDecision.level;
+          hls.nextLoadLevel = fallbackDecision.level;
+          hls.loadLevel = fallbackDecision.level;
+          hls.startLoad(videoRef.current?.currentTime ?? -1);
+          showOsd(t('watch.qualityFallback', {
+            from: `${failedHeight ?? 1080}p`,
+            to: `${lowerHeight ?? 720}p`,
+          }));
+          return;
+        }
+
+        // A 403 at the root manifest/source level switches source. Media-level
+        // failures are handled above so audio, subtitles, and video recovery
+        // cannot be pre-empted by this generic branch.
+        const responseCode = data.response?.code;
+        const isRootSourceFailure =
+          data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
+          || data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT
+          || (!data.frag && !Number.isInteger(data.level));
+        if ((responseCode === 403 || responseCode === 4033) && isRootSourceFailure) {
+          console.warn('🚫 403/4033 source error detected - trying next HLS player...');
+          if (sourceTimeoutRef.current) {
+            clearTimeout(sourceTimeoutRef.current);
+            sourceTimeoutRef.current = null;
+          }
+          setIsLoading(false);
+          requestHlsFallback();
+          return;
+        }
+
         // Vérifier si c'est une erreur 429 (Too Many Requests)
         const is429Error = data.response && data.response.code === 429;
         const isPulseTopstrime = src.includes('pulse.topstrime.online');
+
+        if (is429Error && isPulseTopstrime) {
+          handle429Error(hls, videoRef, data, src, requestHlsFallback);
+          return;
+        }
 
         // Gestion spécifique des erreurs audio/vidéo
         if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
@@ -2933,11 +3499,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               console.error(`❌ Too many buffer stalled errors (${(window as any).bufferStalledRetryCount[retryKey]}), switching source...`);
               (window as any).bufferStalledRetryCount[retryKey] = 0; // Reset le compteur
               setTimeout(() => {
-                // Déclencher le changement de source via un événement personnalisé
-                const sourceChangeEvent = new CustomEvent('forceSourceChange', {
-                  detail: { reason: 'too_many_buffer_stalled_errors', url: src }
-                });
-                window.dispatchEvent(sourceChangeEvent);
+                requestHlsFallback(undefined, src);
               }, 1000);
               return;
             }
@@ -2959,53 +3521,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             return;
           }
 
-          // Gestion spécifique des erreurs de buffer append
-          if (data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR) {
-            console.error('🚨 Buffer append error detected - attempting recovery...');
-
-            // Sauvegarder la position actuelle
-            const currentTime = videoRef.current?.currentTime || 0;
-            const wasPlaying = !videoRef.current?.paused;
-
-            if (videoRef.current && hlsRef.current) {
-              // Utiliser la fonction utilitaire pour réinitialiser l'état d'erreur
-              resetMediaElementError(videoRef.current).then(() => {
-                if (hlsRef.current && videoRef.current) {
-                  console.log('🔄 Reattaching HLS after buffer append error...');
-
-                  // Détacher et réattacher HLS pour un reset complet
-                  hlsRef.current.detachMedia();
-                  hlsRef.current.attachMedia(videoRef.current);
-                  // Le proxy sera automatiquement appliqué par xhrSetup si nécessaire
-                  hlsRef.current.loadSource(src);
-
-                  // Restaurer la position et l'état de lecture
-                  const onLoadedMetadata = () => {
-                    if (videoRef.current) {
-                      videoRef.current.currentTime = Math.max(0, currentTime - 2); // Reculer légèrement
-                      if (wasPlaying) {
-                        safePlay(videoRef.current).catch(e => console.error('Error resuming playback:', e));
-                      }
-                      videoRef.current.removeEventListener('loadedmetadata', onLoadedMetadata);
-                    }
-                  };
-                  videoRef.current.addEventListener('loadedmetadata', onLoadedMetadata);
-                }
-              }).catch((error) => {
-                console.error('❌ Failed to recover from buffer append error:', error);
-                // Si la récupération échoue, déclencher le changement de source
-                setTimeout(() => {
-                  handleHlsError();
-                }, 1000);
-              });
-              return;
-            }
-          }
-
           if (data.details === Hls.ErrorDetails.FRAG_PARSING_ERROR) {
             console.warn('🔊 Fragment parsing error detected:', data);
 
-            const currentTime = videoRef.current?.currentTime || 0;
+            const video = videoRef.current;
+            if (!video) return;
+            const shouldResumeFragRecovery = !video.paused || playbackPolicy.shouldAutoplay;
+            const currentTime = video.currentTime || 0;
             const isEarlyError = currentTime < 30; // Dans les 30 premières secondes
             const failedFragSN = data.frag?.sn;
 
@@ -3035,18 +3557,20 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
               // Attendre un peu puis redémarrer en sautant
               setTimeout(() => {
-                if (hlsRef.current && videoRef.current) {
-                  hlsRef.current.startLoad(skipTime);
+                if (hlsRef.current === hls && videoRef.current === video) {
+                  hls.startLoad(skipTime);
 
                   const onCanPlay = () => {
-                    if (videoRef.current) {
-                      videoRef.current.currentTime = skipTime;
-                      safePlay(videoRef.current).catch(e => console.error('Error resuming playback:', e));
-                      videoRef.current.removeEventListener('canplay', onCanPlay);
+                    if (hlsRef.current === hls && videoRef.current === video) {
+                      video.currentTime = skipTime;
+                      if (shouldResumeFragRecovery) {
+                        safePlay(video).catch(e => console.error('Error resuming playback:', e));
+                      }
+                      video.removeEventListener('canplay', onCanPlay);
                       console.log(`✅ Playback resumed at ${skipTime}s`);
                     }
                   };
-                  videoRef.current.addEventListener('canplay', onCanPlay);
+                  video.addEventListener('canplay', onCanPlay);
                 }
               }, 500);
 
@@ -3124,7 +3648,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
               // Déclencher le changement de source
               setTimeout(() => {
-                handleHlsError();
+                requestHlsFallback();
               }, 500);
 
               return;
@@ -3145,9 +3669,27 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           if (isDnsLikeError(data)) {
             let host: string | undefined;
             try { host = new URL(src).hostname; } catch { /* ignore */ }
-            const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
-            notifyDnsBlocked({ host, details: data.details, switched });
-            if (switched) return;
+            requestHlsFallback(() => {
+              const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
+              notifyDnsBlocked({ host, details: data.details, switched });
+              if (!switched) {
+                void handleHlsErrorRef.current?.();
+              }
+            });
+            return;
+          }
+
+          const responseCode = data.response?.code;
+          const mustSwitchSource =
+            data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+            (data.fatal && (responseCode === 404 || responseCode === 0));
+
+          if (mustSwitchSource) {
+            console.error('📋 HLS source load error - switching source...', data.details);
+            setTimeout(() => {
+              requestHlsFallback();
+            }, 1000);
+            return;
           }
 
           if (data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR) {
@@ -3155,19 +3697,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             hls.startLoad();
             return;
           }
-
-          if (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR) {
-            console.error('📋 Manifest load error - switching source...');
-            setTimeout(() => {
-              handleHlsError();
-            }, 1000);
-            return;
-          }
-        }
-
-        if (is429Error && isPulseTopstrime) {
-          handle429Error(hlsRef.current, videoRef, data, src);
-          return;
         }
 
         if (data.fatal) {
@@ -3176,9 +3705,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           if (isDnsLikeError(data)) {
             let host: string | undefined;
             try { host = new URL(src).hostname; } catch { /* ignore */ }
-            const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
-            notifyDnsBlocked({ host, details: data.details, switched });
-            if (switched) return;
+            requestHlsFallback(() => {
+              const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
+              notifyDnsBlocked({ host, details: data.details, switched });
+              if (!switched) {
+                void handleHlsErrorRef.current?.();
+              }
+            });
+            return;
           }
 
           // Logique de récupération améliorée avant le changement de source
@@ -3195,16 +3729,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               (window as any).hlsRecoveryAttempts[recoveryKey] = currentAttempts + 1;
 
               console.log(`🔄 Attempting media error recovery (${currentAttempts + 1}/2)...`);
-
-              // Stratégie de récupération différente selon le type d'erreur
-              if (data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR) {
-                // Déjà géré par le code spécifique plus haut
-                return;
-              } else {
-                // Autres erreurs média
-                hls.recoverMediaError();
-                return;
-              }
+              setHasFatalPlaybackError(false);
+              hls.recoverMediaError();
+              return;
             } else {
               console.warn('⚠️ Max recovery attempts reached, switching source...');
               // Reset le compteur pour cette erreur
@@ -3212,11 +3739,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             }
           }
 
+          setHasFatalPlaybackError(true);
           console.log('🔄 Triggering automatic source switching...');
 
           // Déclencher le changement automatique de source après un court délai
           setTimeout(() => {
-            handleHlsError();
+            requestHlsFallback();
           }, 500);
         } else {
           console.warn('⚠️ HLS Non-fatal Error:', data.type, data.details);
@@ -3242,12 +3770,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.removeEventListener('playing', handlePlaying);
         video.removeEventListener('progress', handleProgress);
         hls.destroy();
-        hlsRef.current = null;
+        if (hlsRef.current === hls) {
+          hlsRef.current = null;
+        }
       };
     } else {
       // For browsers that don't support HLS.js (like Safari)
       video.src = normalizedSrc;
-      if (autoPlay) {
+      if (autoPlay && playbackPolicy.shouldAutoplay) {
         safePlay(video).catch(e => console.error('Error autoplay in fallback mode:', e));
       }
 
@@ -3272,7 +3802,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.src = '';
       };
     }
-  }, [src, autoPlay, onEnded, onError, subtitleUrl, Hls]); // REMOVED playbackSpeed
+  }, [src, autoPlay, subtitleUrl, Hls, requestHlsFallback, isCasting]); // REMOVED playbackSpeed
 
   // Auto next episode preference (must be declared before useEffect that references it)
   const [autoNextEpisodeEnabled, setAutoNextEpisodeEnabled] = useState(() => {
@@ -4145,6 +4675,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (!video) return;
 
     if (video.paused) {
+      postCastPlaybackSuppressedRef.current = false;
       video.play()
         .then(() => {
           setIsPlaying(true);
@@ -4767,19 +5298,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   const toggleCast = () => {
     if (isCasting) {
-      // Disconnect from cast
-      if (nativeCastBridge) {
-        nativeCastBridge.stop().catch((err: unknown) => {
-          console.warn('Native cast stop failed:', err);
-        });
-        // isCasting will flip to false when CAST_SESSION_ENDED fires
-        return;
-      }
-      if (castSession) {
-        castSession.stop();
-        setCastSession(null);
-        setIsCasting(false);
-      }
+      void runCastCommand(() => castController?.stop() ?? Promise.resolve());
     } else {
       // Start casting immediately without showing menu
       setShowControls(true);
@@ -4789,9 +5308,30 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
       setShowCastMenu(false);
       // Fire and forget; internal loading states are handled within startCasting
-      startCasting();
+      void startCasting();
     }
   };
+
+  const keepControlsVisibleAfterInteraction = useCallback(() => {
+    setShowControls(true);
+    if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+    controlsTimeoutRef.current = undefined;
+    if (!isPlaying || showCastMenu) return;
+    controlsTimeoutRef.current = setTimeout(() => {
+      setShowControls(false);
+      setShowVolumeSlider(false);
+      controlsTimeoutRef.current = undefined;
+    }, 5_000);
+  }, [isPlaying, showCastMenu]);
+
+  const handlePlayerControlInteractionCapture = useCallback(
+    (event: React.SyntheticEvent) => {
+      if (isPlayerControlInteractionTarget(event.target)) {
+        keepControlsVisibleAfterInteraction();
+      }
+    },
+    [keepControlsVisibleAfterInteraction],
+  );
 
   // Function to ensure video element is properly configured for AirPlay
   /**
@@ -4958,128 +5498,175 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   };
 
-  const loadCurrentMediaOnCastSession = useCallback(async (session: any) => {
+  const buildCurrentCastSource = useCallback(async (): Promise<CastSource> => {
+    const streams = src.includes('.m3u8')
+      ? await parseM3u8Manifest(src)
+      : [];
+    const bestStream = streams.length > 0 ? selectBestStream(streams) : null;
+    const streamUrl = bestStream?.url || src;
+    const preferredStreamUrl = await preferFrenchAudioVariant(streamUrl, src);
+    return {
+      url: preferredStreamUrl,
+      contentType: preferredStreamUrl.includes('.mp4')
+        ? 'video/mp4'
+        : 'application/vnd.apple.mpegurl',
+      title: title || tvShow?.name || 'Movix',
+      poster: poster
+        ? (poster.startsWith('http')
+          ? poster
+          : `https://image.tmdb.org/t/p/w500${poster}`)
+        : undefined,
+      currentTimeSec: videoRef.current?.currentTime || 0,
+      tracks: subtitleUrl
+        ? [{
+            url: subtitleUrl,
+            contentType: 'text/vtt',
+            language: 'fr',
+            name: 'Français',
+            active: currentSubtitle !== 'off',
+          }]
+        : [],
+    };
+  }, [currentSubtitle, poster, src, subtitleUrl, title, tvShow?.name]);
+
+  const createWebControllerForSession = useCallback((session: any) => {
+    setCastSession(session);
+    return createWebCastRemoteController(session, async source => {
+      const subtitles = (source.tracks ?? []).map(track => ({
+        url: track.url,
+        language: track.language ?? 'fr',
+        label: track.name ?? track.language ?? 'Sous-titres',
+      }));
+      await loadMediaOnCastWithFallback(
+        session,
+        source.url,
+        source.title,
+        source.poster,
+        source.currentTimeSec ?? 0,
+        isPlaying,
+        subtitles,
+        (source.tracks ?? []).some(track => track.active),
+        'BUFFERED',
+      );
+    });
+  }, [isPlaying]);
+
+  const loadCurrentMediaOnCastController = useCallback(async (
+    controller: CastRemoteController,
+  ) => {
     const mySrc = src;
-    // Dedupe concurrent loads of the same src (startCasting + SESSION_STARTED
-    // both call this for a fresh session).
-    if (castLoadInFlightRef.current === mySrc) {
-      console.log('[Cast] Load already in flight for this src, skipping duplicate');
-      return;
-    }
+    if (castLoadInFlightRef.current === mySrc) return;
     castLoadInFlightRef.current = mySrc;
     try {
       setIsCastLoading(true);
       setCastError(null);
       setShowCastMenu(false);
-      setCastSession(session);
-
-      // Parse M3U8 manifest to get streams and subtitles
-      let streams: any[] = [];
-      if (src.includes('.m3u8')) {
-        streams = await parseM3u8Manifest(src);
-      }
-
-      // Select best stream (French priority)
-      const bestStream = streams.length > 0 ? selectBestStream(streams) : null;
-      const streamUrl = bestStream?.url || src;
-      // If provider encodes audio track in variant (-a1/-a2), prefer French audio
-      const preferredStreamUrl = await preferFrenchAudioVariant(streamUrl, src);
-      if (preferredStreamUrl !== streamUrl) {
-        console.log('Cast chosen stream URL (prefer FR):', { original: streamUrl, preferred: preferredStreamUrl });
-      }
-
-      // Build subtitle tracks for the cast — only the externally-supplied
-      // VOSTFR track today. Internal HLS subtitle tracks are already inside
-      // the manifest, the receiver handles those natively. Activate them on
-      // the receiver only if the user had subtitles visible locally.
-      const subtitlesForCast = subtitleUrl
-        ? [{ url: subtitleUrl, language: 'fr', label: 'Français' }]
-        : [];
-      const enableSubsOnCast = subtitlesForCast.length > 0 && currentSubtitle !== 'off';
-
-      // Load media on cast device — try multiple HLS content-types in case
-      // the receiver rejects our first MIME choice (some Chromecasts only
-      // accept lowercase "application/x-mpegurl", others want the RFC 8216
-      // "application/vnd.apple.mpegurl"). Cinepulse does the same.
-      await loadMediaOnCastWithFallback(
-        session,
-        preferredStreamUrl,
-        title || tvShow?.name || 'Media',
-        poster,
-        videoRef.current?.currentTime || 0,
-        isPlaying,
-        subtitlesForCast,
-        enableSubsOnCast,
-        // VOD content (movies / episodes) is seekable — BUFFERED is correct here
-        // (LIVE is only used by LiveTVPlayer for live channels).
-        'BUFFERED',
-      );
-
-      setIsCasting(true);
-      lastLoadedCastSrcRef.current = src;
-
-      console.log('Successfully started casting with language selection');
-
+      await controller.load(await buildCurrentCastSource());
+      lastLoadedCastSrcRef.current = mySrc;
+      applyAuthoritativeCastStatus(await controller.getStatus());
     } catch (error) {
-      // A newer load for a different src cancelled this one on the receiver
-      // (LOAD_INTERRUPTED / error 904). Expected during episode/server
-      // switches — not a user-facing failure.
-      if (castLoadInFlightRef.current !== mySrc) {
-        console.log('[Cast] Load superseded by a newer source, ignoring error');
-        return;
-      }
-      console.error('Error starting cast:', error);
-      setCastError(error instanceof Error ? error.message : t('watch.castError'));
-      // Keep menu open so the user actually sees the error message.
+      if (castLoadInFlightRef.current !== mySrc) return;
+      setCastError(t(getCastRelayErrorTranslationKey(error)));
       setShowCastMenu(true);
     } finally {
-      // Only the owning load clears the in-flight marker / spinner — a
-      // superseded load must not wipe the state of the one that replaced it.
       if (castLoadInFlightRef.current === mySrc) {
         castLoadInFlightRef.current = null;
         setIsCastLoading(false);
       }
     }
-  }, [isPlaying, poster, src, t, title, tvShow?.name, subtitleUrl, currentSubtitle]);
+  }, [applyAuthoritativeCastStatus, buildCurrentCastSource, src, t]);
 
-  const startCasting = async () => {
+  const startCasting = async (skipRelayDisclosure = false) => {
     // Native Android WebView path — route through the on-device Google Cast SDK.
     if (nativeCastBridge) {
+      if (!nativeCastConfigured) {
+        setCastError(t('watch.castConfigurationError'));
+        setShowCastMenu(true);
+        return;
+      }
+
+      if (!skipRelayDisclosure) {
+        let isSuppressed = relayDisclosureSuppressed;
+        if (isSuppressed === null) {
+          try {
+            isSuppressed =
+              await nativeCastBridge.getRelayDisclosurePreference();
+          } catch {
+            isSuppressed = false;
+          }
+          setRelayDisclosureSuppressedState(isSuppressed);
+        }
+        if (shouldShowCastRelayDisclosure({
+          isAndroidNative: true,
+          isSuppressed,
+        })) {
+          setShowCastRelayDisclosure(true);
+          setShowCastMenu(false);
+          return;
+        }
+      }
+
+      const nativeCastSrc = src;
+      if (castLoadInFlightRef.current === nativeCastSrc) return;
+      castLoadInFlightRef.current = nativeCastSrc;
+
       try {
         setIsCastLoading(true);
         setCastError(null);
 
-        // Same FR-preference logic as the web path so the Chromecast gets the
-        // French audio track when the provider exposes multiple audio variants.
-        let streams: MediaStream[] = [];
-        if (src.includes('.m3u8')) {
-          streams = await parseM3u8Manifest(src);
-        }
-        const bestStream = streams.length > 0 ? selectBestStream(streams) : null;
-        const streamUrl = bestStream?.url || src;
-        const preferredStreamUrl = await preferFrenchAudioVariant(streamUrl, src);
-
-        const finalUrl = preferredStreamUrl;
+        const finalUrl = await prepareCastSourceWithFallback({
+          fallbackUrl: src,
+          timeoutMs: 1_500,
+          prepare: async () => {
+            const streams = src.includes('.m3u8')
+              ? await parseM3u8Manifest(src)
+              : [];
+            const bestStream = streams.length > 0 ? selectBestStream(streams) : null;
+            const streamUrl = bestStream?.url || src;
+            return preferFrenchAudioVariant(streamUrl, src);
+          },
+        });
 
         const posterUrl = poster
           ? (poster.startsWith('http') ? poster : `https://image.tmdb.org/t/p/w500${poster}`)
           : null;
 
-        await nativeCastBridge.loadMedia(
-          finalUrl,
-          title || tvShow?.name || 'Movix',
-          posterUrl,
-          videoRef.current?.currentTime || 0,
-        );
+        const controller =
+          castController ?? createAndroidCastRemoteController(nativeCastBridge);
+        if (!castController) setCastController(controller);
+        await controller.load({
+          url: finalUrl,
+          contentType: finalUrl.includes('.mp4')
+            ? 'video/mp4'
+            : 'application/vnd.apple.mpegurl',
+          title: title || tvShow?.name || 'Movix',
+          poster: posterUrl ?? undefined,
+          currentTimeSec: videoRef.current?.currentTime || 0,
+          tracks: subtitleUrl
+            ? [{
+                url: subtitleUrl,
+                contentType: 'text/vtt',
+                language: 'fr',
+                name: 'Français',
+                active: currentSubtitle !== 'off',
+              }]
+            : [],
+        });
+        applyAuthoritativeCastStatus(await controller.getStatus());
         // Track what we loaded so the src-change effect doesn't reload on every render.
-        lastLoadedCastSrcRef.current = src;
+        lastLoadedCastSrcRef.current = nativeCastSrc;
         // Session state (isCasting, loading done) is driven by
         // CAST_SESSION_STARTED / FAILED events dispatched by the native bridge.
       } catch (error) {
         console.error('Native cast failed:', error);
-        setCastError(error instanceof Error ? error.message : t('watch.castError'));
+        if (castLoadInFlightRef.current !== nativeCastSrc) return;
+        setCastError(t(getCastRelayErrorTranslationKey(error)));
         setShowCastMenu(true);
-        setIsCastLoading(false);
+      } finally {
+        if (castLoadInFlightRef.current === nativeCastSrc) {
+          castLoadInFlightRef.current = null;
+          setIsCastLoading(false);
+        }
       }
       return;
     }
@@ -5087,7 +5674,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     try {
       // Ask for the cast session immediately while we are still inside the user gesture.
       const session = castSession ?? await requestCastSession();
-      await loadCurrentMediaOnCastSession(session);
+      const controller =
+        castController?.kind === 'web'
+          ? castController
+          : createWebControllerForSession(session);
+      if (castController !== controller) setCastController(controller);
+      await loadCurrentMediaOnCastController(controller);
     } catch (error) {
       console.error('Error starting cast session:', error);
       setCastError(error instanceof Error ? error.message : t('watch.castError'));
@@ -5104,47 +5696,46 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   const handleCastSessionUpdate = (session: any) => {
     setCastSession(session);
-    setIsCasting(!!session);
+    if (session && castController?.kind !== 'web') {
+      setCastController(createWebControllerForSession(session));
+    }
   };
 
   const handleCastSessionEnd = () => {
     setCastSession(null);
-    setIsCasting(false);
+    setCastController(current => current?.kind === 'web' ? null : current);
+    applyAuthoritativeCastStatus({
+      connected: false,
+      deviceName: null,
+      mediaSessionId: null,
+      state: 'idle',
+      positionSec: 0,
+      durationSec: null,
+      canSeek: false,
+    });
     setCastCurrentTime(0);
     setCastDuration(0);
     lastLoadedCastSrcRef.current = null;
   };
 
-  // Function to update cast progress
-  const updateCastProgress = useCallback(() => {
-    if (!isCasting || !castSession || isCastDragging) return;
-
-    try {
-      const session: any = castSession;
-      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-      if (!media) return;
-
-      const current = media.getEstimatedTime ? media.getEstimatedTime() : (media.currentTime || 0);
-      const duration = media.getDuration ? media.getDuration() : (media.duration || 0);
-
-      setCastCurrentTime(current);
-      setCastDuration(duration);
-    } catch (e) {
-      console.error('Error updating cast progress:', e);
-    }
-  }, [isCasting, castSession, isCastDragging]);
-
-  // Update cast progress every second
+  // Interpolate only while the last authoritative status says "playing".
+  // Each native/web status event resets this value through
+  // applyAuthoritativeCastStatus.
   useEffect(() => {
-    if (!isCasting) return;
+    if (!isCasting || castStatus.state !== 'playing' || isCastDragging) return;
 
-    const interval = setInterval(updateCastProgress, 1000);
+    const interval = setInterval(() => {
+      setCastCurrentTime(current => Math.min(
+        castStatus.durationSec ?? Number.POSITIVE_INFINITY,
+        current + 1,
+      ));
+    }, 1000);
     return () => clearInterval(interval);
-  }, [isCasting, updateCastProgress]);
+  }, [castStatus.durationSec, castStatus.state, isCastDragging, isCasting]);
 
   // Cast progress bar handlers
   const handleCastProgressClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     if (!currentDuration || isCastDragging) return;
 
     const rect = e.currentTarget.getBoundingClientRect();
@@ -5163,7 +5754,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     progressBar.style.setProperty('--slider-pointer', `${fillPercentage}%`);
 
     seekCastTo(newTime);
-  }, [castDuration, duration, isCastDragging]);
+  }, [castDuration, isCastDragging]);
 
   const handleCastProgressDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     setIsCastDragging(true);
@@ -5173,7 +5764,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const percentage = Math.max(0, Math.min(1, x / rect.width));
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     const newTime = percentage * currentDuration;
     setCastDragTime(newTime);
 
@@ -5182,11 +5773,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (element) {
       element.setAttribute('data-dragging', 'true');
     }
-  }, [castDuration, duration]);
+  }, [castDuration]);
 
   const handleCastProgressDragMove = useCallback((e: MouseEvent) => {
     e.preventDefault();
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     if (!isCastDragging || !currentDuration) return;
 
     const progressBar = document.querySelector('.cast-progress-bar') as HTMLDivElement;
@@ -5204,10 +5795,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     progressBar.style.setProperty('--slider-progress', `${fillPercentage}%`);
     progressBar.style.setProperty('--slider-fill', `${fillPercentage}%`);
     progressBar.style.setProperty('--slider-pointer', `${fillPercentage}%`);
-  }, [isCastDragging, castDuration, duration]);
+  }, [isCastDragging, castDuration]);
 
   const handleCastProgressDragEnd = useCallback(() => {
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     if (!isCastDragging || !currentDuration) return;
 
     setIsCastDragging(false);
@@ -5230,27 +5821,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         progressBar.style.setProperty('--slider-pointer', `${finalPercentage}%`);
       }
     }, 100);
-  }, [isCastDragging, castDuration, duration, castDragTime, castCurrentTime]);
+  }, [isCastDragging, castDuration, castDragTime, castCurrentTime]);
 
   const seekCastTo = useCallback((time: number) => {
-    if (!castSession) return;
-
-    try {
-      const session: any = castSession;
-      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-      if (!media) return;
-
-      if ((window as any).chrome?.cast?.media) {
-        const req = new (window as any).chrome.cast.media.SeekRequest();
-        req.currentTime = time;
-        media.seek(req, () => { }, () => { });
-      } else if (typeof media.seek === 'function') {
-        media.seek(time, () => { }, () => { });
-      }
-    } catch (e) {
-      console.error('Cast seek failed:', e);
-    }
-  }, [castSession]);
+    if (!castController) return;
+    setCastCurrentTime(time);
+    void runCastCommand(() => castController.seekTo(time));
+  }, [castController, runCastCommand]);
 
   // Touch handlers for cast progress bar
   const handleCastProgressTouchStart = useCallback((e: React.TouchEvent) => {
@@ -5258,7 +5835,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const rect = e.currentTarget.getBoundingClientRect();
     const x = touch.clientX - rect.left;
     const percentage = Math.max(0, Math.min(100, (x / rect.width) * 100));
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     const newTime = (percentage / 100) * currentDuration;
 
     setIsCastDragging(true);
@@ -5269,7 +5846,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     element.style.setProperty('--slider-progress', `${percentage}%`);
     element.style.setProperty('--slider-fill', `${percentage}%`);
     element.style.setProperty('--slider-pointer', `${percentage}%`);
-  }, [castDuration, duration]);
+  }, [castDuration]);
 
   const handleCastProgressTouchMove = useCallback((e: React.TouchEvent) => {
     if (!isCastDragging) return;
@@ -5278,7 +5855,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const rect = e.currentTarget.getBoundingClientRect();
     const x = touch.clientX - rect.left;
     const percentage = Math.max(0, Math.min(100, (x / rect.width) * 100));
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     const newTime = (percentage / 100) * currentDuration;
 
     setCastDragTime(newTime);
@@ -5288,7 +5865,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     element.style.setProperty('--slider-progress', `${percentage}%`);
     element.style.setProperty('--slider-fill', `${percentage}%`);
     element.style.setProperty('--slider-pointer', `${percentage}%`);
-  }, [isCastDragging, castDuration, duration]);
+  }, [isCastDragging, castDuration]);
 
   const handleCastProgressTouchEnd = useCallback((e: React.TouchEvent) => {
     if (!isCastDragging) return;
@@ -5297,7 +5874,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const rect = e.currentTarget.getBoundingClientRect();
     const x = touch.clientX - rect.left;
     const percentage = Math.max(0, Math.min(100, (x / rect.width) * 100));
-    const currentDuration = castDuration || duration;
+    const currentDuration = castDuration;
     const newTime = (percentage / 100) * currentDuration;
 
     setIsCastDragging(false);
@@ -5307,12 +5884,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Re-sync CSS variables with final state
     setTimeout(() => {
       const element = e.currentTarget as HTMLElement;
-      const finalPercentage = currentDuration > 0 ? ((castCurrentTime || currentTime) / currentDuration) * 100 : 0;
+      const finalPercentage = currentDuration > 0
+        ? (castCurrentTime / currentDuration) * 100
+        : 0;
       element.style.setProperty('--slider-progress', `${finalPercentage}%`);
       element.style.setProperty('--slider-fill', `${finalPercentage}%`);
       element.style.setProperty('--slider-pointer', `${finalPercentage}%`);
     }, 100);
-  }, [isCastDragging, castDuration, duration, castCurrentTime, currentTime, seekCastTo]);
+  }, [isCastDragging, castDuration, castCurrentTime, seekCastTo]);
 
   // Add event listeners for cast progress bar dragging
   useEffect(() => {
@@ -5426,6 +6005,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
 
       setCastSession(session);
+      const controller = createWebControllerForSession(session);
+      setCastController(controller);
 
       const isResumed =
         sessionState === castFramework?.SessionState?.SESSION_RESUMED ||
@@ -5437,7 +6018,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       // push new media only when the user actually switches episode/server.
       if (isResumed && Array.isArray(session.media) && session.media.length > 0) {
         lastLoadedCastSrcRef.current = src;
-        setIsCasting(true);
+        void controller.getStatus().then(applyAuthoritativeCastStatus);
         return;
       }
 
@@ -5447,7 +6028,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         isResumed;
 
       if (shouldLoadMedia) {
-        void loadCurrentMediaOnCastSession(session);
+        void loadCurrentMediaOnCastController(controller);
       }
     };
 
@@ -5482,7 +6063,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         castContext.removeEventListener(castStateEvent, handleCastStateChanged);
       }
     };
-  }, [loadCurrentMediaOnCastSession, castSdkReady, src]);
+  }, [
+    applyAuthoritativeCastStatus,
+    castSdkReady,
+    createWebControllerForSession,
+    loadCurrentMediaOnCastController,
+    src,
+  ]);
 
   // Detect the Movix Android app WebView cast bridge.
   // When the React Native shell injects window.MovixAndroidCast, we route
@@ -5490,77 +6077,54 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // (chrome.cast is not available inside Android WebView).
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const bridge = (window as any).MovixAndroidCast;
+    const bridge = window.MovixAndroidCast;
     if (!bridge || typeof bridge.isSupported !== 'function') return;
+    if (!isMovixAndroidCastBridgeCompatible(bridge)) {
+      setNativeCastBridge(null);
+      setNativeCastConfigured(false);
+      return;
+    }
 
     let cancelled = false;
+    setNativeCastBridge(bridge);
+    setCastAvailable(true);
     bridge
       .isSupported()
       .then((supported: boolean) => {
-        if (cancelled || !supported) return;
-        setNativeCastBridge(bridge);
-        setCastAvailable(true);
+        if (cancelled) return;
+        if (!supported) {
+          setNativeCastConfigured(false);
+          setCastError(t('watch.castConfigurationError'));
+          return;
+        }
+        setNativeCastConfigured(true);
+        setCastController(createAndroidCastRemoteController(bridge));
+        void bridge.getRelayDisclosurePreference()
+          .then(suppressed => {
+            if (!cancelled) setRelayDisclosureSuppressedState(suppressed);
+          })
+          .catch(() => {
+            if (!cancelled) setRelayDisclosureSuppressedState(false);
+          });
       })
       .catch(() => {
+        if (!cancelled) {
+          setNativeCastConfigured(false);
+          setCastError(t('watch.castConfigurationError'));
+        }
         /* no-op — Cast stays disabled on devices without Play Services */
       });
 
-    const onSessionStarted = () => {
-      setIsCasting(true);
-      setIsCastLoading(false);
-      setCastError(null);
-      // NB: lastLoadedCastSrcRef is set when startCasting actually queues a
-      // media load; don't overwrite it here because the src may have changed
-      // between queueing and device selection.
-    };
-    const onSessionEnded = () => {
-      setIsCasting(false);
-      setIsCastLoading(false);
-      lastLoadedCastSrcRef.current = null;
-    };
-    const onSessionFailed = (event: Event) => {
-      const detail = (event as CustomEvent).detail ?? {};
-      setIsCasting(false);
-      setIsCastLoading(false);
-      setCastError(
-        typeof detail.error === 'number'
-          ? `${t('watch.castError')} (code ${detail.error})`
-          : t('watch.castError'),
-      );
-      setShowCastMenu(true);
-    };
-
-    window.addEventListener('CAST_SESSION_STARTED', onSessionStarted);
-    window.addEventListener('CAST_SESSION_RESUMED', onSessionStarted);
-    window.addEventListener('CAST_SESSION_ENDED', onSessionEnded);
-    window.addEventListener('CAST_SESSION_FAILED', onSessionFailed);
-
     return () => {
       cancelled = true;
-      window.removeEventListener('CAST_SESSION_STARTED', onSessionStarted);
-      window.removeEventListener('CAST_SESSION_RESUMED', onSessionStarted);
-      window.removeEventListener('CAST_SESSION_ENDED', onSessionEnded);
-      window.removeEventListener('CAST_SESSION_FAILED', onSessionFailed);
     };
-  }, [src, t]);
+  }, [t]);
 
   useEffect(() => {
-    if (!castSession || !isCasting) return;
+    if (!castController || !isCasting) return;
     if (lastLoadedCastSrcRef.current === src) return;
-
-    void loadCurrentMediaOnCastSession(castSession);
-  }, [castSession, isCasting, loadCurrentMediaOnCastSession, src]);
-
-  // Native Android cast: when the source changes mid-cast (e.g. next episode),
-  // push the new media to the existing cast session.
-  useEffect(() => {
-    if (!nativeCastBridge || !isCasting) return;
-    if (lastLoadedCastSrcRef.current === src) return;
-    void startCasting();
-    // startCasting is recreated each render and deliberately excluded; the
-    // guard above already prevents loops.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nativeCastBridge, isCasting, src]);
+    void loadCurrentMediaOnCastController(castController);
+  }, [castController, isCasting, loadCurrentMediaOnCastController, src]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -5680,6 +6244,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   const handleAudioTrackChange = (trackId: number) => {
     if (hlsRef.current) {
+      const track = audioTracks.find(item => item.id === trackId);
+      if (track) {
+        hlsAudioPreferences.set(contentQualityKey, {
+          language: track.language,
+          name: track.name,
+        });
+      }
       hlsRef.current.audioTrack = trackId;
       setCurrentAudioTrack(trackId);
       setShowSettings(false);
@@ -5914,19 +6485,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     };
   }, [saveProgress]);
 
-  // Écouter les événements de changement de source forcé
-  useEffect(() => {
-    const handleForceSourceChange = (event: CustomEvent) => {
-      console.log('🔄 Force source change event received:', event.detail);
-      handleHlsError();
-    };
-
-    window.addEventListener('forceSourceChange', handleForceSourceChange as EventListener);
-    return () => {
-      window.removeEventListener('forceSourceChange', handleForceSourceChange as EventListener);
-    };
-  }, []);
-
   // Helper function to determine if next content popup should be shown
   const shouldShowNextContent = (currentTime: number, duration: number): boolean => {
     if (!duration || duration === 0) return false;
@@ -5971,6 +6529,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const handleVideoClick = (e: React.MouseEvent<HTMLDivElement>) => {
     // Ignore click if a touch gesture is active or just ended
     if (touchActiveRef.current || ignoreNextClickRef.current) {
+      return;
+    }
+
+    if (isPlayerControlInteractionTarget(e.target)) {
+      keepControlsVisibleAfterInteraction();
       return;
     }
 
@@ -6447,11 +7010,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         } else {
           console.error("HLS not supported, and trying to play non-MP4 source.");
           setLoadingError(true);
-          // Don't call onError immediately, let the parent handle fallback to other sources
-          if (onError) {
-            console.log("HLS not supported, calling onError to try other source types");
-            onError();
-          }
+          console.log("HLS not supported, requesting an automatic fallback");
+          requestHlsFallback();
           return;
         }
       }
@@ -6460,11 +7020,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const hls = hlsRef.current;
       if (!hls) { // Should not happen if HLS is supported
         setLoadingError(true);
-        // Don't call onError immediately, let the parent handle fallback to other sources
-        if (onError) {
-          console.log("HLS instance not available, calling onError to try other source types");
-          onError();
-        }
+        console.log("HLS instance not available, requesting an automatic fallback");
+        requestHlsFallback();
         return;
       }
 
@@ -6521,8 +7078,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const nextIndex = currentNexusHlsIndex + 1;
       setCurrentNexusHlsIndex(nextIndex);
       const nextSource = nexusHlsSources[nextIndex];
+      const currentSource = nexusHlsSources[currentNexusHlsIndex];
 
       console.log(`Trying Nexus HLS source ${nextIndex + 1}/${nexusHlsSources.length}:`, nextSource);
+
+      if (currentSource?.seekKind === 'cfNative' && nextSource.seekKind === 'source') {
+        showOsd(t('watch.seekSourceFallback'));
+      }
 
       const sourceChangeEvent = new CustomEvent('sourceChange', {
         detail: {
@@ -6537,7 +7099,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       return true;
     }
     return false;
-  }, [nexusHlsSources, currentNexusHlsIndex, src]);
+  }, [nexusHlsSources, currentNexusHlsIndex, showOsd, src, t]);
 
   // Fonction pour essayer la prochaine source Nexus File
   const tryNextNexusFileSource = useCallback(async () => {
@@ -6775,13 +7337,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }, 1000);
     }
   };
-
-  // Trigger loadSource when src changes
-  useEffect(() => {
-    if (src) {
-      loadSource();
-    }
-  }, [src]);
+  handleHlsErrorRef.current = handleHlsError;
 
   // Remove any legacy referrer meta injected by older player builds
   useEffect(() => {
@@ -6816,7 +7372,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               if (response.status === 403 || response.status === 4033) {
                  console.warn('🚫 403/4033 Forbidden error confirmed via fetch - trying next HLS player...');
                  setIsLoading(false);
-                 handleHlsError();
+                 requestHlsFallback();
                  return;
               }
             } catch (err) {
@@ -6829,11 +7385,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             if (isDnsLikeError(null, target.error)) {
               let host: string | undefined;
               try { host = new URL(src).hostname; } catch { /* ignore */ }
-              const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
-              notifyDnsBlocked({ host, details: `videoErrorCode${target.error.code}`, switched });
-              if (switched) return;
+              requestHlsFallback(() => {
+                const switched = dispatchDnsEmbedFallback(src, omegaSources, coflixSources);
+                notifyDnsBlocked({ host, details: `videoErrorCode${target.error.code}`, switched });
+                if (!switched) {
+                  void handleHlsErrorRef.current?.();
+                }
+              });
+              return;
             }
-            handleHlsError();
+            requestHlsFallback();
           }
         }
       };
@@ -6849,86 +7410,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
       };
     }
-  }, [src]); // Only depend on src, not internal darkino logic
-
-  // Setup HLS error handlers
-  useEffect(() => {
-    if (!Hls) return;
-    const hls = hlsRef.current;
-    if (hls) {
-      const onHlsError = (_event: any, data: any) => {
-        // Gestion de l'erreur 403 : auto-switch vers le prochain lecteur HLS disponible
-        if (data.response && (data.response.code === 403 || data.response.code === 4033)) {
-          console.warn('🚫 403/4033 Forbidden error detected - trying next HLS player...');
-          if (sourceTimeoutRef.current) {
-            clearTimeout(sourceTimeoutRef.current);
-            sourceTimeoutRef.current = null;
-          }
-          hls.destroy();
-          setIsLoading(false);
-          handleHlsError();
-          return;
-        }
-
-        // A broken/unsupported subtitle must never kill video playback — drop
-        // the subtitle track and continue instead of switching source.
-        if (isSubtitleLoadError(data)) {
-          console.warn('💬 Subtitle load/parse error — dropping subtitle, keeping playback:', data.details);
-          try {
-            if (hls.subtitleTrack >= 0) hls.subtitleTrack = -1;
-            (hls as any).subtitleDisplay = false;
-          } catch { /* ignore */ }
-          return;
-        }
-
-        // Vérifier si c'est une erreur 429 (Too Many Requests)
-        const is429Error = data.response && data.response.code === 429;
-        const isPulseTopstrime = src.includes('pulse.topstrime.online');
-
-        if (is429Error && isPulseTopstrime) {
-          handle429Error(hls, videoRef, data, src);
-          return;
-        }
-
-        // Handle Buffer Append Errors specificially
-        if (data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR) {
-          console.warn('⚠️ HLS bufferAppendError detected, attempting to recover media error...');
-          try {
-            hls.recoverMediaError();
-          } catch (e) {
-            console.error('Failed to recover from bufferAppendError:', e);
-            // If recovery fails, let it fall through to fatal handling or switch source
-            if (data.fatal) {
-              handleHlsError();
-            }
-          }
-          return;
-        }
-
-        if (data.fatal || data.details === 'manifestLoadError' || data.details === 'levelLoadError') {
-          console.error('Fatal HLS error:', data.type, data.details, data);
-
-          // Check if it's a network error
-          if (data.details === 'manifestLoadError' ||
-            data.details === 'levelLoadError' ||
-            (data.response && data.response.code === 404) ||
-            (data.response && data.response.code === 0)) {
-            console.log('Network error detected in HLS, attempting source switch');
-            handleHlsError();
-          } else if (data.fatal) {
-            console.log('Fatal HLS error, attempting source switch');
-            handleHlsError();
-          }
-        }
-      };
-
-      hls.on(Hls.Events.ERROR, onHlsError);
-
-      return () => {
-        hls.off(Hls.Events.ERROR, onHlsError);
-      };
-    }
-  }, [src, Hls]); // Only depend on src, let parent handle source switching
+  }, [src, requestHlsFallback, omegaSources, coflixSources]);
 
   // Add event handler to restore position after source change
   useEffect(() => {
@@ -7589,13 +8071,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [playbackSpeed, videoRef]);
 
-  // Update video source when episode or format change
-  useEffect(() => {
-    if (src) {
-      loadSource();
-    }
-  }, [src]);
-
   // Function to reset progress for the current item
   const resetCurrentProgress = () => {
     const video = videoRef.current;
@@ -7697,6 +8172,20 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       />
     );
   }, [__pinnedHosterId, __toggleHosterPin]);
+  const __seekStreamingNexusGroups = useMemo(
+    () => groupSeekStreamingSources(nexusHlsSources.filter(source => (
+      source.seekKind === 'cfNative' || source.seekKind === 'source'
+    ))),
+    [nexusHlsSources],
+  );
+  const __otherNexusHlsSources = useMemo(
+    () => nexusHlsSources
+      .map((source, index) => ({ source, index }))
+      .filter(({ source }) => (
+        source.seekKind !== 'cfNative' && source.seekKind !== 'source'
+      )),
+    [nexusHlsSources],
+  );
 
   // Dans le composant HLSPlayer, juste avant le return principal :
   if (onlyQualityMenu) {
@@ -7721,7 +8210,26 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               <>
                 {sourceGroups.map((group, groupIndex) => (
                   <div key={`group_${groupIndex}`} className="mb-6">
-                    <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">{group.title}</h4>
+                    <div className="flex items-center justify-between gap-2 mb-2 px-2">
+                      <h4 className="text-gray-400 text-xs uppercase tracking-wider">{group.title}</h4>
+                      {group.type === 'hls' && (
+                        hlsQualityScan.status === 'running' ? (
+                          <span className="flex items-center gap-1.5 text-xs text-gray-400 whitespace-nowrap">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            {hlsQualityScan.done}/{hlsQualityScan.total}
+                          </span>
+                        ) : (
+                          <button
+                            onClick={runHlsQualityScan}
+                            title={t('watch.qualityCheckTitle')}
+                            className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-gray-800/70 hover:bg-gray-700 text-gray-300 hover:text-white whitespace-nowrap"
+                          >
+                            <Gauge className="w-3.5 h-3.5" />
+                            {t('watch.qualityCheck')}
+                          </button>
+                        )
+                      )}
+                    </div>
                     {group.sources.map(source => {
                       // Skip rendering individual VOSTFR sources here, they are handled in the dropdown
                       if (source.type === 'vostfr') return null;
@@ -7764,13 +8272,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                 {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                               </div>
                               <div className="ml-3 flex items-center gap-2">
-                                {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
+                                {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
                                   <ChevronRight className={`w-4 h-4 transition-transform ${(source.type === 'darkino_main' && showDarkinoMenu) ||
                                     (source.type === 'omega_main' && showOmegaMenu) ||
                                     (source.type === 'multi_main' && showCoflixMenu) ||
                                     (source.type === 'fstream_main' && showFstreamMenu) ||
                                     (source.type === 'wiflix_main' && showWiflixMenu) ||
                                     (source.type === 'j1f_main' && showJ1fMenu) ||
+                                    (source.type === 'swiftflow_main' && showSwiftflowMenu) ||
                                     (source.type === 'nexus_main' && showNexusMenu) ||
                                     (source.type === 'rivestream_main' && showRivestreamMenu) ||
                                     (source.type === 'bravo_main' && showBravoMenu) ||
@@ -7859,8 +8368,50 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                   transition={{ duration: 0.2, ease: "easeOut" }}
                                   className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
                                 >
-                                  {/* Nexus HLS Sources */}
-                                  {nexusHlsSources && nexusHlsSources.length > 0 && nexusHlsSources.map((nexusSource: any, index: number) => {
+                                  {/* Une ligne par embed SeekStreaming ; les serveurs restent disponibles pour le fallback. */}
+                                  {__seekStreamingNexusGroups.map((group, groupIndex) => {
+                                    const nexusSource = group[0];
+                                    const representativeIndex = nexusHlsSources.findIndex(
+                                      candidate => candidate.url === nexusSource.url,
+                                    );
+                                    const isNexusHlsActive = group.some(candidate => candidate.url === src);
+                                    const activeNexusSource = group.find(candidate => candidate.url === src) ?? nexusSource;
+                                    const nexusHlsHosterId = __detectHosterFromUrl(nexusSource.url, nexusSource.label);
+                                    const seekStreamingLabel = __seekStreamingNexusGroups.length > 1
+                                      ? t('watch.seekStreamingNumber', { number: groupIndex + 1 })
+                                      : t('watch.seekStreaming');
+                                    return (
+                                      <motion.div
+                                        key={nexusSource.seekGroupKey || `nexus_seek_${groupIndex}`}
+                                        initial={{ opacity: 0, x: -20 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ duration: 0.2, delay: groupIndex * 0.03 }}
+                                        className="mb-2 flex items-stretch gap-2"
+                                      >
+                                        <button
+                                          onClick={() => handleSourceChange('nexus_hls', `nexus_hls_${representativeIndex}`, nexusSource.url)}
+                                          className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isNexusHlsActive ? 'bg-gray-800/80 border-l-2 border-red-600 pl-3' : 'bg-gray-900/40 text-gray-300'
+                                            }`}
+                                        >
+                                          <div className="min-w-0 flex flex-1 flex-col">
+                                            <span className={isNexusHlsActive ? 'text-red-600 font-medium' : 'text-white'}>
+                                          🚀 {seekStreamingLabel}
+                                          {nexusHlsHosterId && nexusHlsHosterId !== 'unknown' && __pinnedHosterId === nexusHlsHosterId && (
+                                            <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                          )}
+                                        </span>
+                                            {renderSourceQualityMeta(activeNexusSource.url, isNexusHlsActive, undefined, seekStreamingLabel)}
+                                          </div>
+                                          {isNexusHlsActive && <span className="ml-2 text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.active')}</span>}
+                                        </button>
+                                        {__renderHosterPin(nexusHlsHosterId)}
+                                        {renderCopySourceButton(nexusSource.url)}
+                                      </motion.div>
+                                    );
+                                  })}
+
+                                  {/* Autres sources Nexus HLS */}
+                                  {__otherNexusHlsSources.map(({ source: nexusSource, index }) => {
                                     const isNexusHlsActive = src === nexusSource.url;
                                     const nexusHlsHosterId = __detectHosterFromUrl(nexusSource.url, nexusSource.label);
                                     return (
@@ -7868,21 +8419,21 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                         key={`nexus_hls_${index}`}
                                         initial={{ opacity: 0, x: -20 }}
                                         animate={{ opacity: 1, x: 0 }}
-                                        transition={{ duration: 0.2, delay: index * 0.03 }}
+                                        transition={{ duration: 0.2, delay: (__seekStreamingNexusGroups.length + index) * 0.03 }}
                                         className="mb-2 flex items-stretch gap-2"
                                       >
                                         <button
-                                          onClick={() => handleSourceChange('nexus_hls', `nexus_hls_${index}`, nexusSource.url || '')}
+                                          onClick={() => handleSourceChange('nexus_hls', `nexus_hls_${index}`, nexusSource.url)}
                                           className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isNexusHlsActive ? 'bg-gray-800/80 border-l-2 border-red-600 pl-3' : 'bg-gray-900/40 text-gray-300'
                                             }`}
                                         >
                                           <div className="min-w-0 flex flex-1 flex-col">
                                             <span className={isNexusHlsActive ? 'text-red-600 font-medium' : 'text-white'}>
-                                          🚀 {nexusSource.label || `Nexus HLS ${index + 1}`}
-                                          {nexusHlsHosterId && nexusHlsHosterId !== 'unknown' && __pinnedHosterId === nexusHlsHosterId && (
-                                            <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
-                                          )}
-                                        </span>
+                                              🚀 {nexusSource.label || `Nexus HLS ${index + 1}`}
+                                              {nexusHlsHosterId && nexusHlsHosterId !== 'unknown' && __pinnedHosterId === nexusHlsHosterId && (
+                                                <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                              )}
+                                            </span>
                                             {renderSourceQualityMeta(nexusSource.url, isNexusHlsActive, undefined, nexusSource.label || `Nexus HLS ${index + 1}`)}
                                           </div>
                                           {isNexusHlsActive && <span className="ml-2 text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.active')}</span>}
@@ -8302,6 +8853,78 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                               )}
                             </AnimatePresence>
                           )}
+                          {/* Ajout du menu déroulant SwiftFlow */}
+                          {source.type === 'swiftflow_main' && (
+                            <AnimatePresence>
+                              {showSwiftflowMenu && (
+                                <motion.div
+                                  initial={{ opacity: 0, scale: 0.95, transformOrigin: "top" }}
+                                  animate={{ opacity: 1, scale: 1 }}
+                                  exit={{ opacity: 0, scale: 0.95 }}
+                                  transition={{ duration: 0.2, ease: "easeOut" }}
+                                  className="ml-4 pl-2 border-l-2 border-gray-700 mb-2"
+                                >
+                                  {swiftflowSources && swiftflowSources.length > 0 && (() => {
+                                    const sourcesByCategory = swiftflowSources.reduce((acc, source) => {
+                                      const category = source.category || 'Default';
+                                      if (!acc[category]) acc[category] = [];
+                                      acc[category].push(source);
+                                      return acc;
+                                    }, {} as Record<string, typeof swiftflowSources>);
+
+                                    const categoryOrder = [
+                                      { key: 'VF', label: t('watch.french'), flagCode: 'FR' },
+                                      { key: 'VOSTFR', label: t('watch.voSubtitledFr'), flagCode: 'GB' }
+                                    ];
+
+                                    return categoryOrder.map((cat) => {
+                                      const categorySources = sourcesByCategory[cat.key];
+                                      if (!categorySources || categorySources.length === 0) return null;
+
+                                      return (
+                                        <div key={`swiftflow_category_${cat.key}`} className="mb-3">
+                                          <div className="flex items-center gap-2 mb-2 px-2">
+                                            <span className="text-lg"><ReactCountryFlag countryCode={cat.flagCode} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /></span>
+                                            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                                              {cat.label} ({categorySources.length})
+                                            </span>
+                                          </div>
+                                          {categorySources.map((swiftflowSource, index) => {
+                                            const globalIndex = swiftflowSources.findIndex(s => s.url === swiftflowSource.url);
+                                            const isSwiftflowActive = onlyQualityMenu && embedType === 'swiftflow' && embedUrl === swiftflowSource.url;
+                                            const swiftflowHosterId = __detectHosterFromUrl(swiftflowSource.url, swiftflowSource.label);
+                                            return (
+                                              <div key={`swiftflow_${cat.key}_${index}`} className="mb-1 ml-4 flex items-stretch gap-2">
+                                                <motion.button
+                                                  initial={{ opacity: 0, x: -20 }}
+                                                  animate={{ opacity: 1, x: 0 }}
+                                                  transition={{ duration: 0.2, delay: index * 0.03 }}
+                                                  onClick={() => handleSourceChange('swiftflow', `swiftflow_${globalIndex}`, swiftflowSource.url)}
+                                                  className={`w-full flex-1 px-4 py-2 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center bg-gray-900/40 text-gray-300 ${isSwiftflowActive ? 'ring-2 ring-red-500 bg-gray-800/80' : ''}`}
+                                                >
+                                                  <span>
+                                                    {swiftflowSource.label}
+                                                    {swiftflowHosterId && swiftflowHosterId !== 'unknown' && __pinnedHosterId === swiftflowHosterId && (
+                                                      <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
+                                                    )}
+                                                  </span>
+                                                  <div className="flex items-center gap-2">
+                                                    <span className="text-xs text-gray-500">{swiftflowSource.category}</span>
+                                                    {isSwiftflowActive && <span className="text-xs px-2 py-1 bg-red-600 text-white rounded-full">{t('watch.inProgress')}</span>}
+                                                  </div>
+                                                </motion.button>
+                                                {__renderHosterPin(swiftflowHosterId)}
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      );
+                                    }).filter(Boolean);
+                                  })()}
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          )}
                           {/* Sous-menu Bravo (PurStream) */}
                           {source.type === 'bravo_main' && (
                             <AnimatePresence>
@@ -8557,6 +9180,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   useImperativeHandle(ref, () => ({
     play: async () => {
       if (videoRef.current) {
+        postCastPlaybackSuppressedRef.current = false;
         return videoRef.current.play();
       }
       return Promise.reject('No video element available');
@@ -8827,6 +9451,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const handleZoomTouchEnd = (e: React.TouchEvent) => {
     touchActiveRef.current = false;
 
+    if (isPlayerControlInteractionTarget(e.target)) {
+      touchActiveRef.current = false;
+      touchMovedRef.current = false;
+      keepControlsVisibleAfterInteraction();
+      return;
+    }
+
     // Prevent synthetic click from interfering - ALWAYS do this regardless of movement
     preventSyntheticClick();
 
@@ -9067,12 +9698,33 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       className={`relative group w-full h-full bg-black rounded-xl overflow-hidden ${isLoading ? 'aspect-[16/9]' : ''} video-container ${className} ${isFullscreenAnimating ? 'fullscreen-animating' : ''} select-none ${shouldHideCursor || isLocked ? 'cursor-none' : ''}`}
       onMouseMove={!isTouchDevice ? handleMouseMove : undefined}
       onMouseLeave={() => isPlaying && !showCastMenu && setShowControls(false)}
+      onClickCapture={handlePlayerControlInteractionCapture}
+      onChangeCapture={handlePlayerControlInteractionCapture}
       onClick={handleVideoClick}
       onTouchStart={handleZoomTouchStart}
       onTouchMove={handleZoomTouchMove}
+      onTouchEndCapture={handlePlayerControlInteractionCapture}
       onTouchEnd={handleZoomTouchEnd}
       onDoubleClick={handleDoubleTap}
     >
+      <CastRelayDisclosure
+        open={showCastRelayDisclosure}
+        onContinue={() => {
+          setShowCastRelayDisclosure(false);
+          void startCasting(true);
+        }}
+        onOpenBatterySettings={() =>
+          nativeCastBridge?.openBatterySettings() ?? Promise.resolve()
+        }
+        onSetSuppressed={(suppressed) => {
+          if (suppressed) setRelayDisclosureSuppressedState(true);
+          return nativeCastBridge?.setRelayDisclosureSuppressed(suppressed)
+            ?? Promise.resolve();
+        }}
+        onRequestNotificationPermission={() =>
+          nativeCastBridge?.requestRelayNotificationPermission()
+        }
+      />
       {/* Cast Control Overlay - replaces HLS player when casting (Netflix-like) */}
       {isCasting && (
         <div
@@ -9093,19 +9745,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 </svg>
                 <div className="flex flex-col">
                   <span className="text-white font-bold text-lg">{t('watch.castingInProgress')}</span>
-                  <span className="text-white text-sm">{(() => {
-                    if (castSession) {
-                      const deviceName = castSession?.receiver?.friendlyName ||
-                        castSession?.receiverFriendlyName ||
-                        castSession?.receiver?.name ||
-                        castSession?.receiver?.label ||
-                        castSession?.deviceName ||
-                        castSession?.name ||
-                        'Chromecast';
-                      return deviceName;
-                    }
-                    return 'Chromecast';
-                  })()}</span>
+                  <span className="text-white text-sm">
+                    {castStatus.deviceName || 'Chromecast'}
+                  </span>
                 </div>
               </div>
               <button
@@ -9118,6 +9760,24 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               </button>
             </div>
           </div>
+
+          {castStatus.errorCode === 'MOVIX_RELAY_RELOAD_REQUIRED' && (
+            <div
+              role="alert"
+              className="absolute left-4 right-4 top-20 z-30 mx-auto max-w-xl rounded-xl border border-amber-300/40 bg-black/90 p-4 text-center shadow-2xl"
+            >
+              <p className="text-sm font-semibold text-white sm:text-base">
+                {t('watch.castRelayReloadRequired')}
+              </p>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="mt-3 rounded-lg bg-amber-400 px-4 py-2 text-sm font-bold text-black transition-colors hover:bg-amber-300"
+              >
+                {t('watch.reloadToRetry')}
+              </button>
+            </div>
+          )}
 
           {/* Dim overlay over the backdrop (no blur) */}
           <div className="absolute inset-0 bg-black/60" />
@@ -9150,20 +9810,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 {/* Reculer -10s */}
                 <button
                   onClick={() => {
-                    try {
-                      const session: any = castSession as any;
-                      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-                      if (!media) return;
-                      const current = media.getEstimatedTime ? media.getEstimatedTime() : (media.currentTime || 0);
-                      const target = Math.max(0, current - 10);
-                      if ((window as any).chrome?.cast?.media) {
-                        const req = new (window as any).chrome.cast.media.SeekRequest();
-                        req.currentTime = target;
-                        media.seek(req, () => { }, () => { });
-                      } else if (typeof media.seek === 'function') {
-                        media.seek(target, () => { }, () => { });
-                      }
-                    } catch (e) { console.error('Cast seek -10 failed', e); }
+                    if (!castController) return;
+                    const target = Math.max(0, castCurrentTime - 10);
+                    setCastCurrentTime(target);
+                    void runCastCommand(() => castController.seekTo(target));
                   }}
                   className="inline-flex items-center gap-2 sm:gap-2 px-3 sm:px-4 py-3 sm:py-3 rounded-xl bg-black/40 text-white hover:bg-black/60 transition-all duration-200 border border-white/30 hover:border-white/50 font-semibold text-xs sm:text-sm shadow-lg backdrop-blur-sm min-w-0"
                   title={t('watch.rewind10s')}
@@ -9174,72 +9824,42 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 {/* Toggle Play/Pause (between -10s and +10s) */}
                 <button
                   onClick={() => {
-                    try {
-                      const session: any = castSession as any;
-                      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-                      if (!media) return;
-                      const isPlayingCast = media?.playerState === 'PLAYING';
-                      if (isPlayingCast) {
-                        if (typeof media.pause === 'function') {
-                          media.pause(null, () => { }, () => { });
-                        } else if ((window as any).chrome?.cast?.media) {
-                          const req = new (window as any).chrome.cast.media.PauseRequest();
-                          media.pause(req, () => { }, () => { });
-                        }
-                      } else {
-                        if (typeof media.play === 'function') {
-                          media.play(null, () => { }, () => { });
-                        } else if ((window as any).chrome?.cast?.media) {
-                          const req = new (window as any).chrome.cast.media.PlayRequest();
-                          media.play(req, () => { }, () => { });
-                        }
-                      }
-                    } catch (e) { console.error('Cast toggle play/pause failed', e); }
+                    if (!castController) return;
+                    if (castStatus.state === 'playing') {
+                      void runCastCommand(
+                        () => castController.pause(),
+                        'paused',
+                      );
+                    } else {
+                      void runCastCommand(
+                        () => castController.play(),
+                        'playing',
+                      );
+                    }
                   }}
                   className="inline-flex items-center gap-2 sm:gap-2 px-5 sm:px-6 py-3 sm:py-3 rounded-xl bg-red-600 text-white hover:bg-red-700 transition-all duration-200 border border-red-500 hover:border-red-400 font-bold text-sm sm:text-base shadow-xl backdrop-blur-sm min-w-0"
                   title={t('watch.playPause')}
                 >
-                  {(() => {
-                    try {
-                      const session: any = castSession as any;
-                      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-                      const isPlayingCast = media?.playerState === 'PLAYING';
-                      return isPlayingCast ? <Pause className="w-6 h-6 sm:w-5 sm:h-5" /> : <Play className="w-6 h-6 sm:w-5 sm:h-5" />;
-                    } catch {
-                      return <Play className="w-6 h-6 sm:w-5 sm:h-5" />;
-                    }
-                  })()}
+                  {castStatus.state === 'playing'
+                    ? <Pause className="w-6 h-6 sm:w-5 sm:h-5" />
+                    : <Play className="w-6 h-6 sm:w-5 sm:h-5" />}
                   <span className="hidden sm:inline">
-                    {(() => {
-                      try {
-                        const session: any = castSession as any;
-                        const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-                        const isPlayingCast = media?.playerState === 'PLAYING';
-                        return isPlayingCast ? t('watch.pause') : t('watch.play');
-                      } catch {
-                        return t('watch.play');
-                      }
-                    })()}
+                    {castStatus.state === 'playing'
+                      ? t('watch.pause')
+                      : t('watch.play')}
                   </span>
                 </button>
 
                 {/* Avancer +10s (after play/pause) */}
                 <button
                   onClick={() => {
-                    try {
-                      const session: any = castSession as any;
-                      const media = session?.getMediaSession ? session.getMediaSession() : (Array.isArray(session?.media) ? session.media[0] : null);
-                      if (!media) return;
-                      const current = media.getEstimatedTime ? media.getEstimatedTime() : (media.currentTime || 0);
-                      const target = Math.max(0, current + 10);
-                      if ((window as any).chrome?.cast?.media) {
-                        const req = new (window as any).chrome.cast.media.SeekRequest();
-                        req.currentTime = target;
-                        media.seek(req, () => { }, () => { });
-                      } else if (typeof media.seek === 'function') {
-                        media.seek(target, () => { }, () => { });
-                      }
-                    } catch (e) { console.error('Cast seek +10 failed', e); }
+                    if (!castController) return;
+                    const target = Math.min(
+                      castStatus.durationSec ?? Number.POSITIVE_INFINITY,
+                      castCurrentTime + 10,
+                    );
+                    setCastCurrentTime(target);
+                    void runCastCommand(() => castController.seekTo(target));
                   }}
                   className="inline-flex items-center gap-2 sm:gap-2 px-3 sm:px-4 py-3 sm:py-3 rounded-xl bg-black/40 text-white hover:bg-black/60 transition-all duration-200 border border-white/30 hover:border-white/50 font-semibold text-xs sm:text-sm shadow-lg backdrop-blur-sm min-w-0"
                   title={t('watch.forward10s')}
@@ -9264,26 +9884,26 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                     aria-valuemin={0}
                     aria-valuemax={100}
                     aria-valuenow={(() => {
-                      const currentDuration = castDuration || duration;
-                      const currentTimeValue = castCurrentTime || currentTime;
+                      const currentDuration = castDuration;
+                      const currentTimeValue = castCurrentTime;
                       return currentDuration > 0 ? Math.round((currentTimeValue / currentDuration) * 100) : 0;
                     })()}
-                    aria-valuetext={`${formatTime(castCurrentTime || currentTime)} out of ${formatTime(castDuration || duration)}`}
+                    aria-valuetext={`${formatTime(castCurrentTime)} out of ${formatTime(castDuration)}`}
                     aria-orientation="horizontal"
                     style={{
                       '--slider-progress': `${(() => {
-                        const currentDuration = castDuration || duration;
-                        const currentTimeValue = castCurrentTime || currentTime;
+                        const currentDuration = castDuration;
+                        const currentTimeValue = castCurrentTime;
                         return currentDuration > 0 ? (currentTimeValue / currentDuration) * 100 : 0;
                       })()}%`,
                       '--slider-fill': `${(() => {
-                        const currentDuration = castDuration || duration;
-                        const currentTimeValue = castCurrentTime || currentTime;
+                        const currentDuration = castDuration;
+                        const currentTimeValue = castCurrentTime;
                         return currentDuration > 0 ? (currentTimeValue / currentDuration) * 100 : 0;
                       })()}%`,
                       '--slider-pointer': `${(() => {
-                        const currentDuration = castDuration || duration;
-                        const currentTimeValue = castCurrentTime || currentTime;
+                        const currentDuration = castDuration;
+                        const currentTimeValue = castCurrentTime;
                         return currentDuration > 0 ? (currentTimeValue / currentDuration) * 100 : 0;
                       })()}%`
                     } as React.CSSProperties}
@@ -9328,7 +9948,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                         }}
                       >
                         <div className="px-2 py-1.5 text-sm sm:px-3 sm:py-2 sm:text-base font-bold bg-black/80 backdrop-blur-sm text-white rounded-lg whitespace-nowrap shadow-xl border border-white/20">
-                          {formatTime(isCastDragging ? castDragTime : (castCurrentTime || currentTime))}
+                          {formatTime(isCastDragging ? castDragTime : castCurrentTime)}
                         </div>
                       </div>
                     </div>
@@ -9337,7 +9957,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               </div>
 
               <div className="mt-4 sm:mt-6 text-white text-sm sm:text-lg font-bold bg-black/40 px-3 sm:px-4 py-2 rounded-xl border border-white/20 backdrop-blur-sm shadow-lg relative z-30 sticky bottom-4 sm:static">
-                {formatTime(isCastDragging ? castDragTime : (castCurrentTime || currentTime))} / {formatTime(castDuration || duration)}
+                {formatTime(isCastDragging ? castDragTime : castCurrentTime)} / {formatTime(castDuration)}
               </div>
             </div>
           </div>
@@ -9372,13 +9992,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             x-webkit-airplay="allow"
             disableRemotePlayback={false}
           >
-            {/* Source elements for AirPlay compatibility - allows native playback */}
-            {src && src.includes('.m3u8') && (
-              <source src={src} type="application/x-mpegURL" />
-            )}
-            {src && !isMP4Source(src) && (
-              <source src={src} type="video/mp4" />
-            )}
             {t('watch.browserNotSupported')}
             {subtitleUrl && (
               <track
@@ -9825,8 +10438,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               duration: 0.2,
               ease: "easeOut"
             }}
-            className="absolute inset-0 flex items-center justify-center gap-8 z-50 pointer-events-none"
+            className="absolute inset-0 flex items-center justify-center z-50 pointer-events-none"
           >
+            <div
+              className="flex items-center justify-center gap-8 pointer-events-auto"
+              data-player-controls=""
+            >
             <motion.button
               onClick={(e) => {
                 e.stopPropagation();
@@ -9853,9 +10470,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 togglePlay();
               }}
               onTouchEnd={(e) => {
-                e.preventDefault();
                 e.stopPropagation();
-                togglePlay();
               }}
               initial={{ scale: 1 }}
               whileHover={{
@@ -9892,6 +10507,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             >
               <FastForward size={56} />
             </motion.button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -10123,6 +10739,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       {controls && !isCasting && (
         <motion.div
           className="absolute bottom-0 left-0 right-0 p-4 control-bar"
+          data-player-controls=""
           initial={{ opacity: 0, y: 20 }}
           animate={{
             opacity: showControls ? 1 : 0,
@@ -10164,9 +10781,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 <button
                   onClick={!isWatchPartyGuest ? togglePlay : undefined}
                   onTouchEnd={!isWatchPartyGuest ? (e) => {
-                    e.preventDefault();
                     e.stopPropagation();
-                    togglePlay();
                   } : undefined}
                   className={`text-white transition-colors ${!isWatchPartyGuest ? 'hover:text-gray-300' : 'opacity-50 cursor-not-allowed'}`}
                   disabled={isWatchPartyGuest}
@@ -10674,6 +11289,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             settingsMenuRef,
             settingsMenuWidth,
             audioTracks,
+            qualities,
+            qualityPreference,
+            effectiveQualityHeight,
+            handleQualityPreferenceChange,
             subtitles,
             t,
             setShowSettings,
@@ -10699,12 +11318,15 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             handleSourceChange,
             renderSourceQualityMeta,
             renderCopySourceButton,
+            hlsQualityScan,
+            runHlsQualityScan,
             showDarkinoMenu,
             showOmegaMenu,
             showCoflixMenu,
             showFstreamMenu,
             showWiflixMenu,
             showJ1fMenu,
+            showSwiftflowMenu,
             showNexusMenu,
             showRivestreamMenu,
             showBravoMenu,
@@ -10716,6 +11338,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             fstreamSources,
             wiflixSources,
             j1fSources,
+            swiftflowSources,
             rivestreamSources,
             rivestreamCaptions,
             getOriginalUrl,
@@ -11015,7 +11638,17 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-400">{t('watch.quality')}</span>
-                    <span>{currentQuality === 'auto' ? 'Auto' : `${currentQuality}p`}</span>
+                    <span>
+                      {effectiveQualityHeight
+                        ? `${effectiveQualityHeight}p`
+                        : qualityPreference === 'auto'
+                          ? t('watch.qualityAuto')
+                          : `${qualityPreference}p`}
+                      {effectiveQualityHeight
+                        && (qualityPreference === 'auto' || qualityPreference !== effectiveQualityHeight)
+                        ? ` · ${qualityPreference === 'auto' ? t('watch.qualityAuto') : `${qualityPreference}p`}`
+                        : ''}
+                    </span>
                   </div>
                 </>
               )}
