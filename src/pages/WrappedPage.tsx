@@ -1372,12 +1372,12 @@ const SlideClosing: React.FC<{
                             />
                         ) : (
                             <span className="flex h-full w-full items-center justify-center">
-                                <Loader2 className="h-5 w-5 animate-spin text-white/40" />
+                        <Loader2 className="h-5 w-5 animate-spin text-white opacity-40" />
                             </span>
                         )}
                         {isGeneratingPreview && previewUrl && (
                             <span className="absolute inset-0 flex items-center justify-center bg-black/50">
-                                <Loader2 className="h-5 w-5 animate-spin text-white/70" />
+                      <Loader2 className="h-5 w-5 animate-spin text-white opacity-70" />
                             </span>
                         )}
                     </button>

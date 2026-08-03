@@ -649,7 +649,7 @@ const WishboardPage: React.FC = () => {
                             onClick={() => window.location.href = '/login-bip39'}
                             className="relative flex items-center justify-center gap-3 w-full px-4 py-3.5 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-xl transition-all font-medium"
                         >
-                            <svg className="w-5 h-5 text-white/60" fill="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-5 h-5 text-white opacity-60" fill="currentColor" viewBox="0 0 24 24">
                                 <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z" />
                             </svg>
                             <span>{t('greenlight.secretPhrase')}</span>

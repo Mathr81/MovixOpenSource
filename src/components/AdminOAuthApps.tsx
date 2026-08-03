@@ -504,7 +504,7 @@ const AppCard: React.FC<AppCardProps> = ({ app, onEdit, onStats, onDelete, onTog
             <img src={`${API_URL}${app.iconUrl}`} alt={app.clientName} className="h-full w-full object-cover" />
           ) : (
             <div className="flex h-full w-full items-center justify-center">
-              <ImageIcon className="h-5 w-5 text-white/30" />
+              <ImageIcon className="h-5 w-5 text-white opacity-30" />
             </div>
           )}
           {/* Overlay hover : clic = upload */}

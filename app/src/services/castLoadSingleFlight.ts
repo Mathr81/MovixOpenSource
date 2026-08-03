@@ -25,6 +25,7 @@ type NormalizedSource = {
 };
 
 type NormalizedTrack = Omit<NormalizedSource, 'tracks'> & {
+  inlineVtt: string | null;
   language: string | null;
   name: string | null;
   active: boolean | null;
@@ -66,7 +67,7 @@ function normalizeMetadata(metadata: CastLoadMetadata) {
 }
 
 function normalizeSource(
-  source: PreparedCastSource | PreparedCastTrack,
+  source: PreparedCastSource,
 ): NormalizedSource {
   const normalized = {
     url: source.url,
@@ -84,8 +85,21 @@ function normalizeSource(
 }
 
 function normalizeTrack(track: PreparedCastTrack): NormalizedTrack {
+  if (typeof track.inlineVtt === 'string') {
+    return {
+      url: '',
+      inlineVtt: track.inlineVtt,
+      contentType: track.contentType ?? null,
+      protocolVersion: track.protocolVersion,
+      headers: [],
+      language: track.language ?? null,
+      name: track.name ?? null,
+      active: track.active ?? null,
+    };
+  }
   return {
     ...normalizeSource(track),
+    inlineVtt: null,
     language: track.language ?? null,
     name: track.name ?? null,
     active: track.active ?? null,

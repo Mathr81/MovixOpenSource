@@ -33,6 +33,8 @@ import {
   resolveRenderedWatchSource,
   syncHlsActiveSource,
 } from '../../utils/hlsAutoFallbackGuard';
+import { resolveKisskhTv } from '../../services/kisskhService';
+import type { KisskhSource, KisskhSubtitleTrack } from '../../types/kisskh';
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 
@@ -579,6 +581,14 @@ const WatchTv: React.FC = () => {
   const [selectedVoxSource, setSelectedVoxSource] = useState<number>(0);
   const [loadingVox, setLoadingVox] = useState(true);
 
+  // KissKH resolution is episode-scoped. The generation and controller reject
+  // late completions without blocking any incumbent provider.
+  const [kisskhSources, setKisskhSources] = useState<KisskhSource[]>([]);
+  const [kisskhSubtitles, setKisskhSubtitles] = useState<KisskhSubtitleTrack[]>([]);
+  const [loadingKisskh, setLoadingKisskh] = useState(true);
+  const kisskhRequestGenerationRef = useRef(0);
+  const kisskhRequestAbortRef = useRef<AbortController | null>(null);
+
   // PurStream (Bravo) HLS states
   const [purstreamSources, setPurstreamSources] = useState<{ url: string; label: string }[]>([]);
   const canUseBravo = isUserVip() || isExtensionAvailable();
@@ -784,6 +794,7 @@ const WatchTv: React.FC = () => {
     } else if (
       selectedSource === 'rivestream_hls'
       || selectedSource === 'bravo'
+      || selectedSource === 'kisskh'
     ) {
       directSourceUrl = videoSource || '';
     }
@@ -1221,13 +1232,14 @@ const WatchTv: React.FC = () => {
       (selectedSource === 'mp4' && (mp4Sources.length > 0 || sibnetUrl)) ||
       (selectedSource === 'm3u8' && adFreeM3u8Url) ||
       (selectedSource === 'bravo' && purstreamSources.length > 0 && canUseBravo) ||
+      (selectedSource === 'kisskh' && kisskhSources.length > 0) ||
       (selectedSource === 'rivestream' && rivestreamSources.length > 0) ||
       (selectedSource === 'rivestream_hls' && (rivestreamSources.length > 0 || loadingRivestream))) {
       setShowSourceButton(false);
     } else {
       setShowSourceButton(true);
     }
-  }, [selectedSource, nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, rivestreamSources, loadingRivestream]);
+  }, [selectedSource, nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, sibnetUrl, adFreeM3u8Url, purstreamSources, canUseBravo, kisskhSources, rivestreamSources, loadingRivestream]);
 
   // Effect to fetch episodes when the selected season changes in the menu
   useEffect(() => {
@@ -1266,12 +1278,22 @@ const WatchTv: React.FC = () => {
 
   // Initial Fetch Effect
   useEffect(() => {
+    kisskhRequestAbortRef.current?.abort();
+    const kisskhController = new AbortController();
+    const kisskhGeneration = kisskhRequestGenerationRef.current + 1;
+    kisskhRequestGenerationRef.current = kisskhGeneration;
+    kisskhRequestAbortRef.current = kisskhController;
+    setKisskhSources([]);
+    setKisskhSubtitles([]);
+    setLoadingKisskh(true);
+
     // Validate parameters
     if (!id || isNaN(seasonNumber) || isNaN(episodeNumber) || seasonNumber < 0 || episodeNumber < 1) {
       console.error("Invalid ID, season, or episode number in URL");
       setLoadingError(true);
       setIsLoading(false);
-      return;
+      setLoadingKisskh(false);
+      return () => kisskhController.abort();
     }
 
     const initialFetch = async () => {
@@ -1373,6 +1395,33 @@ const WatchTv: React.FC = () => {
         const releaseYearData = new Date(show.first_air_date).getFullYear();
 
         // ========== INITIATE ALL ASYNCHRONOUS SOURCE CHECKS (NON-BLOCKING) ==========
+        const kisskhPromise = (async () => {
+          try {
+            const resolution = await resolveKisskhTv(
+              parseInt(id, 10),
+              seasonNumber,
+              episodeNumber,
+              { signal: kisskhController.signal },
+            );
+            if (
+              kisskhController.signal.aborted
+              || kisskhRequestGenerationRef.current !== kisskhGeneration
+            ) {
+              return null;
+            }
+            return resolution;
+          } catch {
+            return null;
+          } finally {
+            if (
+              !kisskhController.signal.aborted
+              && kisskhRequestGenerationRef.current === kisskhGeneration
+            ) {
+              setLoadingKisskh(false);
+            }
+          }
+        })();
+
         const darkinoPromise = checkDarkinoAvailability(
           show.name,
           releaseYearData,
@@ -1553,7 +1602,8 @@ const WatchTv: React.FC = () => {
           viperResult,
           voxResult,
           j1fResult,
-          swiftflowResult
+          swiftflowResult,
+          kisskhResult,
         ] = await Promise.all([
           darkinoPromise,
           customLinksPromise,
@@ -1566,8 +1616,16 @@ const WatchTv: React.FC = () => {
           viperPromise,
           voxPromise,
           j1fPromise,
-          swiftflowPromise
+          swiftflowPromise,
+          kisskhPromise,
         ]);
+
+        const kisskhRequestIsCurrent = !kisskhController.signal.aborted
+          && kisskhRequestGenerationRef.current === kisskhGeneration;
+        if (kisskhRequestIsCurrent && kisskhResult) {
+          setKisskhSources(kisskhResult.sources);
+          setKisskhSubtitles(kisskhResult.subtitles);
+        }
 
         // ========== PROCESS OMEGA RESULTS (before setting state) ==========
         let processedOmegaDataForState = null; // Variable to hold the data for setOmegaData
@@ -3181,6 +3239,17 @@ const WatchTv: React.FC = () => {
               setOnlyVostfrAvailable(false);
               return true;
             }
+            case 'kisskh': {
+              const source = kisskhResult?.sources[0];
+              if (!kisskhRequestIsCurrent || !source || !['hls', 'mp4'].includes(source.type)) return false;
+              setSelectedSource('kisskh');
+              setVideoSource(source.url);
+              setEmbedUrl(null);
+              setEmbedType(null);
+              currentSourceRef.current = 'kisskh';
+              setOnlyVostfrAvailable(false);
+              return true;
+            }
             // Les ids restants (vostfr, rivestream_hls) ne sont pas auto-select
             // pour les séries (vostfr est le fallback final, rivestream_hls dispo via boutons).
             default:
@@ -3224,6 +3293,7 @@ const WatchTv: React.FC = () => {
             { id: 'custom', hasData: !!(customLinksResult.customLinks && customLinksResult.customLinks.length) },
             { id: 'frembed', hasData: !!frembedAvailabilityResult },
             { id: 'vox', hasData: voxProcessedSources.length > 0 },
+            { id: 'kisskh', hasData: kisskhRequestIsCurrent && !!kisskhResult?.sources.length },
             { id: 'rivestream_hls', hasData: false },
             { id: 'vostfr', hasData: false },
           ];
@@ -3269,6 +3339,12 @@ const WatchTv: React.FC = () => {
     }; // End of initialFetch function
 
     initialFetch();
+    return () => {
+      kisskhController.abort();
+      if (kisskhRequestAbortRef.current === kisskhController) {
+        kisskhRequestAbortRef.current = null;
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, seasonNumber, episodeNumber]); // Rerun if essential params change
 
@@ -3280,11 +3356,12 @@ const WatchTv: React.FC = () => {
       const { type, url, origin, fromSrc } = event.detail as { type: PlayerSourceType | string, url: string, id?: string | number, origin?: string, fromSrc?: string };
       const isAutomaticFallback =
         typeof origin === 'string' && origin.includes('auto-fallback');
+      const isKisskhFallbackCompletion = origin === 'kisskh-fallback';
 
       // Reject stale auto-fallback events whose originating src no longer matches
       // the currently-active player URL. This prevents a late error handler from
       // a previously-selected player reverting a user's manual switch.
-      if (isAutomaticFallback && typeof fromSrc === 'string' && fromSrc) {
+      if ((isAutomaticFallback || isKisskhFallbackCompletion) && typeof fromSrc === 'string' && fromSrc) {
         if (fromSrc !== currentActiveUrlRef.current) {
           console.log(
             `[WatchTv] Ignoring stale auto-fallback sourceChange (from=${fromSrc.substring(0, 80)} current=${currentActiveUrlRef.current.substring(0, 80)})`
@@ -3370,6 +3447,14 @@ const WatchTv: React.FC = () => {
               allowed: bravoAllowed,
               fallback: 'last',
             });
+          case 'kisskh_main':
+            return isKisskhFallbackCompletion
+              ? resolveAcceptedWatchSource({ requestedSource: url })
+              : resolveAcceptedWatchSource({
+                  requestedSource: url,
+                  availableSources: kisskhSources.map(source => source.url),
+                  fallback: 'first',
+                });
           case 'frembed':
           case 'custom':
           case 'vostfr':
@@ -3409,7 +3494,7 @@ const WatchTv: React.FC = () => {
         && !isAutomaticFallback
         && typeof type === 'string'
       ) {
-        setLastPlayer(type);
+        setLastPlayer(type === 'kisskh_main' ? 'kisskh' : type);
       }
 
       // When a source is picked from the menu, hide the "no content" message and the menu itself.
@@ -3426,7 +3511,7 @@ const WatchTv: React.FC = () => {
       }
 
       // Handle HLS source selections
-      if (type === 'nexus_hls' || type === 'nexus_file' || type === 'darkino' || type === 'mp4' || type === 'm3u8' || type === 'sibnet' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo') {
+      if (type === 'nexus_hls' || type === 'nexus_file' || type === 'darkino' || type === 'mp4' || type === 'm3u8' || type === 'sibnet' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo' || type === 'kisskh_main') {
         // Ne pas cacher l'iframe si c'est juste le déclencheur de chargement Rivestream
         if (!isRivestreamTrigger) {
           setEmbedUrl(null); // Hide iframe
@@ -3565,6 +3650,20 @@ const WatchTv: React.FC = () => {
             currentSourceRef.current = 'bravo';
           }
         }
+        else if (type === 'kisskh_main' && acceptedPlaybackUrl) {
+          setSelectedSource('kisskh');
+          setVideoSource(acceptedPlaybackUrl);
+          setEmbedUrl(null);
+          setEmbedType(null);
+          currentSourceRef.current = 'kisskh';
+          if (isKisskhFallbackCompletion) {
+            setKisskhSources(current => current.map(source => (
+              source.id === event.detail.id
+                ? { ...source, url: acceptedPlaybackUrl, fallbackToken: '' }
+                : source
+            )));
+          }
+        }
       }
       // Handle Embed source selections
       else if (type === 'frembed' || type === 'custom' || type === 'vostfr' || type === 'omega' || type === 'coflix' || type === 'fstream' || type === 'wiflix' || type === 'j1f' || type === 'swiftflow' || type === 'viper' || type === 'adfree' || type === 'vox') {
@@ -3652,7 +3751,7 @@ const WatchTv: React.FC = () => {
       window.removeEventListener('sourceChange', handleSourceChangeFromMenu as EventListener);
     };
   }, [
-    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, sortedSwiftflow, swiftflowSources, canUseBravo, // Data sources
+    nexusHlsSources, nexusFileSources, darkinoSources, mp4Sources, adFreeM3u8Url, sibnetUrl, darkinoAvailable, fstreamSources, rivestreamSources, viperSources, voxSources, purstreamSources, kisskhSources, sortedFstream, sortedWiflix, sortedJ1f, j1fSources, sortedSwiftflow, swiftflowSources, canUseBravo, // Data sources
     setOnlyVostfrAvailable, setShowEmbedQuality, // State setters for visibility
     setEmbedUrl, setEmbedType, setSelectedSource, // General source setters
     setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedFstreamSource, setVideoSource, setSelectedViperSource, // HLS specific setters
@@ -3706,6 +3805,8 @@ const WatchTv: React.FC = () => {
     hlsSrc = videoSource || '';
   } else if (selectedSource === 'bravo') {
     // Sources Bravo (PurStream) — utilise videoSource défini lors de la sélection
+    hlsSrc = videoSource || '';
+  } else if (selectedSource === 'kisskh') {
     hlsSrc = videoSource || '';
   }
 
@@ -4604,6 +4705,9 @@ const WatchTv: React.FC = () => {
                     <HLSPlayer
                       priorityCategory="moviesTv"
                       autoFallbackGuard={autoFallbackGuard}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -4952,6 +5056,9 @@ const WatchTv: React.FC = () => {
                     <HLSPlayer
                       priorityCategory="moviesTv"
                       autoFallbackGuard={autoFallbackGuard}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -4998,6 +5105,9 @@ const WatchTv: React.FC = () => {
           <HLSPlayer
             priorityCategory="moviesTv"
             autoFallbackGuard={autoFallbackGuard}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
             key={`${selectedSource}-${selectedMp4Source}-${hlsSrc}-${videoSource}`} // Updated key to include videoSource
             src={hlsSrc}
             poster={showPosterPath ? `https://image.tmdb.org/t/p/w500${showPosterPath}` : undefined}
@@ -5076,6 +5186,9 @@ const WatchTv: React.FC = () => {
                     <HLSPlayer
                       priorityCategory="moviesTv"
                       autoFallbackGuard={autoFallbackGuard}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
                       src={''}
                       className="hidden"
                       movieId={undefined}
@@ -5118,9 +5231,12 @@ const WatchTv: React.FC = () => {
       ) : (
         <div className="w-full h-full flex flex-col items-center justify-center relative bg-black">
           <HLSPlayer
-            priorityCategory="moviesTv"
-            autoFallbackGuard={autoFallbackGuard}
-            src={''}
+                      priorityCategory="moviesTv"
+                      autoFallbackGuard={autoFallbackGuard}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
+                      src={''}
             className="hidden"
             movieId={undefined}
             tvShowId={id ?? undefined}

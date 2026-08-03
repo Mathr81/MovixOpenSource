@@ -27,15 +27,26 @@ export type NativeCastCapabilities = {
   castLanProxyVersion: number;
 };
 
-export type PreparedCastTrack = {
-  url: string;
-  headers: Record<string, string>;
+type PreparedCastTrackMetadata = {
   contentType?: string;
   protocolVersion: 1;
   language?: string;
   name?: string;
   active?: boolean;
 };
+
+export type PreparedCastTrack = PreparedCastTrackMetadata & (
+  | {
+      url: string;
+      headers: Record<string, string>;
+      inlineVtt?: never;
+    }
+  | {
+      inlineVtt: string;
+      url?: never;
+      headers?: never;
+    }
+);
 
 export type PreparedCastSource = {
   url: string;

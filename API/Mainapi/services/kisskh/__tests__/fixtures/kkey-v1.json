@@ -1,0 +1,21 @@
+{
+  "algorithmVersion": "kkey-v1-current-test",
+  "keyHex": "00112233445566778899aabbccddeeff",
+  "ivHex": "ffeeddccbbaa99887766554433221100",
+  "fixedMarker": "mg3c3b04ba",
+  "appVersion": "2.8.10",
+  "platformVersion": 4830201,
+  "environmentFields": ["kisskh", "kisskh", "kisskh", "kisskh", "kisskh", "kisskh"],
+  "contexts": {
+    "episode": {
+      "contextId": "00000000-0000-4000-8000-000000000001",
+      "expectedLength": 288,
+      "expectedSha256": "467ddba42f2c147574c74639dfa3e36a809bc8b393305752413d9729018da32b"
+    },
+    "sub": {
+      "contextId": "00000000-0000-4000-8000-000000000002",
+      "expectedLength": 288,
+      "expectedSha256": "41ffc879f27150e4265003254dcb37fc99fb1b8cd33f3477db4a72fe9fed7095"
+    }
+  }
+}

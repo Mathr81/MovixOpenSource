@@ -25,6 +25,8 @@ import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
 import { isContentAllowed, getClassificationLabel } from '../../utils/certificationUtils';
 import { getCoflixPreferredUrl } from '../../utils/coflix';
+import { KisskhServiceError, resolveKisskhMovie } from '../../services/kisskhService';
+import type { KisskhSource, KisskhSubtitleTrack } from '../../types/kisskh';
 import {
   createHlsAutoFallbackGuard,
   resolveAcceptedWatchSource,
@@ -228,7 +230,7 @@ interface NightflixSource {
   label?: string;
 }
 
-type PlayerSourceType = 'primary' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'multi' | 'omega' | 'darkino' | 'mp4' | 'coflix' | 'frembed' | 'custom' | 'nexus_hls' | 'nexus_file' | 'fstream' | 'wiflix' | 'j1f' | 'swiftflow' | 'viper' | 'vidmoly' | 'dropload' | 'adfree' | 'rivestream_hls' | 'rivestream' | 'bravo' | number;
+type PlayerSourceType = 'primary' | 'vostfr' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'multi' | 'omega' | 'darkino' | 'mp4' | 'coflix' | 'frembed' | 'custom' | 'nexus_hls' | 'nexus_file' | 'fstream' | 'wiflix' | 'j1f' | 'swiftflow' | 'viper' | 'vidmoly' | 'dropload' | 'adfree' | 'rivestream_hls' | 'rivestream' | 'bravo' | 'kisskh' | number;
 
 function formatPremidSourceDetail(...parts: Array<string | null | undefined>) {
   const normalizedParts = parts
@@ -450,6 +452,14 @@ const WatchMovie: React.FC = () => {
   const [, setVipRetryMessage] = useState<string | null>(null);
   const [onlyVostfrAvailable, setOnlyVostfrAvailable] = useState<boolean>(false);
 
+  // KissKH resolution is movie-scoped. Abort plus generation checks keep a
+  // late response from a previous route from replacing the current movie.
+  const [kisskhSources, setKisskhSources] = useState<KisskhSource[]>([]);
+  const [kisskhSubtitles, setKisskhSubtitles] = useState<KisskhSubtitleTrack[]>([]);
+  const [loadingKisskh, setLoadingKisskh] = useState(true);
+  const kisskhRequestGenerationRef = useRef(0);
+  const kisskhRequestAbortRef = useRef<AbortController | null>(null);
+
   // PurStream (Bravo) HLS states
   const [purstreamSources, setPurstreamSources] = useState<{ url: string; label: string }[]>([]);
   const canUseBravo = isUserVip() || isExtensionAvailable();
@@ -632,7 +642,7 @@ const WatchMovie: React.FC = () => {
         videoSource
         || rivestreamSources[selectedRivestreamSource]?.url
         || '';
-    } else if (selectedSource === 'bravo') {
+    } else if (selectedSource === 'bravo' || selectedSource === 'kisskh') {
       directSourceUrl = videoSource || '';
     }
 
@@ -681,6 +691,62 @@ const WatchMovie: React.FC = () => {
     } : undefined,
     isActive: !isLoading && !!id,
   });
+
+  useEffect(() => {
+    kisskhRequestAbortRef.current?.abort();
+    const kisskhController = new AbortController();
+    const kisskhGeneration = kisskhRequestGenerationRef.current + 1;
+    kisskhRequestGenerationRef.current = kisskhGeneration;
+    kisskhRequestAbortRef.current = kisskhController;
+    setKisskhSources([]);
+    setKisskhSubtitles([]);
+    setLoadingKisskh(true);
+
+    if (!id) {
+      setLoadingKisskh(false);
+      return () => kisskhController.abort();
+    }
+
+    const resolveMovie = async () => {
+      try {
+        const resolution = await resolveKisskhMovie(Number(id), { signal: kisskhController.signal });
+        if (
+          kisskhController.signal.aborted
+          || kisskhRequestGenerationRef.current !== kisskhGeneration
+        ) {
+          return;
+        }
+        setKisskhSources(resolution.sources);
+        setKisskhSubtitles(resolution.subtitles);
+      } catch (error) {
+        if (
+          kisskhController.signal.aborted
+          || kisskhRequestGenerationRef.current !== kisskhGeneration
+        ) {
+          return;
+        }
+        if (error instanceof KisskhServiceError && error.code === 'retrieval_in_progress') {
+          return;
+        }
+        // KissKH is additive; other provider sources remain usable on failure.
+      } finally {
+        if (
+          !kisskhController.signal.aborted
+          && kisskhRequestGenerationRef.current === kisskhGeneration
+        ) {
+          setLoadingKisskh(false);
+        }
+      }
+    };
+
+    void resolveMovie();
+    return () => {
+      kisskhController.abort();
+      if (kisskhRequestAbortRef.current === kisskhController) {
+        kisskhRequestAbortRef.current = null;
+      }
+    };
+  }, [id]);
 
   useEffect(() => {
     // Fetch movie sources
@@ -2771,12 +2837,13 @@ const WatchMovie: React.FC = () => {
       const type = typeof rawType === 'number' ? String(rawType) : rawType;
       const isAutomaticFallback =
         typeof origin === 'string' && origin.includes('auto-fallback');
+      const isKisskhFallbackCompletion = origin === 'kisskh-fallback';
 
       // Reject stale auto-fallback events whose originating src no longer matches
       // the currently-active player URL. This prevents a late error handler from
       // a previously-selected player (e.g. darkino) reverting a user's manual
       // switch to another source (e.g. fsvid).
-      if (isAutomaticFallback && typeof fromSrc === 'string' && fromSrc) {
+      if ((isAutomaticFallback || isKisskhFallbackCompletion) && typeof fromSrc === 'string' && fromSrc) {
         if (fromSrc !== currentActiveUrlRef.current) {
           console.log(
             `[WatchMovie] Ignoring stale auto-fallback sourceChange (from=${fromSrc.substring(0, 80)} current=${currentActiveUrlRef.current.substring(0, 80)})`
@@ -2853,6 +2920,14 @@ const WatchMovie: React.FC = () => {
               allowed: bravoAllowed,
               fallback: 'last',
             });
+          case 'kisskh_main':
+            return isKisskhFallbackCompletion
+              ? resolveAcceptedWatchSource({ requestedSource: url })
+              : resolveAcceptedWatchSource({
+                  requestedSource: url,
+                  availableSources: kisskhSources.map(source => source.url),
+                  fallback: 'first',
+                });
           case 'frembed':
           case 'custom':
           case 'vostfr':
@@ -2891,7 +2966,7 @@ const WatchMovie: React.FC = () => {
         && !isAutomaticFallback
         && typeof type === 'string'
       ) {
-        setLastPlayer(type);
+        setLastPlayer(type === 'kisskh_main' ? 'kisskh' : type);
       }
 
       // When any source is picked from the menu, hide the "no content" message and the menu itself.
@@ -2905,7 +2980,7 @@ const WatchMovie: React.FC = () => {
       }
 
       // Handle HLS source selections
-      if (type === 'darkino' || type === 'mp4' || type === 'nexus_hls' || type === 'nexus_file' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo') {
+      if (type === 'darkino' || type === 'mp4' || type === 'nexus_hls' || type === 'nexus_file' || type === 'rivestream_hls' || type === 'rivestream' || type === 'bravo' || type === 'kisskh_main') {
         // Ne pas cacher l'iframe si c'est juste le déclencheur de chargement Rivestream
         if (!isRivestreamTrigger) {
           setEmbedUrl(null); // Hide iframe
@@ -3023,6 +3098,19 @@ const WatchMovie: React.FC = () => {
             currentSourceRef.current = 'bravo';
             console.log(`✅ [WatchMovie] Playing Bravo via HLS: ${chosenBravoUrl}`);
           }
+        } else if (type === 'kisskh_main' && acceptedPlaybackUrl) {
+          setSelectedSource('kisskh');
+          setVideoSource(acceptedPlaybackUrl);
+          setEmbedUrl(null);
+          setEmbedType(null);
+          currentSourceRef.current = 'kisskh';
+          if (isKisskhFallbackCompletion) {
+            setKisskhSources(current => current.map(source => (
+              source.id === event.detail.id
+                ? { ...source, url: acceptedPlaybackUrl, fallbackToken: '' }
+                : source
+            )));
+          }
         }
       }
       // Handle Embed source selections
@@ -3102,7 +3190,7 @@ const WatchMovie: React.FC = () => {
     };
   }, [
     // State values used in logic
-    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, rivestreamSources, purstreamSources, rivestreamLoaded, loadingRivestream, canUseBravo,
+    darkinoSources, mp4Sources, darkinoAvailable, nexusHlsSources, nexusFileSources, fstreamSources, wiflixSources, j1fSources, swiftflowSources, sortedFstream, sortedWiflix, sortedJ1f, sortedSwiftflow, viperSources, rivestreamSources, purstreamSources, kisskhSources, rivestreamLoaded, loadingRivestream, canUseBravo,
     // State setters
     setOnlyVostfrAvailable, setShowEmbedQuality, setEmbedUrl, setEmbedType,
     setSelectedSource, setSelectedDarkinoSource, setSelectedMp4Source, setSelectedNexusHlsSource, setSelectedNexusFileSource, setSelectedFstreamSource, setSelectedWiflixSource, setSelectedViperSource, setSelectedRivestreamSource, setVideoSource,
@@ -3534,6 +3622,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -3641,6 +3732,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -3743,6 +3837,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
 
             title={movieTitle}
             initialTime={watchProgress}
@@ -3793,6 +3890,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -3854,6 +3954,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
 
             title={movieTitle}
             initialTime={watchProgress}
@@ -3898,6 +4001,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -3912,7 +4018,7 @@ const WatchMovie: React.FC = () => {
             )}
           </AnimatePresence>
         </div>
-      ) : ((selectedSource === 'nexus_hls' && nexusHlsSources.length > 0) || (selectedSource === 'bravo' && purstreamSources.length > 0 && canUseBravo)) && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
+      ) : ((selectedSource === 'nexus_hls' && nexusHlsSources.length > 0) || (selectedSource === 'bravo' && purstreamSources.length > 0 && canUseBravo) || (selectedSource === 'kisskh' && kisskhSources.length > 0)) && (!adPopupTriggered || shouldLoadIframe || hasClickedAd) ? (
         <div className="w-full h-full flex items-center justify-center">
           <HLSPlayer
             priorityCategory="moviesTv"
@@ -3959,6 +4065,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
 
             title={movieTitle}
             initialTime={watchProgress}
@@ -4009,6 +4118,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -4070,6 +4182,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
 
             title={movieTitle}
             initialTime={watchProgress}
@@ -4120,6 +4235,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -4195,6 +4313,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                 viperSources={sortedViper}
+                kisskhSources={kisskhSources}
+                kisskhSubtitles={kisskhSubtitles}
+                loadingKisskh={loadingKisskh}
 
                 title={movieTitle}
                 initialTime={watchProgress}
@@ -4241,6 +4362,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                           viperSources={sortedViper}
+                          kisskhSources={kisskhSources}
+                          kisskhSubtitles={kisskhSubtitles}
+                          loadingKisskh={loadingKisskh}
 
                           autoPlay={false}
                           onlyQualityMenu={true}
@@ -4277,6 +4401,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                 viperSources={sortedViper}
+                kisskhSources={kisskhSources}
+                kisskhSubtitles={kisskhSubtitles}
+                loadingKisskh={loadingKisskh}
 
                 autoPlay={false}
                 onlyQualityMenu={true}
@@ -4339,6 +4466,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
             viperSources={sortedViper}
+            kisskhSources={kisskhSources}
+            kisskhSubtitles={kisskhSubtitles}
+            loadingKisskh={loadingKisskh}
 
             title={movieTitle}
             initialTime={watchProgress}
@@ -4383,6 +4513,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -4508,6 +4641,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}
@@ -4612,6 +4748,9 @@ const WatchMovie: React.FC = () => {
                       j1fSources={sortedJ1f}
                       swiftflowSources={sortedSwiftflow}
                       viperSources={sortedViper}
+                      kisskhSources={kisskhSources}
+                      kisskhSubtitles={kisskhSubtitles}
+                      loadingKisskh={loadingKisskh}
 
                       autoPlay={false}
                       onlyQualityMenu={true}

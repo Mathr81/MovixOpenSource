@@ -244,6 +244,46 @@ function calculateTitleSimilarity(title1, title2) {
   return union === 0 ? 0 : intersection / union;
 }
 
+function normalizeFStreamBaseTitle(value) {
+  return (value || '')
+    .replace(/\s*\(\d{4}\)\s*/g, ' ')
+    .replace(/\s*-\s*Saison\s+\d+.*$/i, '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isFStreamCachedSelectionValid(cachedData, requestedSeason) {
+  const tmdbTitle = cachedData?.tmdb?.title;
+  const bestMatch = cachedData?.search?.bestMatch;
+  if (!tmdbTitle || !bestMatch) return true;
+
+  const requestedSeasonNumber = parseInt(requestedSeason, 10);
+  const cachedSeasonNumber = parseInt(bestMatch.seasonNumber, 10);
+  if (
+    !Number.isNaN(requestedSeasonNumber) &&
+    !Number.isNaN(cachedSeasonNumber) &&
+    cachedSeasonNumber !== requestedSeasonNumber
+  ) {
+    return false;
+  }
+
+  const normalizedTmdbTitle = normalizeFStreamBaseTitle(tmdbTitle);
+  const normalizedMatchTitle = normalizeFStreamBaseTitle(
+    bestMatch.originalTitle || bestMatch.title,
+  );
+  const tmdbTokens = normalizedTmdbTitle.split(' ').filter(Boolean);
+
+  if (tmdbTokens.length === 1) {
+    return normalizedMatchTitle === normalizedTmdbTitle;
+  }
+
+  return true;
+}
+
 // === Search Functions ===
 async function searchFStream(query, page = 1) {
   try {
@@ -325,6 +365,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
     if (!normalizedSerie) return [];
 
     const results = [];
+    const exactResults = [];
+    const normalizedSerieTokens = normalizedSerie.split(' ').filter(Boolean);
     $('div.search-item').each((_, element) => {
       const $el = $(element);
       const rawTitle = $el.find('.search-title').text().trim();
@@ -341,6 +383,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
       const baseTitle = rawTitle.replace(/\s*-\s*Saison\s+\d+.*$/i, '').replace(/\s*\(\d{4}\)\s*$/, '').trim();
       const normalizedBase = normalize(baseTitle);
       if (!normalizedBase) return;
+      const isExactTitle = normalizedBase === normalizedSerie;
+      if (normalizedSerieTokens.length === 1 && !isExactTitle) return;
       if (!normalizedBase.includes(normalizedSerie) && !normalizedSerie.includes(normalizedBase)) return;
 
       const titleYearMatch = rawTitle.match(/\((\d{4})\)/);
@@ -353,7 +397,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
         ? link
         : `${FSTREAM_BASE_URL}${link.startsWith('/') ? '' : '/'}${link}`;
 
-      results.push({
+      const target = isExactTitle ? exactResults : results;
+      target.push({
         title: cleanTitle,
         originalTitle: rawTitle,
         link: normalizedLink,
@@ -362,7 +407,7 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
       });
     });
 
-    return results;
+    return exactResults.length > 0 ? exactResults : results;
   } catch (error) {
     console.error(`[FSTREAM TV] Erreur lors de la recuperation des saisons pour ${tmdbId}: ${error.message}`);
     return [];
@@ -1696,7 +1741,8 @@ router.get('/tv/:id/season/:season', async (req, res) => {
 
   try {
     const cachedData = await getFStreamFromCache(cacheKey);
-    if (cachedData) {
+    const cachedSelectionIsValid = isFStreamCachedSelectionValid(cachedData, season);
+    if (cachedData && cachedSelectionIsValid) {
       res.status(200).json(cachedData);
 
       // Background update
@@ -1873,6 +1919,9 @@ router.get('/tv/:id/season/:season', async (req, res) => {
       });
 
       return;
+    }
+    if (cachedData && !cachedSelectionIsValid) {
+      console.warn(`[FSTREAM TV] Cache ignore: fiche incompatible avec le titre TMDB pour ${id} S${season}`);
     }
 
     // No cache

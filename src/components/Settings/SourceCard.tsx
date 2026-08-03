@@ -34,6 +34,7 @@ export const SOURCE_LABELS: Record<TopLevelSourceId, string> = {
   vostfr: 'Vostfr',
   viper: 'Viper',
   vox: 'Vox',
+  kisskh: 'KissKH',
   custom: 'Lecteur Movix',
 };
 

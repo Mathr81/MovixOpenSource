@@ -4,18 +4,20 @@ import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.net.URI
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 internal data class CastPreparedTextTrack(
-    val url: String,
+    val url: String? = null,
     val language: String? = null,
     val name: String? = null,
     val contentType: String = "text/vtt",
     val headers: Map<String, String> = emptyMap(),
     val active: Boolean = false,
+    val inlineVtt: String? = null,
 )
 
 internal data class CastPreparedSource(
@@ -321,7 +323,15 @@ internal class CastMediaPreparer(
         sessionId: String,
         track: CastPreparedTextTrack,
     ): PreparedCastTextTrack {
-        val trackUrl = validateUrl(track.url).toString()
+        track.inlineVtt?.let { inlineVtt ->
+            if (track.url != null) {
+                throw CastMediaPreparationException("MOVIX_RELAY_INVALID_TEXT_TRACK")
+            }
+            return prepareInlineTextTrack(sessionId, track, inlineVtt)
+        }
+        val trackUrl = validateUrl(
+            track.url ?: throw CastMediaPreparationException("MOVIX_RELAY_INVALID_TEXT_TRACK"),
+        ).toString()
         val trackHeaders = MediaProxyPolicy.sanitizeRequestHeaders(track.headers)
         val response = execute(trackUrl, "GET", trackHeaders)
         response.use {
@@ -354,6 +364,59 @@ internal class CastMediaPreparer(
                 active = track.active,
             )
         }
+    }
+
+    private fun prepareInlineTextTrack(
+        sessionId: String,
+        track: CastPreparedTextTrack,
+        input: String,
+    ): PreparedCastTextTrack {
+        val normalized = input.removePrefix("\uFEFF").replace("\r\n", "\n").replace('\r', '\n')
+        val bytes = normalized.toByteArray(Charsets.UTF_8)
+        if (
+            bytes.isEmpty() ||
+            bytes.size > MAX_TEXT_TRACK_BYTES ||
+            normalized.indexOf('\u0000') >= 0 ||
+            !normalized.startsWith("WEBVTT") ||
+            !INLINE_VTT_CUE.containsMatchIn(normalized)
+        ) {
+            throw CastMediaPreparationException("MOVIX_RELAY_INVALID_TEXT_TRACK")
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .take(16)
+            .joinToString("") { "%02x".format(it) }
+        val syntheticUrl = "https://inline.movix.invalid/$digest.vtt"
+        val preparedResponse = MediaProxyPreparedResponse(
+            200,
+            "OK",
+            mapOf(
+                "Content-Type" to "text/vtt; charset=utf-8",
+                "Access-Control-Allow-Origin" to "*",
+                "Cache-Control" to "no-store",
+            ),
+            bytes,
+            syntheticUrl,
+        )
+        val registration = sessionStore.registerResource(
+            sessionId = sessionId,
+            upstreamUrl = syntheticUrl,
+            port = port,
+            preparedResponse = preparedResponse,
+            headers = emptyMap(),
+        )
+        sessionStore.setPersistentPreparedResponse(
+            sessionId,
+            registration.resourceId,
+            preparedResponse,
+        )
+        return PreparedCastTextTrack(
+            lanUrl = registration.localUrl,
+            language = track.language?.take(35),
+            name = track.name?.take(80),
+            contentType = "text/vtt",
+            active = track.active,
+        )
     }
 
     private fun execute(
@@ -726,6 +789,9 @@ internal class CastMediaPreparer(
     }
 
     companion object {
+        private val INLINE_VTT_CUE = Regex(
+            "(?m)^\\s*\\d{2,}:\\d{2}:\\d{2}\\.\\d{3}\\s+-->\\s+\\d{2,}:\\d{2}:\\d{2}\\.\\d{3}(?:\\s|$)",
+        )
         private const val MAX_MANIFEST_BYTES = 512 * 1024
         private const val MAX_TEXT_TRACK_BYTES = 2 * 1024 * 1024
         private const val MAX_INIT_PROBE_BYTES = 256 * 1024

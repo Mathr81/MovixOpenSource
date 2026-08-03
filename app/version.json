@@ -1,13 +1,13 @@
 {
-  "version": "2.5.7",
-  "buildNumber": 16,
+  "version": "2.5.8",
+  "buildNumber": 17,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72217738,
-  "apkSha256": "cdb76bc46a9f4a767d3b216975e8e528520355751483fd7530fa00ac1258d30d",
+  "apkSizeBytes": 72222238,
+  "apkSha256": "290317f1002f3bfda746626951e221a4de8bb37828461bffb8bfc92e078b3ac2",
   "mandatory": false,
-  "releasedAt": "2026-08-01T21:09:32.083Z",
+  "releasedAt": "2026-08-03T19:19:40.810Z",
   "releaseNotes": {
-    "fr": "Correction du Cast : il devrait désormais fonctionner avec à peu près toutes les sources. La lecture locale se rétablit correctement après une déconnexion du Cast. L’écran ne s’éteint plus pendant le visionnage d’un contenu. Le mode Picture-in-Picture a également été corrigé.",
-    "en": "Cast fixes: it should now work with nearly all sources. Local playback now recovers correctly after disconnecting from Cast. The screen no longer turns off while watching content. Picture-in-Picture mode has also been fixed."
+    "fr": "Correction des proxys Fsvid et Vidzy pour l’extraction fiable des flux vidéo. Ajout du support de la nouvelle source KissKH. Correction du Cast pour prendre en charge les sous-titres.",
+    "en": "Fixed the Fsvid and Vidzy proxy extractors for reliable video streams. Added support for the new KissKH source. Fixed Cast support for subtitles."
   }
 }

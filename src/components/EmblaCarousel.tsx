@@ -333,7 +333,7 @@ const CarouselCard = React.memo<{
             ) : null}
             {year && (
               <div className="flex items-center gap-1">
-                <Calendar className="w-3 h-3 text-white/60" />
+            <Calendar className="w-3 h-3 text-white opacity-60" />
                 <span className="text-xs text-white/60">{year}</span>
               </div>
             )}

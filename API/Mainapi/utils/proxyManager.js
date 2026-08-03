@@ -5,6 +5,8 @@
  */
 
 const axios = require("axios");
+const cluster = require("node:cluster");
+const crypto = require("node:crypto");
 const http = require("http");
 const https = require("https");
 const { SocksProxyAgent } = require("socks-proxy-agent");
@@ -731,6 +733,13 @@ let cycleTLSInstance = null;
 let cycleTLSInitializing = false;
 const cycleTLSWaiters = [];
 
+function cycleTlsInitOptions(workerId = cluster.worker?.id ?? 0) {
+  const normalizedWorkerId = Number.isSafeInteger(workerId) && workerId >= 0 ? workerId : 0;
+  const port = 9119 + normalizedWorkerId;
+  if (port > 65535) throw new RangeError("identifiant worker CycleTLS invalide");
+  return { port };
+}
+
 async function getCycleTLS() {
   if (cycleTLSInstance) return cycleTLSInstance;
   if (cycleTLSInitializing) {
@@ -738,7 +747,7 @@ async function getCycleTLS() {
   }
   cycleTLSInitializing = true;
   try {
-    cycleTLSInstance = await initCycleTLS();
+    cycleTLSInstance = await initCycleTLS(cycleTlsInitOptions());
     cycleTLSInitializing = false;
     for (const waiter of cycleTLSWaiters) waiter(cycleTLSInstance);
     cycleTLSWaiters.length = 0;
@@ -1278,15 +1287,25 @@ const { acquireRedisLock } = require("./redisLock");
 
 const PROXY_ROTATION_REDIS_PREFIX = "proxyscrape:rotation:v1";
 const PROXY_RATE_LIMIT_REDIS_PREFIX = "proxyscrape:rate-limit:v1";
+const KISSKH_METADATA_PROXY_OPTIONS = Object.freeze({
+  poolName: "KISSKH_METADATA",
+  minIntervalMs: 1000,
+  digestIdentity: true,
+  maxCandidates: 1000,
+});
 const proxyRateLimitState = new Map();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildProxyRateLimitKey(poolName, proxy) {
+function buildProxyRateLimitKey(poolName, proxy, digestIdentity = false) {
   if (!proxy || !proxy.host || !proxy.port) return null;
-  return `${PROXY_RATE_LIMIT_REDIS_PREFIX}:${poolName}:${proxy.type || "proxy"}:${proxy.host}:${proxy.port}:${proxy.auth || ""}`;
+  const identity = `${String(proxy.type || "proxy").toLowerCase()}:${String(proxy.host).trim().toLowerCase()}:${Number(proxy.port)}:${proxy.auth || ""}`;
+  const suffix = digestIdentity
+    ? crypto.createHash("sha256").update(identity).digest("hex")
+    : identity;
+  return `${PROXY_RATE_LIMIT_REDIS_PREFIX}:${poolName}:${suffix}`;
 }
 
 function reserveLocalRateLimitedProxy(proxyKey, minIntervalMs) {
@@ -1302,7 +1321,7 @@ function reserveLocalRateLimitedProxy(proxyKey, minIntervalMs) {
   return true;
 }
 
-async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs) {
+async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs, digestIdentity = false) {
   if (!proxy) return false;
 
   const safeIntervalMs = Math.max(0, Math.floor(Number(minIntervalMs) || 0));
@@ -1310,7 +1329,7 @@ async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs) {
     return true;
   }
 
-  const proxyKey = buildProxyRateLimitKey(poolName, proxy);
+  const proxyKey = buildProxyRateLimitKey(poolName, proxy, digestIdentity);
   if (!proxyKey) {
     return false;
   }
@@ -1402,6 +1421,7 @@ async function pickNextRateLimitedProxy(pool, options = {}) {
     minIntervalMs = 0,
     waitTimeoutMs = 0,
     retryDelayMs = 25,
+    digestIdentity = false,
   } = options;
 
   const safeMinIntervalMs = Math.max(0, Math.floor(Number(minIntervalMs) || 0));
@@ -1422,6 +1442,7 @@ async function pickNextRateLimitedProxy(pool, options = {}) {
         poolName,
         proxy,
         safeMinIntervalMs,
+        digestIdentity,
       );
       if (reserved) {
         return proxy;
@@ -1443,6 +1464,64 @@ async function pickNextSocks5Proxy(options = {}) {
     ...options,
   });
   return proxy || null;
+}
+
+async function getKisskhProxyCandidates(options = {}) {
+  const requestedLimit = options.maxCandidates === undefined
+    ? KISSKH_METADATA_PROXY_OPTIONS.maxCandidates
+    : Number(options.maxCandidates);
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit <= 0) {
+    throw new TypeError("maxCandidates KissKH invalide");
+  }
+
+  const poolSnapshot = PROXIES.slice();
+  if (poolSnapshot.length === 0) return [];
+  const scanLimit = Math.min(
+    poolSnapshot.length,
+    requestedLimit,
+    KISSKH_METADATA_PROXY_OPTIONS.maxCandidates,
+  );
+  const startIndex = await reserveProxyWindow(
+    KISSKH_METADATA_PROXY_OPTIONS.poolName,
+    poolSnapshot.length,
+    1,
+  );
+  const candidates = [];
+  const seen = new Set();
+  for (let offset = 0; offset < scanLimit; offset += 1) {
+    const proxy = poolSnapshot[(startIndex + offset) % poolSnapshot.length];
+    const identity = buildProxyRateLimitKey(
+      KISSKH_METADATA_PROXY_OPTIONS.poolName,
+      proxy,
+      KISSKH_METADATA_PROXY_OPTIONS.digestIdentity,
+    );
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    candidates.push(proxy);
+  }
+  return candidates;
+}
+
+function reserveKisskhProxy(proxy, options = {}) {
+  const requestedInterval = Math.floor(Number(options.minIntervalMs) || 0);
+  const minIntervalMs = Math.max(
+    KISSKH_METADATA_PROXY_OPTIONS.minIntervalMs,
+    requestedInterval,
+  );
+  return reserveRateLimitedProxy(
+    KISSKH_METADATA_PROXY_OPTIONS.poolName,
+    proxy,
+    minIntervalMs,
+    KISSKH_METADATA_PROXY_OPTIONS.digestIdentity,
+  );
+}
+
+async function pickNextKisskhProxy(options = {}) {
+  const candidates = await getKisskhProxyCandidates(options);
+  for (const proxy of candidates) {
+    if (await reserveKisskhProxy(proxy, options)) return proxy;
+  }
+  return null;
 }
 
 async function pickDedicatedSocks5Proxy(options = {}) {
@@ -1802,7 +1881,9 @@ function buildProxyScrapeCandidates(protocol) {
       params: {
         type: "getproxies",
         protocol,
-        format: "normal",
+        format: "credentials",
+        credential_format: 2,
+        status: "online",
       },
       label: `v4 account ${accountPath}`,
     },
@@ -2475,10 +2556,14 @@ module.exports = {
   pickRandomProxy,
   pickProxyscrapeCandidates,
   pickNextSocks5Proxy,
+  getKisskhProxyCandidates,
+  reserveKisskhProxy,
+  pickNextKisskhProxy,
   pickDedicatedSocks5Proxy,
   getProxyAgent,
   getDarkinoHttpProxyAgent,
 
   // Cleanup
+  cycleTlsInitOptions,
   shutdownCycleTLS,
 };

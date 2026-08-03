@@ -20,7 +20,8 @@ export interface CastRemoteStatus {
 }
 
 export interface CastTextTrack {
-  url: string;
+  url?: string;
+  inlineVtt?: string;
   contentType: 'text/vtt' | string;
   language?: string;
   name?: string;

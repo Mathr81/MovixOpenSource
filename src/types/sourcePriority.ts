@@ -4,7 +4,7 @@
 export const TOP_LEVEL_SOURCE_IDS = [
   'darkino', 'mp4', 'nexus_hls', 'bravo',
   'fstream', 'wiflix', 'j1f', 'swiftflow', 'omega', 'coflix', 'frembed', 'vostfr',
-  'viper', 'vox', 'custom',
+  'viper', 'vox', 'kisskh', 'custom',
 ] as const;
 export type TopLevelSourceId = typeof TOP_LEVEL_SOURCE_IDS[number];
 
@@ -64,7 +64,7 @@ export interface CustomHoster {
 }
 
 export interface SourcePriorityPrefs {
-  version: 1;
+  version: 3;
   categories: {
     moviesTv: MoviesTvPrefs;
     anime: AnimePrefs;

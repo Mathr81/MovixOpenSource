@@ -1153,7 +1153,7 @@ const AdminWishboard: React.FC = () => {
                                 Classement des Admins / Uploaders
                             </h3>
                             <p className="mt-1 flex items-center gap-2 text-sm text-white/45">
-                                <CalendarDays className="h-4 w-4 text-amber-400/80" />
+                            <CalendarDays className="h-4 w-4 text-amber-400 opacity-80" />
                                 {selectedLeaderboardMonthLabel}
                             </p>
                             <div className="flex flex-wrap items-center gap-3 mt-3">

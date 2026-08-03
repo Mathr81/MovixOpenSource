@@ -523,7 +523,7 @@ const VipInvoicePage: React.FC = () => {
                         {showExpiration && (
                           <div className="flex items-center gap-3 py-4">
                             <div className="p-2.5 rounded-xl bg-white/8">
-                              <Clock3 className="h-5 w-5 text-white/85" />
+                    <Clock3 className="h-5 w-5 text-white opacity-[0.85]" />
                             </div>
                             <div>
                               <p className="text-sm font-semibold text-white">{t('vipDonations.invoice.expirationTitle')}</p>
@@ -695,7 +695,7 @@ const VipInvoicePage: React.FC = () => {
                       {showExpiration && (
                         <div className="flex items-center gap-3 py-4">
                           <div className="p-2.5 rounded-xl bg-white/8">
-                            <Clock3 className="h-5 w-5 text-white/85" />
+                  <Clock3 className="h-5 w-5 text-white opacity-[0.85]" />
                           </div>
                           <div>
                             <p className="text-sm font-semibold text-white">{t('vipDonations.invoice.expirationTitle')}</p>

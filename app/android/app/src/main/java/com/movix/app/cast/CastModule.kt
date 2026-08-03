@@ -460,7 +460,9 @@ class CastModule internal constructor(
             for (index in 0 until minOf(array.size(), 16)) {
                 if (array.getType(index) != ReadableType.Map) continue
                 val track = array.getMap(index) ?: continue
-                val url = track.optionalString("url") ?: continue
+                val url = track.optionalString("url")
+                val inlineVtt = track.optionalString("inlineVtt")
+                if ((url == null) == (inlineVtt == null)) continue
                 add(
                     CastPreparedTextTrack(
                         url = url,
@@ -472,6 +474,7 @@ class CastModule internal constructor(
                             track.hasKey("active") &&
                                 track.getType("active") == ReadableType.Boolean &&
                                 track.getBoolean("active"),
+                        inlineVtt = inlineVtt,
                     ),
                 )
             }

@@ -272,7 +272,8 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         if (
             !candidate ||
             candidate.length > MAX_MEDIA_URL_LENGTH ||
-            !candidate.toLowerCase().includes('.m3u8')
+            !candidate.toLowerCase().includes('.m3u8') ||
+            candidate.toLowerCase().includes('troll')
         ) {
             return null;
         }
@@ -307,6 +308,118 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         }
         return parsed.href;
     };
+
+    // Replay the decoder described by the player without evaluating remote JS.
+    // Seed, step, mask, variable names, payload, and reverse order all come
+    // from the current page, so provider-side parameter rotations keep working.
+    const rollingXorPattern =
+        /(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,512}?for\s*\(\s*var\s+([A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\2\s*<\s*\1\.length\s*;\s*\2\+\+\s*\)\s*\{[\s\S]{0,512}?(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*\(\s*([\s\S]{1,128}?)\s*\)\s*&\s*(0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,512}?([A-Za-z_$][\w$]*)\s*\+=\s*String\.fromCharCode\(\s*\1\.charCodeAt\(\s*\2\s*\)\s*\^\s*\3\s*\)[\s\S]{0,256}?\}\s*return\s+\6(\s*\.split\(\s*["']["']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["']["']\s*\))?\s*\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    const numericLiteralPattern = '(?:0[xX][0-9a-fA-F]+|\\d+)';
+    const parseRollingParameters = (expression, indexName) => {
+        const indexToken = indexName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const normalized = expression.replace(/[\s()]/g, '');
+        const layouts = [
+            {
+                pattern: new RegExp(
+                    `^(${numericLiteralPattern})\\+${indexToken}\\*(${numericLiteralPattern})$`,
+                ),
+                seed: 1,
+                step: 2,
+            },
+            {
+                pattern: new RegExp(
+                    `^(${numericLiteralPattern})\\+(${numericLiteralPattern})\\*${indexToken}$`,
+                ),
+                seed: 1,
+                step: 2,
+            },
+            {
+                pattern: new RegExp(
+                    `^${indexToken}\\*(${numericLiteralPattern})\\+(${numericLiteralPattern})$`,
+                ),
+                seed: 2,
+                step: 1,
+            },
+            {
+                pattern: new RegExp(
+                    `^(${numericLiteralPattern})\\*${indexToken}\\+(${numericLiteralPattern})$`,
+                ),
+                seed: 2,
+                step: 1,
+            },
+            {
+                pattern: new RegExp(
+                    `^(${numericLiteralPattern})\\+${indexToken}$`,
+                ),
+                seed: 1,
+                fixedStep: 1,
+            },
+            {
+                pattern: new RegExp(
+                    `^${indexToken}\\+(${numericLiteralPattern})$`,
+                ),
+                seed: 1,
+                fixedStep: 1,
+            },
+        ];
+
+        for (const layout of layouts) {
+            const match = normalized.match(layout.pattern);
+            if (!match) continue;
+            return {
+                seed: Number(match[layout.seed]),
+                step:
+                    layout.fixedStep === undefined
+                        ? Number(match[layout.step])
+                        : layout.fixedStep,
+            };
+        }
+        return null;
+    };
+
+    for (const match of String(script || '').matchAll(rollingXorPattern)) {
+        const parameters = parseRollingParameters(match[4], match[2]);
+        const mask = Number(match[5]);
+        if (
+            !parameters ||
+            !Number.isSafeInteger(parameters.seed) ||
+            parameters.seed < 0 ||
+            parameters.seed > 0xffffffff ||
+            !Number.isSafeInteger(parameters.step) ||
+            parameters.step < 0 ||
+            parameters.step > 0xffffffff ||
+            !Number.isSafeInteger(mask) ||
+            mask < 0 ||
+            mask > 255
+        ) {
+            continue;
+        }
+
+        const payload = match[8];
+        if (payload.length > MAX_XOR_PAYLOAD_LENGTH) continue;
+        const normalizedPayload = payload.replace(/-/g, '+').replace(/_/g, '/');
+        if (normalizedPayload.length % 4 === 1) continue;
+        const paddedPayload = normalizedPayload.padEnd(
+            normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+            '=',
+        );
+
+        try {
+            const encrypted = atob(paddedPayload);
+            const decodedBytes = Uint8Array.from(
+                encrypted,
+                (character, index) =>
+                    character.charCodeAt(0) ^
+                    ((parameters.seed + index * parameters.step) & mask),
+            );
+            if (match[7]) decodedBytes.reverse();
+            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
+            const candidate = normalizeCandidate(decoded);
+            if (candidate) return candidate;
+        } catch {
+            // Try the next decoder or one of the legacy formats below.
+        }
+    }
 
     const xorPattern =
         /var\s+[A-Za-z_$][\w$]*\s*=\s*\[([0-9,\s]+)\]\s*,\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,2000}?\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
@@ -356,6 +469,14 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         if (candidate) return candidate;
     }
     return null;
+}
+
+function extractFsvidVidzyM3u8FromHtml(html, embedUrl) {
+    const direct = extractM3u8UrlFromDecodedScript(html, embedUrl);
+    if (direct) return direct;
+
+    const decoded = deobfuscatePackedScript(html);
+    return decoded ? extractM3u8UrlFromDecodedScript(decoded, embedUrl) : null;
 }
 
 function extractUqloadMediaUrl(html) {
@@ -577,7 +698,7 @@ async function extractFsvid(fsvidUrl) {
 
     const cacheKey = md5Hash(fsvidUrl);
     const cached = caches.fsvid.get(cacheKey);
-    if (cached) {
+    if (cached && !String(cached.m3u8Url || '').toLowerCase().includes('troll')) {
         console.log('[EXT-FSVID] Cache hit');
         return { ...cached, fromCache: true };
     }
@@ -613,47 +734,11 @@ async function extractFsvid(fsvidUrl) {
 
         const html = await resp.text();
         console.log(`[EXT-FSVID] HTML length: ${html.length}`);
-
-        // Check if the page has packed script
-        const hasEval = html.includes('eval(function(p,a,c,k,e,');
-        console.log(`[EXT-FSVID] Contains eval packer: ${hasEval}`);
-
-        if (!hasEval) {
-            // Try to find m3u8 directly in page (some fsvid pages have it in plain)
-            const directM3u8 = html.match(/["'](https?:\/\/[^"']*\.m3u8[^"']*)["']/);
-            if (directM3u8) {
-                console.log(`[EXT-FSVID] Found direct M3U8 (no packer needed): ${directM3u8[1]}`);
-                const m3u8Url = directM3u8[1].replace(/\\\//g, '/');
-                const result = { m3u8Url, success: true, source: 'fsvid' };
-                caches.fsvid.set(cacheKey, result);
-                return result;
-            }
-            console.error('[EXT-FSVID] No eval packer and no direct M3U8 found');
-            console.log('[EXT-FSVID] HTML snippet (first 500 chars):', html.substring(0, 500));
-            return { success: false, error: 'Fsvid: No packed script found' };
-        }
-
-        // Pass full HTML to deobfuscatePackedScript (handles escaped quotes)
-        const deobfuscated = deobfuscatePackedScript(html);
-        if (!deobfuscated) {
-            console.error('[EXT-FSVID] Deobfuscation returned null');
-            // Log area around eval for debugging
-            const evalIdx = html.indexOf('eval(function(p,a,c,k,e,');
-            if (evalIdx !== -1) {
-                console.log('[EXT-FSVID] Packer snippet:', html.substring(evalIdx, evalIdx + 200));
-            }
-            return { success: false, error: 'Fsvid: Deobfuscation failed' };
-        }
-
-        console.log(`[EXT-FSVID] Deobfuscated length: ${deobfuscated.length}`);
-        console.log('[EXT-FSVID] Deobfuscated snippet:', deobfuscated.substring(0, 300));
-
-        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, fsvidUrl);
+        const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, fsvidUrl);
 
         if (!m3u8Url) {
-            console.error('[EXT-FSVID] No M3U8 URL found in deobfuscated script');
-            console.log('[EXT-FSVID] Full deobfuscated:', deobfuscated);
-            return { success: false, error: 'Fsvid: M3U8 not found in script' };
+            console.error('[EXT-FSVID] No safe M3U8 URL found in page');
+            return { success: false, error: 'Fsvid: M3U8 not found in page' };
         }
 
         console.log(`[EXT-FSVID] Final M3U8 URL: ${m3u8Url}`);
@@ -679,7 +764,9 @@ async function extractVidzy(vidzyUrl) {
 
     const cacheKey = md5Hash(vidzyUrl);
     const cached = caches.vidzy.get(cacheKey);
-    if (cached) return { ...cached, fromCache: true };
+    if (cached && !String(cached.m3u8Url || '').toLowerCase().includes('troll')) {
+        return { ...cached, fromCache: true };
+    }
 
     try {
         const controller = new AbortController();
@@ -695,14 +782,9 @@ async function extractVidzy(vidzyUrl) {
         clearTimeout(timer);
         if (!resp.ok) return { success: false, error: `Vidzy: HTTP ${resp.status}` };
         const html = await resp.text();
+        const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, vidzyUrl);
 
-        // Pass full HTML to deobfuscatePackedScript (handles escaped quotes)
-        const deobfuscated = deobfuscatePackedScript(html);
-        if (!deobfuscated) return { success: false, error: 'Vidzy: Deobfuscation failed' };
-
-        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, vidzyUrl);
-
-        if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in script' };
+        if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in page' };
 
         const result = { m3u8Url, success: true, source: 'vidzy' };
         caches.vidzy.set(cacheKey, result);
@@ -1305,6 +1387,7 @@ async function setupHeadersForService(type, url, referer) {
         doodstream: { 'Referer': referer || 'https://d0000d.com/', 'Origin': referer ? new URL(referer).origin : 'https://d0000d.com' },
         seekstreaming: seekHeaders,
         cinep: { 'Referer': 'https://purstream.mx/', 'Origin': 'https://purstream.mx' },
+        kisskh: { 'Referer': 'https://kisskh.nl/', 'Origin': 'https://kisskh.nl' },
     };
 
     const hdrs = headerMap[type];

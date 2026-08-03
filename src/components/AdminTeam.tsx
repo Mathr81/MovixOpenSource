@@ -417,7 +417,7 @@ const MemberCard: React.FC<MemberCardProps> = ({ member, onHistory, onRemove }) 
             />
           ) : (
             <div className="flex h-full w-full items-center justify-center">
-              <User className="h-5 w-5 text-white/30" />
+              <User className="h-5 w-5 text-white opacity-30" />
             </div>
           )}
         </div>

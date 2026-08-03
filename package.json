@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "workspaces": [
+    "server"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -29,7 +32,6 @@
     "@fontsource/archivo-black": "^5.2.8",
     "@fontsource/inter": "^5.2.8",
     "@headlessui/react": "^2.2.0",
-    "@hono/node-server": "^1.19.14",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",
     "@radix-ui/react-select": "^2.2.6",
@@ -50,7 +52,6 @@
     "file-saver": "^2.0.5",
     "framer-motion": "11.11.10",
     "hls.js": "^1.6.16",
-    "hono": "^4.12.14",
     "i18next": "^25.8.10",
     "i18next-browser-languagedetector": "^8.2.1",
     "jszip": "^3.10.1",

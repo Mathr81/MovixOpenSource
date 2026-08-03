@@ -940,6 +940,8 @@
     "translating": "Traduction en cours...",
     "cancelTranslation": "Annuler",
     "translationActive": "Traduction active",
+    "translatedSubtitles": "Sous-titres traduits",
+    "changeSubtitle": "Changer",
     "translationFailed": "La traduction des sous-titres a échoué. Réessaie dans quelques instants.",
     "translationLanguages": {
       "fr": "Français",
@@ -957,7 +959,10 @@
       "tr": "Turc",
       "nl": "Néerlandais",
       "pl": "Polonais",
-      "uk": "Ukrainien"
+      "uk": "Ukrainien",
+      "id": "Indonésien",
+      "ms": "Malais",
+      "km": "Khmer"
     },
     "selectedLabel": "Sélectionné",
     "textSize": "Taille du texte",
@@ -1875,6 +1880,9 @@
       "tabMoviesTv": "Films & Séries",
       "tabAnime": "Animes",
       "sectionSources": "Sources",
+      "sources": {
+        "kisskh": "KissKH"
+      },
       "sectionHosters": "Ordre des hosters (global)",
       "sectionHostersAnime": "Ordre des hosters",
       "sectionLanguages": "Langues",
@@ -4596,6 +4604,7 @@
     "vi": "Vietnamien",
     "id": "Indonésien",
     "ms": "Malais",
+    "km": "Khmer",
     "ro": "Roumain",
     "hu": "Hongrois",
     "uk": "Ukrainien",

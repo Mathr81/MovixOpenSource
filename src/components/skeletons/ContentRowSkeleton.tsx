@@ -13,7 +13,7 @@ const ContentRowSkeleton: React.FC = () => {
       <div className="relative">
         {/* Left chevron (greyed out, matches ContentRow.tsx:45-51) */}
         <div className="absolute left-0 top-0 bottom-0 z-10 hidden md:flex items-center justify-center w-16 bg-gradient-to-r from-black/50 to-transparent pointer-events-none">
-          <ChevronLeft className="w-8 h-8 text-white/20" />
+        <ChevronLeft className="w-8 h-8 text-white opacity-20" />
         </div>
 
         {/* Cards row (8 posters, w-[150px], no titles below to match real component) */}
@@ -27,7 +27,7 @@ const ContentRowSkeleton: React.FC = () => {
 
         {/* Right chevron */}
         <div className="absolute right-0 top-0 bottom-0 z-10 hidden md:flex items-center justify-center w-16 bg-gradient-to-l from-black/50 to-transparent pointer-events-none">
-          <ChevronRight className="w-8 h-8 text-white/20" />
+        <ChevronRight className="w-8 h-8 text-white opacity-20" />
         </div>
       </div>
     </div>

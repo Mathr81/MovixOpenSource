@@ -1207,7 +1207,7 @@ const RoulettePage: React.FC = () => {
                         <span className="text-white/80">{winner.vote_average?.toFixed(1)}</span>
                       </div>
                       <div className="flex items-center gap-1">
-                        <Calendar className="w-4 h-4 text-white/30" />
+                    <Calendar className="w-4 h-4 text-white opacity-30" />
                         <span>{new Date(winner.release_date || winner.first_air_date || '').getFullYear() || 'N/A'}</span>
                       </div>
                       <span className="px-2 py-0.5 rounded-lg bg-white/5 border border-white/10 text-[11px] uppercase font-semibold">
@@ -1290,7 +1290,7 @@ const RoulettePage: React.FC = () => {
           {!hasSpun && (
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="text-center py-12">
               <motion.div animate={{ rotate: [0, 10, -10, 0] }} transition={{ repeat: Infinity, duration: 2, ease: 'easeInOut' }}>
-                <Dices className="w-16 h-16 text-white/10 mx-auto mb-4" />
+          <Dices className="w-16 h-16 text-white opacity-10 mx-auto mb-4" />
               </motion.div>
               <p className="text-white/30 text-sm">{t('roulette.hint')}</p>
             </motion.div>

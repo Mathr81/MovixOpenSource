@@ -753,7 +753,7 @@ const OAuthAuthorizePage: React.FC = () => {
             )}
 
             <div className="mt-6 flex items-start gap-2.5 border-t border-white/10 pt-4">
-              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300/80" />
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300 opacity-80" />
               <div className="min-w-0">
                 <p className="text-sm font-medium text-white">{t('oauthAuthorize.securityTitle')}</p>
                 <p className="mt-1 text-xs leading-4 text-gray-400">

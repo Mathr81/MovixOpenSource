@@ -24,6 +24,63 @@ class CastMediaPreparerTest {
     )
 
     @Test
+    fun servesInlineWebVttFromTheLanRelayWithoutAnUpstreamSubtitleRequest() {
+        val requests = mutableListOf<MediaProxyTarget>()
+        val upstream = object : MediaProxyUpstream {
+            override fun execute(
+                target: MediaProxyTarget,
+                localRequestHeaders: Map<String, String>,
+            ): MediaProxyUpstreamResponse {
+                requests += target
+                return MediaProxyUpstreamResponse(
+                    200,
+                    "OK",
+                    mapOf("Content-Type" to "video/mp4"),
+                    ByteArrayInputStream(byteArrayOf(0, 0, 0, 24, 102, 116, 121, 112)),
+                    target.upstreamUrl,
+                )
+            }
+        }
+        val store = MediaProxySessionStore()
+        val preparer = CastMediaPreparer(
+            upstream,
+            store,
+            access,
+            port = 28127,
+            validateUrl = { URI(it) },
+        )
+        val vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nBonjour\n"
+
+        val prepared = preparer.prepare(
+            CastPreparedSource(
+                url = "https://cdn.example/movie.mp4",
+                headers = emptyMap(),
+                tracks = listOf(
+                    CastPreparedTextTrack(
+                        inlineVtt = vtt,
+                        language = "fr",
+                        active = true,
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(1, requests.size)
+        val trackParts = URI(prepared.textTracks.single().lanUrl).path
+            .split('/')
+            .filter(String::isNotEmpty)
+        val first = requireNotNull(
+            store.consumePreparedResponse(trackParts[1], trackParts[2]),
+        )
+        val second = requireNotNull(
+            store.consumePreparedResponse(trackParts[1], trackParts[2]),
+        )
+        assertEquals("text/vtt; charset=utf-8", first.headers["Content-Type"])
+        assertEquals(vtt, first.body.toString(Charsets.UTF_8))
+        assertEquals(vtt, second.body.toString(Charsets.UTF_8))
+    }
+
+    @Test
     fun preparesMasterAndRepresentativeHlsWithOpaqueSubtitle() {
         val requests = mutableListOf<MediaProxyTarget>()
         val upstream = object : MediaProxyUpstream {

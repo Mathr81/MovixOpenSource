@@ -1955,7 +1955,7 @@ const LiveTV: React.FC = () => {
 
             {/* ── STREAM DISCLAIMER ── */}
             <div className="flex items-start gap-2.5 px-3.5 py-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl">
-              <Wifi className="w-4 h-4 text-white/35 shrink-0 mt-0.5" />
+                    <Wifi className="w-4 h-4 text-white opacity-[0.35] shrink-0 mt-0.5" />
               <p className="text-white/45 text-xs sm:text-sm leading-snug">{t('liveTV.streamDisclaimer')}</p>
             </div>
 

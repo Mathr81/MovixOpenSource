@@ -151,10 +151,27 @@ export function buildCastShim(): string {
       }
       var prepared;
       try {
-        prepared = prepareSource(track.url, track.contentType || 'text/vtt');
+        if (typeof track.inlineVtt === 'string') {
+          if (
+            track.inlineVtt.length === 0
+            || track.inlineVtt.length > 2 * 1024 * 1024
+            || track.inlineVtt.indexOf('\\u0000') !== -1
+            || !/^\\uFEFF?WEBVTT(?:[ \\t]|\\r?$)/m.test(track.inlineVtt)
+            || track.inlineVtt.indexOf('-->') === -1
+          ) {
+            throw new Error('Cast track preparation failed');
+          }
+          prepared = {
+            inlineVtt: track.inlineVtt,
+            contentType: 'text/vtt',
+            protocolVersion: 1,
+          };
+        } else {
+          prepared = prepareSource(track.url, track.contentType || 'text/vtt');
+        }
       } catch (error) {
         error.castStage = 'track';
-        error.castValue = track.url;
+        error.castValue = typeof track.url === 'string' ? track.url : 'inline-vtt';
         throw error;
       }
       if (typeof track.language === 'string') {

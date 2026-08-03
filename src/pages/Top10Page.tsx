@@ -491,7 +491,7 @@ const Top10Page: React.FC = () => {
           className="max-w-4xl mx-auto mb-10 flex flex-col sm:flex-row items-center justify-center gap-3"
         >
           <div className="flex items-center gap-1 p-1 pl-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] flex-wrap justify-center">
-            <CalendarDays className="w-3.5 h-3.5 text-white/30 mr-1" />
+                              <CalendarDays className="w-3.5 h-3.5 text-white opacity-30 mr-1" />
             {periodOptions.map((p) => (
               <button
                 key={p.id}
@@ -505,7 +505,7 @@ const Top10Page: React.FC = () => {
             ))}
           </div>
           <div className="flex items-center gap-1 p-1 pl-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] flex-wrap justify-center">
-            <BarChart3 className="w-3.5 h-3.5 text-white/30 mr-1" />
+                              <BarChart3 className="w-3.5 h-3.5 text-white opacity-30 mr-1" />
             {algoOptions.map((a) => (
               <button
                 key={a.id}

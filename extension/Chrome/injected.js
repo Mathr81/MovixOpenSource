@@ -3,6 +3,44 @@ window.hasMovixNexusExtractor = true; // Signals that M3U8 extraction is availab
 window.dispatchEvent(new CustomEvent('movix-extension-loaded'));
 console.log("Movix Extension loaded in page context (with Nexus M3U8 extractors)");
 
+window.movixKisskhFallback = function(request) {
+    return new Promise((resolve) => {
+        const messageId = 'kisskh_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
+        let settled = false;
+        let timeoutId;
+
+        const cleanup = () => {
+            window.removeEventListener('message', handler);
+            if (timeoutId !== undefined) clearTimeout(timeoutId);
+        };
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(result);
+        };
+        const handler = (event) => {
+            if (event.data && event.data.source === 'MOVIX_EXTENSION' && event.data.messageId === messageId) {
+                finish(event.data.success
+                    ? event.data.data
+                    : { success: false, code: 'unsupported_transport' });
+            }
+        };
+
+        window.addEventListener('message', handler);
+        timeoutId = setTimeout(() => {
+            finish({ success: false, code: 'timeout' });
+        }, 15000);
+        window.postMessage({
+            source: 'MOVIX_WEB',
+            type: 'EXTENSION_REQUEST',
+            action: 'KISSKH_FALLBACK',
+            messageId,
+            payload: request
+        }, '*');
+    });
+};
+
 /**
  * Helper: Extract M3U8 from a single embed URL via the extension
  * Usage: const result = await window.movixExtractM3u8('voe', 'https://voe.sx/xxx');

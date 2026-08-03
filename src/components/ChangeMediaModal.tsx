@@ -182,7 +182,7 @@ const ChangeMediaModal: React.FC<ChangeMediaModalProps> = ({ isOpen, onClose, on
         {step === 'search' && (
           <>
             <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/30" />
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white opacity-30" />
               <input
                 type="text"
                 value={query}
@@ -301,7 +301,7 @@ const ChangeMediaModal: React.FC<ChangeMediaModalProps> = ({ isOpen, onClose, on
                       />
                     ) : (
                       <div className="w-20 h-12 rounded-lg bg-white/10 flex items-center justify-center flex-shrink-0">
-                        <Film className="w-4 h-4 text-white/20" />
+                        <Film className="w-4 h-4 text-white opacity-20" />
                       </div>
                     )}
                     <div className="flex-1 min-w-0">
@@ -313,7 +313,7 @@ const ChangeMediaModal: React.FC<ChangeMediaModalProps> = ({ isOpen, onClose, on
                         <p className="text-xs text-white/30 line-clamp-1 mt-0.5">{ep.overview}</p>
                       )}
                     </div>
-                    <ArrowRight className="w-4 h-4 text-white/20 group-hover:text-red-400 transition-colors flex-shrink-0" />
+                    <ArrowRight className="w-4 h-4 text-white opacity-20 group-hover:text-red-400 group-hover:opacity-100 transition-[color,opacity] flex-shrink-0" />
                   </motion.button>
                 ))}
               </div>

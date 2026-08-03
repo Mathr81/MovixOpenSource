@@ -1,6 +1,6 @@
 /**
  * Stockage DB des clients OAuth + stats + grants VIP. Remplace le fichier
- * `data/oauth-clients.json` (déprécié — migration auto au boot).
+ * `data/oauth-clients.json` (déprécié — aucune migration automatique au boot).
  *
  * Les autres modules continuent d'appeler `loadOAuthClients()` (sync) de
  * `oauthClients.js`, qui lit depuis le cache pré-warmé par les fonctions

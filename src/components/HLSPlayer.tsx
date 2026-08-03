@@ -45,7 +45,11 @@ import {
   isAirPlaySupported,
   isRemotePlaybackSupported,
 } from '../utils/castUtils';
-import { getLocalPlaybackInitPolicy } from '../utils/castLocalPlaybackRecovery';
+import {
+  getLocalPlaybackInitPolicy,
+  getLocalPlaybackSeekTime,
+  normalizeLocalMediaDuration,
+} from '../utils/castLocalPlaybackRecovery';
 import { prepareCastSourceWithFallback } from '../utils/castSourcePreparation';
 import { useAntiSpoilerSettings } from '../hooks/useAntiSpoilerSettings';
 import { useTranslation } from 'react-i18next';
@@ -106,6 +110,66 @@ import {
   isSeekStreamingEmbedUrl,
 } from '../utils/seekStreamingCandidates';
 import type { SeekStreamingHlsSource } from '../utils/seekStreamingCandidates';
+import { fetchKisskhSubtitle } from '../services/kisskhService';
+import { createVttBlobUrl, kisskhTrackToVtt } from '../utils/kisskhSubtitles';
+import { applySelectedTextTrackMode } from '../utils/subtitleTrackSelection';
+import { formatSubtitleTextToSafeHtml } from '../utils/subtitleFormatting';
+import {
+  cuesToWebVtt,
+  isolateSubtitleTrack,
+  prepareCastSubtitleTracks,
+  resolveCastSubtitleSource,
+  resolveSelectedSubtitleTrack,
+  type CastSubtitleCandidate,
+} from '../utils/subtitleDelivery';
+import type {
+  KisskhFallbackTransport,
+  KisskhSource,
+  KisskhSubtitleTrack,
+} from '../types/kisskh';
+
+const EMPTY_KISSKH_SOURCES: KisskhSource[] = [];
+const EMPTY_KISSKH_SUBTITLES: KisskhSubtitleTrack[] = [];
+
+type SubtitleCueSnapshot = Pick<VTTCue, 'startTime' | 'endTime' | 'text'>;
+
+interface SubtitleTranslationHistoryEntry {
+  id: string;
+  sourceSubtitleId: string;
+  sourceLanguage: string;
+  sourceLabel: string;
+  targetLanguage: string;
+  cues: SubtitleCueSnapshot[];
+}
+
+const SUBTITLE_LANGUAGE_ALIASES: Record<string, string> = {
+  ara: 'ar', arabic: 'ar', arabe: 'ar',
+  eng: 'en', english: 'en', anglais: 'en',
+  fra: 'fr', fre: 'fr', french: 'fr', francais: 'fr', français: 'fr',
+  ind: 'id', indonesia: 'id', indonesian: 'id', indonesien: 'id', indonésien: 'id',
+  khm: 'km', khmer: 'km', cambodian: 'km',
+  kor: 'ko', korean: 'ko', coreen: 'ko', coréen: 'ko',
+  may: 'ms', msa: 'ms', malay: 'ms', malais: 'ms',
+  vie: 'vi', vietnamese: 'vi', vietnamien: 'vi',
+};
+
+function normalizeSubtitleLanguageCode(code?: string, label?: string): string {
+  const normalize = (value?: string) => (value || '')
+    .normalize('NFKD')
+    .replace(/\p{M}+/gu, '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, '-')
+    .split('-')[0]
+    .replace(/[^a-z]/g, '');
+  const normalizedCode = normalize(code);
+  const normalizedLabel = normalize(label);
+  return SUBTITLE_LANGUAGE_ALIASES[normalizedCode]
+    || SUBTITLE_LANGUAGE_ALIASES[normalizedLabel]
+    || normalizedCode
+    || normalizedLabel
+    || 'unknown';
+}
 
 // Milestone 4 — mapping des `source.type` (top-level row) vers `TopLevelSourceId`.
 // Doit rester en phase avec `SOURCE_MAIN_TO_TOP_LEVEL` dans HLSPlayerSettingsPanel.tsx.
@@ -119,6 +183,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   multi_main: 'coflix',
   viper_main: 'viper',
   vox_main: 'vox',
+  kisskh_main: 'kisskh',
   bravo_main: 'bravo',
   rivestream_main: 'rivestream_hls',
   vostfr_main: 'vostfr',
@@ -419,6 +484,15 @@ const isMP4Source = (url: string): boolean => {
 
   return false;
 };
+
+function resolveCastContentType(
+  url: string,
+  isExplicitMp4: boolean,
+): 'video/mp4' | 'application/vnd.apple.mpegurl' {
+  return isExplicitMp4 || url.includes('.mp4')
+    ? 'video/mp4'
+    : 'application/vnd.apple.mpegurl';
+}
 
 // Utility function to create HLS config based on domain
 const createHlsConfig = (src: string) => {
@@ -747,6 +821,9 @@ interface HLSPlayerProps {
   swiftflowSources?: { url: string; label: string; category: string }[];
   viperSources?: { url: string; label: string; quality: string; language: string }[];
   voxSources?: { name: string; link: string }[];
+  kisskhSources?: KisskhSource[];
+  kisskhSubtitles?: KisskhSubtitleTrack[];
+  loadingKisskh?: boolean;
   onlyQualityMenu?: boolean; // Ajout pour l'affichage du menu qualité seul
   embedType?: string; // Type de la source embed actuellement sélectionnée
   embedUrl?: string;  // URL de la source embed actuellement sélectionnée
@@ -891,12 +968,21 @@ interface SourceOption {
   isActive?: boolean;
   quality?: string;
   language?: string;
+  mediaType?: 'hls' | 'mp4';
 }
 
 interface SourceGroup {
   type: 'hls' | 'embed';
   title: string;
   sources: SourceOption[];
+}
+
+interface PreparedKisskhSubtitle {
+  id: string;
+  label: string;
+  lang: string;
+  url: string;
+  vtt: string;
 }
 
 // Add the helper function here
@@ -997,6 +1083,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   swiftflowSources = [],
   viperSources = [],
   voxSources = [],
+  kisskhSources = EMPTY_KISSKH_SOURCES,
+  kisskhSubtitles = EMPTY_KISSKH_SUBTITLES,
+  loadingKisskh = false,
   onlyQualityMenu = false,
   embedType,
   embedUrl,
@@ -1028,11 +1117,78 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<HlsType | null>(null);
   const handleHlsErrorRef = useRef<(() => Promise<void>) | null>(null);
+  const kisskhFallbackGenerationRef = useRef(0);
+  const kisskhFallbackAbortRef = useRef<AbortController | null>(null);
+  const consumedKisskhFallbackTokensRef = useRef(new Set<string>());
+  const activeKisskhSourceRef = useRef<KisskhSource | null>(null);
   const onShowSourcesRef = useRef(onShowSources);
   const playerAutoFallbackOwnerRef = useRef<object>({});
+  const isSelectedKisskhMp4 = kisskhSources.some(source => (
+    source.type === 'mp4' && source.url === src
+  ));
   useLayoutEffect(() => {
     onShowSourcesRef.current = onShowSources;
   }, [onShowSources]);
+
+  useEffect(() => {
+    kisskhFallbackAbortRef.current?.abort();
+    const controller = new AbortController();
+    kisskhFallbackAbortRef.current = controller;
+    kisskhFallbackGenerationRef.current += 1;
+    consumedKisskhFallbackTokensRef.current.clear();
+    activeKisskhSourceRef.current = kisskhSources.find(source => source.url === src) ?? null;
+
+    return () => {
+      controller.abort();
+      if (kisskhFallbackAbortRef.current === controller) {
+        kisskhFallbackAbortRef.current = null;
+      }
+    };
+  }, [episodeNumber, kisskhSources, movieId, seasonNumber, src, tvShowId]);
+
+  const requestKisskhMediaFallback = useCallback(async (): Promise<boolean> => {
+    const source = activeKisskhSourceRef.current;
+    const fallbackToken = source?.fallbackToken;
+    const transport = window.movixKisskhFallback;
+    const controller = kisskhFallbackAbortRef.current;
+    if (!source || !fallbackToken || !transport || !controller) return false;
+
+    // Consume before crossing the async boundary: duplicate media error events
+    // for this generation can never exchange the same token twice.
+    if (consumedKisskhFallbackTokensRef.current.has(fallbackToken)) return true;
+    consumedKisskhFallbackTokensRef.current.add(fallbackToken);
+    const generation = kisskhFallbackGenerationRef.current;
+
+    try {
+      const result = await transport({ kind: 'media', fallbackToken });
+      if (
+        controller.signal.aborted
+        || kisskhFallbackGenerationRef.current !== generation
+        || activeKisskhSourceRef.current?.id !== source.id
+        || activeKisskhSourceRef.current.url !== source.url
+      ) {
+        return true;
+      }
+      if (result.success !== true || result.kind !== 'media') return false;
+
+      const nextUrl = new URL(result.url);
+      if (!['http:', 'https:'].includes(nextUrl.protocol) || nextUrl.username || nextUrl.password) {
+        return false;
+      }
+      window.dispatchEvent(new CustomEvent('sourceChange', {
+        detail: {
+          type: 'kisskh_main',
+          id: source.id,
+          url: nextUrl.href,
+          origin: 'kisskh-fallback',
+          fromSrc: source.url,
+        },
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
   const localAutoFallbackGuardRef = useRef<HlsAutoFallbackGuard | null>(null);
   if (!localAutoFallbackGuardRef.current) {
     localAutoFallbackGuardRef.current = createHlsAutoFallbackGuard(2);
@@ -1205,7 +1361,74 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [copiedSourceUrl, setCopiedSourceUrl] = useState<string | null>(null);
   const copiedSourceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [subtitles, setSubtitles] = useState<TextTrack[]>([]);
-  const [currentSubtitle, setCurrentSubtitle] = useState<string>('off');
+  const [currentSubtitle, setCurrentSubtitleState] = useState<string>('off');
+  const currentSubtitleRef = useRef<string>('off');
+  const setCurrentSubtitle = useCallback((selectionId: string) => {
+    currentSubtitleRef.current = selectionId;
+    setCurrentSubtitleState(selectionId);
+  }, []);
+  const [preparedKisskhSubtitles, setPreparedKisskhSubtitles] = useState<PreparedKisskhSubtitle[]>([]);
+  const [isKisskhSubtitleSelected, setIsKisskhSubtitleSelected] = useState(false);
+  const kisskhAutoSubtitleKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const generatedKisskhBlobUrls: Array<ReturnType<typeof createVttBlobUrl>> = [];
+    setPreparedKisskhSubtitles([]);
+    setIsKisskhSubtitleSelected(false);
+
+    const isKisskhSelected = kisskhSources.some(source => source.url === src);
+    if (!isKisskhSelected || kisskhSubtitles.length === 0) {
+      return () => {
+        cancelled = true;
+        generatedKisskhBlobUrls.forEach(entry => entry.revoke());
+      };
+    }
+
+    const transport: KisskhFallbackTransport = async request => {
+      const fallback = window.movixKisskhFallback;
+      return fallback
+        ? fallback(request)
+        : { success: false, code: 'fallback_unavailable' };
+    };
+
+    void Promise.all(kisskhSubtitles.map(async track => {
+      try {
+        const raw = await fetchKisskhSubtitle(track, transport);
+        const vtt = await kisskhTrackToVtt(raw, {
+          format: track.format,
+          cipher: track.cipher,
+        });
+        if (cancelled) return null;
+        const blob = createVttBlobUrl(vtt);
+        generatedKisskhBlobUrls.push(blob);
+        return {
+          status: 'ready' as const,
+          track: {
+            id: track.id,
+            label: track.label,
+            lang: track.lang,
+            url: blob.url,
+            vtt,
+          },
+        };
+      } catch {
+        // A broken/decrypt-unsupported track must never remove other subtitles
+        // or fail media playback.
+        return { status: 'error' as const, id: track.id, code: 'subtitle_unsupported' as const };
+      }
+    })).then(results => {
+      if (cancelled) return;
+      setPreparedKisskhSubtitles(results.flatMap(result => (
+        result?.status === 'ready' ? [result.track] : []
+      )));
+    });
+
+    return () => {
+      cancelled = true;
+      generatedKisskhBlobUrls.forEach(entry => entry.revoke());
+    };
+  }, [episodeNumber, kisskhSources, kisskhSubtitles, movieId, seasonNumber, src, tvShowId]);
 
   useEffect(() => {
     contentQualityKeyRef.current = contentQualityKey;
@@ -1276,7 +1499,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     [allExternalLanguages, availableExternalLangCodes]
   );
   const [selectedExternalLang, setSelectedExternalLang] = useState<string | null>(null);
-  const [selectedExternalSub] = useState<any | null>(null);
+  const [selectedExternalSub, setSelectedExternalSub] = useState<any | null>(null);
   const [externalSubs, setExternalSubs] = useState<any[]>([]);
   const [externalLoading, setExternalLoading] = useState(false);
   const [loadingSubtitle, setLoadingSubtitle] = useState(false);
@@ -1393,7 +1616,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [previewStyle, setPreviewStyle] = useState({});
 
   const [isDragging, setIsDragging] = useState(false);
-  const [activeSubtitleCues, setActiveSubtitleCues] = useState<VTTCue[]>([]);
+  const [activeSubtitleCues, setActiveSubtitleCues] = useState<SubtitleCueSnapshot[]>([]);
   const [subtitleContainerVisible, setSubtitleContainerVisible] = useState(false);
   // Subtitle translation
   const [translateSubsTo, setTranslateSubsTo] = useState<string | null>(null);
@@ -1401,7 +1624,20 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const [translatedCueTexts, setTranslatedCueTexts] = useState<Map<string, string>>(new Map());
   const [translationProgress, setTranslationProgress] = useState<{ done: number; total: number } | null>(null);
   const [translationLang, setTranslationLang] = useState<string | null>(null);
+  const [translatedSubtitleHistory, setTranslatedSubtitleHistory] = useState<SubtitleTranslationHistoryEntry[]>([]);
+  const [activeTranslatedSubtitleId, setActiveTranslatedSubtitleId] = useState<string | null>(null);
   const translationAbortRef = useRef(false);
+
+  useEffect(() => {
+    translationAbortRef.current = true;
+    translationCacheRef.current.clear();
+    setTranslatedCueTexts(new Map());
+    setTranslationProgress(null);
+    setTranslationLang(null);
+    setTranslatedSubtitleHistory([]);
+    setActiveTranslatedSubtitleId(null);
+  }, [contentQualityKey]);
+
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(() => {
     // Try to load saved subtitle style from localStorage
     const savedStyle = localStorage.getItem('subtitleStyle');
@@ -1496,6 +1732,18 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   }, [purstreamSources]);
 
+  // Free users receive the direct KissKH URL. The extension/userscript applies
+  // the provider headers to the media host; VIP proxy URLs must stay untouched.
+  useEffect(() => {
+    if (!window.movixSetupHeaders) return;
+    for (const source of kisskhSources) {
+      try {
+        if (new URL(source.url).pathname === '/kisskh-proxy') continue;
+        window.movixSetupHeaders!('kisskh', source.url).catch(() => {});
+      } catch { /* ignore invalid urls */ }
+    }
+  }, [kisskhSources]);
+
   // const [currentHlsSrc, setCurrentHlsSrc] = useState<string>(src); // Track currently loaded HLS src
 
   // Définition de currentSourceRef
@@ -1565,6 +1813,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   // Add state to track if the active source is HLS/MP4
   const [isPipActive, setIsPipActive] = useState(false);
+  const pipSubtitleCleanupRef = useRef<(() => void) | null>(null);
+  const pipNativeSubtitleModeRef = useRef(false);
   const [isWatchPartyActive] = useState(false);
 
   // Add state for PiP backdrop image
@@ -1604,6 +1854,29 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   const lastAuthoritativeCastStatusRef = useRef(castStatus);
   const isCasting = castStatus.connected;
   const postCastPlaybackSuppressedRef = useRef(isCasting);
+
+  useEffect(() => {
+    if (!isCasting) return;
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+      hoverTimeoutRef.current = null;
+    }
+    previewHlsRef.current?.destroy();
+    previewHlsRef.current = null;
+    setHoverState({ time: null, x: 0, showPreview: false, previewUrl: null });
+    setLoadingPreview(false);
+    setCurrentTime(0);
+    setDuration(0);
+  }, [isCasting]);
+
+  // A disabled <track> is not guaranteed to emit `load`. Synchronize the
+  // browser TextTrackList whenever prepared tracks or the local video element
+  // are remounted so the subtitle menu never keeps stale TextTrack instances.
+  useLayoutEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    setSubtitles(Array.from(video.textTracks));
+  }, [isCasting, preparedKisskhSubtitles]);
   const setIsCasting = useCallback((connected: boolean) => {
     setCastStatus(current => ({
       ...current,
@@ -2348,6 +2621,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       omegaSources: omegaSources?.length || 0,
       coflixSources: coflixSources?.length || 0,
       fstreamSources: fstreamSources?.length || 0,
+      kisskhSources: kisskhSources?.length || 0,
+      loadingKisskh,
       onlyQualityMenu
     });
 
@@ -2411,6 +2686,18 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           quality: source.label || 'HD',
           language: source.language || 'FR'
         });
+      });
+    }
+
+    // Le proxy KissKH peut relayer un manifeste HLS ou un MP4 direct.
+    const kisskhSource = kisskhSources[0];
+    if (kisskhSource && (isUserVip() || isExtensionAvailable())) {
+      hlsSources.push({
+        type: 'kisskh_main',
+        id: kisskhSource.id,
+        label: `🌸 ${kisskhSource.label}`,
+        url: kisskhSource.url,
+        mediaType: kisskhSource.type,
       });
     }
 
@@ -2670,6 +2957,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [
     darkinoSources?.length,
     mp4Sources?.length,
+    kisskhSources,
+    loadingKisskh,
     nexusHlsSources?.length,
     nexusFileSources?.length,
     rivestreamSources?.length,
@@ -3051,7 +3340,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Check if source is MP4
     // Les sources mp4 (y compris Bravo/Purstream et Sibnet) sont jouées directement dans la balise <video> sans passer par Hls.js
     const normalizedSrc = normalizeUqloadEmbedUrl(src);
-    const isMP4 = isMP4Source(normalizedSrc);
+    const isMP4 = kisskhSources.some(source => (
+      source.type === 'mp4' && source.url === normalizedSrc
+    )) || isMP4Source(normalizedSrc);
     // Bravo/Purstream fournit des liens mp4 compatibles avec cette logique
     if (isMP4) {
       // For MP4, directly set the source on the video element
@@ -3286,16 +3577,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
 
         // Désactiver tous les sous-titres par défaut
-        video.textTracks.addEventListener('addtrack', (event) => {
-          const track = event.track;
-          if (track) {
-            track.mode = 'disabled';
-          }
-        });
-
-        Array.from(video.textTracks).forEach(track => {
-          track.mode = 'disabled';
-        });
+        applySelectedTextTrackMode(
+          Array.from(video.textTracks),
+          currentSubtitleRef.current,
+        );
       });
 
       hls.on(Hls.Events.LEVELS_UPDATED, (_event, data) => {
@@ -3802,7 +4087,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.src = '';
       };
     }
-  }, [src, autoPlay, subtitleUrl, Hls, requestHlsFallback, isCasting]); // REMOVED playbackSpeed
+  }, [src, autoPlay, subtitleUrl, Hls, requestHlsFallback, isCasting, kisskhSources]); // REMOVED playbackSpeed
 
   // Auto next episode preference (must be declared before useEffect that references it)
   const [autoNextEpisodeEnabled, setAutoNextEpisodeEnabled] = useState(() => {
@@ -3987,11 +4272,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (!video) return;
 
     const handleLoadedMetadata = () => {
-      setDuration(video.duration);
+      setDuration(normalizeLocalMediaDuration(video.duration));
     };
 
     const handleDurationChange = () => {
-      setDuration(video.duration);
+      setDuration(normalizeLocalMediaDuration(video.duration));
     };
 
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
@@ -4001,7 +4286,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       video.removeEventListener('loadedmetadata', handleLoadedMetadata);
       video.removeEventListener('durationchange', handleDurationChange);
     };
-  }, []);
+  }, [isCasting]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -4010,7 +4295,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const handleTimeUpdate = () => {
       if (isDragging) return;
       setCurrentTime(video.currentTime);
-      setDuration(video.duration);
+      setDuration(normalizeLocalMediaDuration(video.duration));
       // Keep the last known position in a ref that survives cleanup of the
       // main src effect (which clears video.src and resets currentTime).
       if (video.currentTime > 0.5) {
@@ -4023,7 +4308,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     return () => {
       video.removeEventListener('timeupdate', handleTimeUpdate);
     };
-  }, [isDragging]);
+  }, [isDragging, isCasting]);
 
   // Reset persisted position when the actual episode/movie changes (not on
   // a mere source switch for the same episode).
@@ -4040,6 +4325,12 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const video = videoRef.current;
     if (!video) return;
 
+    translationAbortRef.current = true;
+    setTranslationProgress(null);
+    setTranslationLang(null);
+    setTranslatedCueTexts(new Map());
+    setActiveTranslatedSubtitleId(null);
+
     // Désactiver tous les tracks
     Array.from(video.textTracks).forEach(track => {
       track.mode = 'disabled';
@@ -4051,24 +4342,86 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       setCurrentSubtitle('off');
       setActiveSubtitleCues([]);
       setSubtitleContainerVisible(false);
+      setIsKisskhSubtitleSelected(false);
       return;
     }
 
     if (subtitleId.startsWith('internal:')) {
-      const track = Array.from(video.textTracks).find((t, idx) => `internal:${idx}` === subtitleId);
+      const track = applySelectedTextTrackMode(Array.from(video.textTracks), subtitleId);
       if (track) {
-        track.mode = 'hidden';
         setCurrentSubtitle(subtitleId);
         setSelectedSubtitleLang(track.language || null);
         const trackUrl = track.hasOwnProperty('src') ? (track as any).src : track.hasOwnProperty('url') ? (track as any).url : '';
         setSelectedSubtitleUrl(trackUrl);
-        refreshActiveCues(video, track, subtitleStyle.delay);
+        const trackElement = Array.from(video.querySelectorAll('track')).find(
+          element => element.track === track,
+        );
+        setIsKisskhSubtitleSelected(trackElement?.dataset.kisskhTrack === 'true');
+
+        const reapplySelectedTrack = () => {
+          if (currentSubtitleRef.current !== subtitleId) return;
+          const liveTracks = Array.from(video.textTracks);
+          const liveIndex = liveTracks.indexOf(trackElement?.track || track);
+          if (liveIndex < 0) return;
+          const selectedTrack = applySelectedTextTrackMode(liveTracks, `internal:${liveIndex}`);
+          if (selectedTrack) refreshActiveCues(video, selectedTrack, subtitleStyle.delay);
+        };
+        reapplySelectedTrack();
+        if (trackElement && trackElement.readyState !== 2) {
+          trackElement.addEventListener('load', reapplySelectedTrack, { once: true });
+        }
       }
     } else if (subtitleId.startsWith('external:')) {
       // La sélection d'un sous-titre externe est déjà gérée dans le bouton (setCurrentSubtitle)
       // On ne fait rien ici, car loadExternalSubtitle s'occupe d'ajouter le track et de le sélectionner
     }
   };
+
+  useEffect(() => {
+    const isKisskhSelected = kisskhSources.some(source => source.url === src);
+    if (!isKisskhSelected) {
+      kisskhAutoSubtitleKeyRef.current = null;
+      return;
+    }
+
+    const autoSelectionKey = `${movieId ?? 'tv'}:${contentQualityKey}:${src}`;
+    if (kisskhAutoSubtitleKeyRef.current === autoSelectionKey) return;
+
+    const video = videoRef.current;
+    if (!video) return;
+    const trackElements = Array.from(video.querySelectorAll('track'));
+    const frenchTrackElement = trackElements.find(track => (
+      track.dataset.kisskhTrack === 'true'
+      && normalizeSubtitleLanguageCode(track.srclang, track.label) === 'fr'
+    ));
+    const frenchTrackIndex = frenchTrackElement
+      ? Array.from(video.textTracks).indexOf(frenchTrackElement.track)
+      : -1;
+    if (frenchTrackIndex < 0) return;
+
+    kisskhAutoSubtitleKeyRef.current = autoSelectionKey;
+    handleSubtitleChange(`internal:${frenchTrackIndex}`);
+  // Le garde par contenu empêche une nouvelle sélection après un choix manuel.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contentQualityKey, kisskhSources, movieId, preparedKisskhSubtitles, src]);
+
+  // Restore the selected subtitle after the local video remounts.
+  useLayoutEffect(() => {
+    if (isCasting) {
+      setActiveSubtitleCues([]);
+      setSubtitleContainerVisible(false);
+      return;
+    }
+
+    const video = videoRef.current;
+    const selectedSubtitle = currentSubtitleRef.current;
+    if (!video || !selectedSubtitle.startsWith('internal:')) return;
+
+    handleSubtitleChange(selectedSubtitle);
+  // The selected track is held in currentSubtitleRef so this effect only needs
+  // to follow the two events that replace the browser TextTrack instances.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCasting, preparedKisskhSubtitles]);
 
   // Fetch imdb id from TMDB for a movieId or tvShowId (strip leading 'tt' for OpenSubtitles)
   const fetchImdbId = async (tmdbId?: string | number, isTvShow: boolean = false): Promise<string | null> => {
@@ -4217,7 +4570,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   };
 
   // Load selected external subtitle into the video by creating a <track> element
-  const loadExternalSubtitle = async (sub: any, id?: string) => {
+  const loadExternalSubtitle = async (sub: any) => {
     if (!videoRef.current || !sub) return;
     setLoadingSubtitle(true);
     try {
@@ -4256,6 +4609,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           const arrayBuffer = await response.arrayBuffer();
           const buffer = new Uint8Array(arrayBuffer);
 
+          subtitleDecoding: {
           // Check if it's a valid gzip file
           if (buffer.length < 2 || buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
             console.warn('File does not appear to be gzipped, trying direct processing');
@@ -4268,7 +4622,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             const objUrl = URL.createObjectURL(blob);
             trackEl.src = objUrl;
             console.log('Processed as regular SRT file');
-            return;
+            break subtitleDecoding;
           }
 
           // Extract using PAKO (lazy-loaded)
@@ -4330,6 +4684,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           trackEl.src = objUrl;
 
           console.log('Successfully extracted and converted subtitle using PAKO');
+          }
         } catch (err) {
           console.error('Failed to fetch/extract external subtitle with PAKO:', err);
           // fallback: try to use SubDownloadLink directly (may be blocked by CORS)
@@ -4351,13 +4706,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       const enableTrack = (textTrack?: TextTrack | null) => {
         const added = textTrack || Array.from(video.textTracks).find(t => (t as any).label === trackEl.label || t.language === trackEl.srclang);
         if (added) {
-          // Disable all other tracks
-          Array.from(video.textTracks).forEach(t => t.mode = 'disabled');
-          added.mode = 'hidden';
-          // Use the external id if provided, otherwise fall back to language code
-          setCurrentSubtitle(id || added.language || String(trackEl.srclang));
-          setSubtitleContainerVisible(true);
-          refreshActiveCues(video, added, subtitleStyle.delay);
+          const tracks = Array.from(video.textTracks);
+          const trackIndex = tracks.indexOf(added);
+          if (trackIndex < 0) return false;
+
+          // Une piste externe importée devient une piste interne normale : elle
+          // apparaît immédiatement dans la liste et bénéficie de la traduction.
+          setSubtitles(tracks);
+          handleSubtitleChange(`internal:${trackIndex}`);
+          setIsKisskhSubtitleSelected(false);
+          setSelectedExternalSub(sub);
           return true;
         }
         return false;
@@ -4498,6 +4856,59 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
   };
 
+  const activateTranslatedSubtitle = useCallback((entryId: string) => {
+    const entry = translatedSubtitleHistory.find(item => item.id === entryId);
+    const video = videoRef.current;
+    if (!entry || !video) return;
+
+    translationAbortRef.current = true;
+    Array.from(video.textTracks).forEach(track => { track.mode = 'disabled'; });
+    setTranslationProgress(null);
+    setTranslatedCueTexts(new Map());
+    setTranslationLang(entry.targetLanguage);
+    setActiveTranslatedSubtitleId(entry.id);
+    setCurrentSubtitle(`translated:${entry.id}`);
+    setIsKisskhSubtitleSelected(false);
+
+    const adjustedTime = video.currentTime - subtitleStyle.delay;
+    const cues = entry.cues.filter(cue => (
+      cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
+    ));
+    setActiveSubtitleCues(cues);
+    setSubtitleContainerVisible(cues.length > 0);
+  }, [subtitleStyle.delay, translatedSubtitleHistory]);
+
+  useEffect(() => {
+    if (!activeTranslatedSubtitleId) return;
+    const entry = translatedSubtitleHistory.find(item => item.id === activeTranslatedSubtitleId);
+    const video = videoRef.current;
+    if (!entry || !video) return;
+
+    const refreshTranslatedCues = () => {
+      const adjustedTime = video.currentTime - subtitleStyle.delay;
+      const cues = entry.cues.filter(cue => (
+        cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
+      ));
+      setActiveSubtitleCues(cues);
+      setSubtitleContainerVisible(cues.length > 0);
+    };
+
+    refreshTranslatedCues();
+    video.addEventListener('timeupdate', refreshTranslatedCues);
+    return () => video.removeEventListener('timeupdate', refreshTranslatedCues);
+  }, [activeTranslatedSubtitleId, isCasting, subtitleStyle.delay, translatedSubtitleHistory]);
+
+  useEffect(() => {
+    if (
+      activeTranslatedSubtitleId
+      && currentSubtitle !== `translated:${activeTranslatedSubtitleId}`
+    ) {
+      setActiveTranslatedSubtitleId(null);
+      setTranslationLang(null);
+      setTranslatedCueTexts(new Map());
+    }
+  }, [activeTranslatedSubtitleId, currentSubtitle]);
+
   // Batch-translate texts by joining them with a separator in a single request (POST to avoid URL length limits)
   const batchTranslateChunk = useCallback(async (texts: string[], targetLang: string): Promise<Map<string, string>> => {
     const SEPARATOR = '\n\n||||\n\n';
@@ -4565,12 +4976,20 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       track => track.mode === 'showing' || track.mode === 'hidden'
     );
     if (!activeTrack?.cues?.length) return;
+    const sourceSubtitleId = currentSubtitle;
+    const sourceLanguage = normalizeSubtitleLanguageCode(activeTrack.language, activeTrack.label);
+    const sourceLabel = activeTrack.label || sourceLanguage;
+    const sourceCues: SubtitleCueSnapshot[] = Array.from(activeTrack.cues).map(cue => ({
+      startTime: cue.startTime,
+      endTime: cue.endTime,
+      text: (cue as VTTCue).text,
+    }));
 
     // Deduplicate cue texts
     const uniqueTexts: string[] = [];
     const seen = new Set<string>();
-    for (const cue of Array.from(activeTrack.cues)) {
-      const text = (cue as VTTCue).text;
+    for (const cue of sourceCues) {
+      const text = cue.text;
       if (text && !seen.has(text)) {
         seen.add(text);
         uniqueTexts.push(text);
@@ -4638,9 +5057,38 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         setTranslationLang(null);
         setTranslatedCueTexts(new Map());
         toast.error(t('watch.translationFailed'));
+      } else if (results.size > 0) {
+        const entryId = `${sourceSubtitleId}:${sourceLanguage}:${translateSubsTo}`;
+        const entry: SubtitleTranslationHistoryEntry = {
+          id: entryId,
+          sourceSubtitleId,
+          sourceLanguage,
+          sourceLabel,
+          targetLanguage: translateSubsTo,
+          cues: sourceCues.map(cue => ({
+            startTime: cue.startTime,
+            endTime: cue.endTime,
+            text: results.get(cue.text) || cue.text,
+          })),
+        };
+        setTranslatedSubtitleHistory(previous => [
+          entry,
+          ...previous.filter(item => item.id !== entry.id),
+        ]);
+        Array.from(video.textTracks).forEach(track => { track.mode = 'disabled'; });
+        setTranslatedCueTexts(new Map());
+        setActiveTranslatedSubtitleId(entry.id);
+        setCurrentSubtitle(`translated:${entry.id}`);
+        setIsKisskhSubtitleSelected(false);
+        const adjustedTime = video.currentTime - subtitleStyle.delay;
+        const activeCues = entry.cues.filter(cue => (
+          cue.startTime <= adjustedTime && adjustedTime <= cue.endTime
+        ));
+        setActiveSubtitleCues(activeCues);
+        setSubtitleContainerVisible(activeCues.length > 0);
       }
     }
-  }, [translateSubsTo, batchTranslateChunk, t]);
+  }, [batchTranslateChunk, currentSubtitle, subtitleStyle.delay, t, translateSubsTo]);
 
   // Cancel ongoing translation
   const cancelSubtitleTranslation = useCallback(() => {
@@ -4648,7 +5096,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     setTranslationProgress(null);
     setTranslatedCueTexts(new Map());
     setTranslationLang(null);
-  }, []);
+    if (activeTranslatedSubtitleId) {
+      const video = videoRef.current;
+      if (video) Array.from(video.textTracks).forEach(track => { track.mode = 'disabled'; });
+      setActiveTranslatedSubtitleId(null);
+      setCurrentSubtitle('off');
+      setActiveSubtitleCues([]);
+      setSubtitleContainerVisible(false);
+      setIsKisskhSubtitleSelected(false);
+    }
+  }, [activeTranslatedSubtitleId]);
 
   const handleMouseMove = () => {
     // Do not show controls via mousemove on touch devices or while a touch gesture is active
@@ -5190,6 +5647,80 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   // Add reference for the PiP error timeout
   const pipErrorTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  const cleanupPipSubtitleTrack = useCallback(() => {
+    const cleanup = pipSubtitleCleanupRef.current;
+    pipSubtitleCleanupRef.current = null;
+    cleanup?.();
+  }, []);
+
+  const createPipSubtitleTrack = useCallback(() => {
+    cleanupPipSubtitleTrack();
+    const video = videoRef.current;
+    if (!video || currentSubtitleRef.current === 'off') return;
+
+    const translated = activeTranslatedSubtitleId
+      ? translatedSubtitleHistory.find(entry => entry.id === activeTranslatedSubtitleId)
+      : null;
+    const activeTrack = resolveSelectedSubtitleTrack(
+      Array.from(video.textTracks),
+      currentSubtitleRef.current,
+    );
+    const cues: SubtitleCueSnapshot[] = translated?.cues ?? Array.from(activeTrack?.cues ?? []).map(cue => ({
+      startTime: cue.startTime,
+      endTime: cue.endTime,
+      text: (cue as VTTCue).text || '',
+    }));
+    if (cues.length === 0) return;
+
+    const blobUrl = URL.createObjectURL(new Blob([
+      cuesToWebVtt(cues, subtitleStyle.delay),
+    ], { type: 'text/vtt;charset=utf-8' }));
+    const trackElement = document.createElement('track');
+    trackElement.kind = 'subtitles';
+    trackElement.label = translated?.sourceLabel || activeTrack?.label || 'Sous-titres';
+    trackElement.srclang = translated?.targetLanguage || activeTrack?.language || 'und';
+    trackElement.src = blobUrl;
+    trackElement.dataset.pipSubtitleTrack = 'true';
+
+    const previousModes = Array.from(video.textTracks).map(track => ({
+      track,
+      mode: track.mode,
+    }));
+    pipNativeSubtitleModeRef.current = true;
+    video.classList.remove('subtitles-disabled');
+    video.appendChild(trackElement);
+    const track = trackElement.track;
+    const enforceExclusiveTrack = () => {
+      isolateSubtitleTrack(Array.from(video.textTracks), track);
+    };
+    enforceExclusiveTrack();
+    trackElement.addEventListener('load', enforceExclusiveTrack);
+    video.textTracks.addEventListener('addtrack', enforceExclusiveTrack);
+    video.textTracks.addEventListener('change', enforceExclusiveTrack);
+
+    pipSubtitleCleanupRef.current = () => {
+      trackElement.removeEventListener('load', enforceExclusiveTrack);
+      video.textTracks.removeEventListener('addtrack', enforceExclusiveTrack);
+      video.textTracks.removeEventListener('change', enforceExclusiveTrack);
+      trackElement.remove();
+      URL.revokeObjectURL(blobUrl);
+      pipNativeSubtitleModeRef.current = false;
+      video.classList.add('subtitles-disabled');
+      for (const entry of previousModes) {
+        if (Array.from(video.textTracks).includes(entry.track)) {
+          entry.track.mode = entry.mode;
+        }
+      }
+    };
+  }, [
+    activeTranslatedSubtitleId,
+    cleanupPipSubtitleTrack,
+    subtitleStyle.delay,
+    translatedSubtitleHistory,
+  ]);
+
+  useEffect(() => () => cleanupPipSubtitleTrack(), [cleanupPipSubtitleTrack, src]);
+
 
 
 
@@ -5216,6 +5747,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       // Si déjà en PiP, sortir du mode PiP
       if (document.pictureInPictureElement === video) {
         await document.exitPictureInPicture();
+        cleanupPipSubtitleTrack();
         setIsPipActive(false);
         return;
       }
@@ -5233,6 +5765,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         try {
           // Certaines versions de Firefox supportent cette API
           if (typeof video.requestPictureInPicture === 'function') {
+            createPipSubtitleTrack();
             await video.requestPictureInPicture();
             setIsPipActive(true);
           } else {
@@ -5241,6 +5774,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             pipErrorTimeoutRef.current = setTimeout(() => setPipError(null), 3000);
           }
         } catch (firefoxError) {
+          cleanupPipSubtitleTrack();
           console.warn('Firefox PiP error:', firefoxError);
           setPipError(t('watch.usePipFirefox'));
           pipErrorTimeoutRef.current = setTimeout(() => setPipError(null), 3000);
@@ -5266,9 +5800,11 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       }
 
       // Request PiP mode pour navigateurs standards
+      createPipSubtitleTrack();
       await video.requestPictureInPicture();
       setIsPipActive(true);
     } catch (error) {
+      cleanupPipSubtitleTrack();
       console.error('Error toggling picture-in-picture:', error);
 
       // Show fallback message or UI indication that PiP failed
@@ -5498,6 +6034,148 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     }
   };
 
+  const buildCurrentCastTracks = useCallback(async () => {
+    const video = videoRef.current;
+    const candidates: CastSubtitleCandidate[] = [];
+    const activeTextTrack = currentSubtitle === 'off' || activeTranslatedSubtitleId
+      ? null
+      : Array.from(video?.textTracks ?? []).find(track => (
+          track.mode === 'hidden' || track.mode === 'showing'
+        )) ?? null;
+
+    for (const entry of translatedSubtitleHistory) {
+      candidates.push({
+        id: `translated:${entry.id}`,
+        label: `${entry.sourceLabel} → ${entry.targetLanguage.toUpperCase()}`,
+        language: entry.targetLanguage,
+        active: activeTranslatedSubtitleId === entry.id,
+        vtt: cuesToWebVtt(entry.cues, subtitleStyle.delay),
+      });
+    }
+
+    const kisskhTrackElements = video
+      ? Array.from(video.querySelectorAll('track[data-kisskh-track="true"]'))
+      : [];
+    for (const track of preparedKisskhSubtitles) {
+      const element = kisskhTrackElements.find(candidate => candidate.src === track.url);
+      candidates.push({
+        id: `kisskh:${track.id}`,
+        label: track.label,
+        language: normalizeSubtitleLanguageCode(track.lang, track.label),
+        active: element?.track === activeTextTrack,
+        vtt: track.vtt,
+      });
+    }
+
+    const elementTracks = new Set<TextTrack>();
+    const elementLabels = new Set<string>();
+    if (video) {
+      for (const element of Array.from(video.querySelectorAll('track'))) {
+        if (
+          element.dataset.pipSubtitleTrack === 'true'
+          || element.dataset.kisskhTrack === 'true'
+          || !element.src
+        ) continue;
+        elementTracks.add(element.track);
+        elementLabels.add(element.label.trim().toLowerCase());
+        candidates.push({
+          id: `element:${element.src}`,
+          label: element.label || element.srclang || 'Sous-titres',
+          language: normalizeSubtitleLanguageCode(element.srclang, element.label),
+          active: element.track === activeTextTrack,
+          url: element.src,
+          contentType: element.src.toLowerCase().includes('.srt')
+            ? 'application/x-subrip'
+            : 'text/vtt',
+        });
+      }
+
+      // hls.js creates TextTrack objects without matching <track> elements.
+      // Materializing populated cues keeps the selected embedded HLS subtitle
+      // castable even when its source is a segmented subtitle playlist.
+      for (const [index, textTrack] of Array.from(video.textTracks).entries()) {
+        if (elementTracks.has(textTrack) || !textTrack.cues?.length) continue;
+        const cues = Array.from(textTrack.cues).map(cue => ({
+          startTime: cue.startTime,
+          endTime: cue.endTime,
+          text: (cue as VTTCue).text || '',
+        }));
+        candidates.push({
+          id: `text-track:${index}`,
+          label: textTrack.label || textTrack.language || `Sous-titres ${index + 1}`,
+          language: normalizeSubtitleLanguageCode(textTrack.language, textTrack.label),
+          active: textTrack === activeTextTrack,
+          vtt: cuesToWebVtt(cues, subtitleStyle.delay),
+        });
+      }
+    }
+
+    for (const [index, track] of (hlsRef.current?.subtitleTracks ?? []).entries()) {
+      if (!track.url) continue;
+      const castSubtitleSource = resolveCastSubtitleSource(track.url);
+      if (!castSubtitleSource) continue;
+      candidates.push({
+        id: `hls:${track.id ?? index}:${track.url}`,
+        label: track.name || track.lang || `Sous-titres ${index + 1}`,
+        language: normalizeSubtitleLanguageCode(track.lang, track.name),
+        active: hlsRef.current?.subtitleTrack === index && !activeTranslatedSubtitleId,
+        url: castSubtitleSource.url,
+        contentType: castSubtitleSource.contentType,
+      });
+    }
+
+    for (const [index, caption] of rivestreamCaptions.entries()) {
+      if (!caption.file || elementLabels.has(caption.label.trim().toLowerCase())) continue;
+      candidates.push({
+        id: `rivestream:${index}:${caption.file}`,
+        label: caption.label || `Sous-titres ${index + 1}`,
+        language: normalizeSubtitleLanguageCode(undefined, caption.label),
+        active: currentSubtitle === `rivestream:${index}`,
+        url: caption.file,
+        contentType: /\.srt(?:$|[?#])/i.test(caption.file)
+          ? 'application/x-subrip'
+          : 'text/vtt',
+      });
+    }
+
+    if (subtitleUrl && !candidates.some(candidate => candidate.url === subtitleUrl)) {
+      candidates.push({
+        id: `prop:${subtitleUrl}`,
+        label: t('watch.french'),
+        language: 'fr',
+        active: currentSubtitle !== 'off' && !activeTranslatedSubtitleId,
+        url: subtitleUrl,
+        contentType: /\.srt(?:$|[?#])/i.test(subtitleUrl)
+          ? 'application/x-subrip'
+          : 'text/vtt',
+      });
+    }
+
+    candidates.sort((left, right) => Number(right.active) - Number(left.active));
+    return prepareCastSubtitleTracks(candidates, {
+      readText: async url => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Subtitle unavailable');
+        const declaredLength = Number(response.headers.get('content-length'));
+        if (Number.isFinite(declaredLength) && declaredLength > 2 * 1024 * 1024) {
+          throw new Error('Subtitle too large');
+        }
+        const blob = await response.blob();
+        if (blob.size > 2 * 1024 * 1024) throw new Error('Subtitle too large');
+        return blob.text();
+      },
+    });
+  }, [
+    activeTranslatedSubtitleId,
+    currentSubtitle,
+    preparedKisskhSubtitles,
+    rivestreamCaptions,
+    subtitleStyle.delay,
+    subtitleUrl,
+    t,
+    translatedSubtitleHistory,
+  ]);
+
   const buildCurrentCastSource = useCallback(async (): Promise<CastSource> => {
     const streams = src.includes('.m3u8')
       ? await parseM3u8Manifest(src)
@@ -5507,9 +6185,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const preferredStreamUrl = await preferFrenchAudioVariant(streamUrl, src);
     return {
       url: preferredStreamUrl,
-      contentType: preferredStreamUrl.includes('.mp4')
-        ? 'video/mp4'
-        : 'application/vnd.apple.mpegurl',
+      contentType: resolveCastContentType(preferredStreamUrl, isSelectedKisskhMp4),
       title: title || tvShow?.name || 'Movix',
       poster: poster
         ? (poster.startsWith('http')
@@ -5517,23 +6193,19 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           : `https://image.tmdb.org/t/p/w500${poster}`)
         : undefined,
       currentTimeSec: videoRef.current?.currentTime || 0,
-      tracks: subtitleUrl
-        ? [{
-            url: subtitleUrl,
-            contentType: 'text/vtt',
-            language: 'fr',
-            name: 'Français',
-            active: currentSubtitle !== 'off',
-          }]
-        : [],
+      tracks: await buildCurrentCastTracks(),
     };
-  }, [currentSubtitle, poster, src, subtitleUrl, title, tvShow?.name]);
+  }, [buildCurrentCastTracks, isSelectedKisskhMp4, poster, src, title, tvShow?.name]);
 
   const createWebControllerForSession = useCallback((session: any) => {
     setCastSession(session);
     return createWebCastRemoteController(session, async source => {
-      const subtitles = (source.tracks ?? []).map(track => ({
+      const webTracks = (source.tracks ?? []).filter(
+        (track): track is typeof track & { url: string } => Boolean(track.url),
+      );
+      const subtitles = webTracks.map(track => ({
         url: track.url,
+        contentType: track.contentType,
         language: track.language ?? 'fr',
         label: track.name ?? track.language ?? 'Sous-titres',
       }));
@@ -5545,8 +6217,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         source.currentTimeSec ?? 0,
         isPlaying,
         subtitles,
-        (source.tracks ?? []).some(track => track.active),
+        webTracks.some(track => track.active),
         'BUFFERED',
+        source.contentType,
       );
     });
   }, [isPlaying]);
@@ -5627,30 +6300,17 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           },
         });
 
-        const posterUrl = poster
-          ? (poster.startsWith('http') ? poster : `https://image.tmdb.org/t/p/w500${poster}`)
-          : null;
+        const preparedCastSource = await buildCurrentCastSource();
 
         const controller =
           castController ?? createAndroidCastRemoteController(nativeCastBridge);
         if (!castController) setCastController(controller);
         await controller.load({
+          ...preparedCastSource,
           url: finalUrl,
-          contentType: finalUrl.includes('.mp4')
-            ? 'video/mp4'
-            : 'application/vnd.apple.mpegurl',
-          title: title || tvShow?.name || 'Movix',
-          poster: posterUrl ?? undefined,
+          contentType: resolveCastContentType(finalUrl, isSelectedKisskhMp4),
           currentTimeSec: videoRef.current?.currentTime || 0,
-          tracks: subtitleUrl
-            ? [{
-                url: subtitleUrl,
-                contentType: 'text/vtt',
-                language: 'fr',
-                name: 'Français',
-                active: currentSubtitle !== 'off',
-              }]
-            : [],
+          tracks: preparedCastSource.tracks,
         });
         applyAuthoritativeCastStatus(await controller.getStatus());
         // Track what we loaded so the src-change effect doesn't reload on every render.
@@ -5914,8 +6574,14 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const video = videoRef.current;
     if (!video) return;
 
-    const handleEnterPIP = () => setIsPipActive(true);
-    const handleExitPIP = () => setIsPipActive(false);
+    const handleEnterPIP = () => {
+      if (!pipSubtitleCleanupRef.current) createPipSubtitleTrack();
+      setIsPipActive(true);
+    };
+    const handleExitPIP = () => {
+      cleanupPipSubtitleTrack();
+      setIsPipActive(false);
+    };
 
     video.addEventListener('enterpictureinpicture', handleEnterPIP);
     video.addEventListener('leavepictureinpicture', handleExitPIP);
@@ -5923,8 +6589,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     return () => {
       video.removeEventListener('enterpictureinpicture', handleEnterPIP);
       video.removeEventListener('leavepictureinpicture', handleExitPIP);
+      cleanupPipSubtitleTrack();
     };
-  }, []);
+  }, [cleanupPipSubtitleTrack, createPipSubtitleTrack]);
 
   // Fetch PiP backdrop image when movieId changes
   useEffect(() => {
@@ -6280,9 +6947,39 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       'ru': { name: t('languages.ru'), countryCode: 'RU' },
       'hi': { name: t('languages.hi'), countryCode: 'IN' },
       'ar': { name: t('languages.ar'), countryCode: 'SA' },
+      'nl': { name: t('languages.nl'), countryCode: 'NL' },
+      'sv': { name: t('languages.sv'), countryCode: 'SE' },
+      'no': { name: t('languages.no'), countryCode: 'NO' },
+      'da': { name: t('languages.da'), countryCode: 'DK' },
+      'fi': { name: t('languages.fi'), countryCode: 'FI' },
+      'pl': { name: t('languages.pl'), countryCode: 'PL' },
+      'tr': { name: t('languages.tr'), countryCode: 'TR' },
+      'cs': { name: t('languages.cs'), countryCode: 'CZ' },
+      'el': { name: t('languages.el'), countryCode: 'GR' },
+      'he': { name: t('languages.he'), countryCode: 'IL' },
+      'th': { name: t('languages.th'), countryCode: 'TH' },
+      'vi': { name: t('languages.vi'), countryCode: 'VN' },
+      'id': { name: t('languages.id'), countryCode: 'ID' },
+      'ms': { name: t('languages.ms'), countryCode: 'MY' },
+      'km': { name: t('languages.km'), countryCode: 'KH' },
+      'ro': { name: t('languages.ro'), countryCode: 'RO' },
+      'hu': { name: t('languages.hu'), countryCode: 'HU' },
+      'uk': { name: t('languages.uk'), countryCode: 'UA' },
+      'bg': { name: t('languages.bg'), countryCode: 'BG' },
+      'hr': { name: t('languages.hr'), countryCode: 'HR' },
+      'sk': { name: t('languages.sk'), countryCode: 'SK' },
+      'sl': { name: t('languages.sl'), countryCode: 'SI' },
+      'et': { name: t('languages.et'), countryCode: 'EE' },
+      'lv': { name: t('languages.lv'), countryCode: 'LV' },
+      'lt': { name: t('languages.lt'), countryCode: 'LT' },
+      'sr': { name: t('languages.sr'), countryCode: 'RS' },
+      'ca': { name: t('languages.ca'), countryCode: 'ES' },
+      'ga': { name: t('languages.ga'), countryCode: 'IE' },
+      'cy': { name: t('languages.cy'), countryCode: 'GB' },
       'unknown': { name: t('common.unknown', 'Unknown') }
     };
-    const lang = languages[code] || { name: code };
+    const normalizedCode = normalizeSubtitleLanguageCode(code);
+    const lang = languages[normalizedCode] || { name: code };
     return <><span style={{ display: 'inline-flex', verticalAlign: 'middle' }}>{lang.countryCode ? <ReactCountryFlag countryCode={lang.countryCode as string} svg style={{ width: '1.2em', height: '1.2em', borderRadius: '2px' }} /> : '🌐'}</span> {lang.name}</>;
   };
 
@@ -6300,8 +6997,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
     const rect = progressBar.getBoundingClientRect();
     const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
-    const clickPosition = (clientX - rect.left) / rect.width;
-    const newTime = clickPosition * duration;
+    const newTime = getLocalPlaybackSeekTime({
+      clientX,
+      left: rect.left,
+      width: rect.width,
+      duration,
+    });
+    if (newTime === null) return;
 
     videoRef.current.currentTime = newTime;
     setCurrentTime(newTime);
@@ -6972,7 +7674,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const wasPlaying = !videoRef.current.paused;
 
     // Check if source is MP4
-    const isMP4 = isMP4Source(src);
+    const isMP4 = kisskhSources.some(source => (
+      source.type === 'mp4' && source.url === src
+    )) || isMP4Source(src);
 
     if (isMP4) {
       // For MP4, directly set the source on the video element
@@ -7150,7 +7854,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
   }, [purstreamSources, currentBravoIndex, src]);
 
   const handleHlsError = async () => {
-    console.log('🔄 Source loading failed or timeout occurred. Current src:', src?.substring(0, 100));
+    console.log('🔄 Source loading failed or timeout occurred');
     let savedPosition = 0;
     if (videoRef.current) {
       savedPosition = videoRef.current.currentTime;
@@ -7363,11 +8067,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         const target = event.target as HTMLVideoElement;
         if (target.error) {
           console.log(`Video error detected: ${target.error.code} - ${target.error.message}`);
+
+          if (activeKisskhSourceRef.current) {
+            const handledByKisskh = await requestKisskhMediaFallback();
+            if (handledByKisskh) return;
+          }
           
           // Vérification explicite de l'erreur 403 via un fetch
           if (target.error.code === 4) {
             try {
-              console.log(`🕵️ verifying error 403 for url: ${src}`);
+              console.log('🕵️ verifying whether the media error is a 403');
               const response = await fetch(src, { method: 'HEAD' });
               if (response.status === 403 || response.status === 4033) {
                  console.warn('🚫 403/4033 Forbidden error confirmed via fetch - trying next HLS player...');
@@ -7410,7 +8119,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         }
       };
     }
-  }, [src, requestHlsFallback, omegaSources, coflixSources]);
+  }, [src, requestHlsFallback, requestKisskhMediaFallback, omegaSources, coflixSources]);
 
   // Add event handler to restore position after source change
   useEffect(() => {
@@ -7442,8 +8151,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const playerRect = containerRef.current.getBoundingClientRect();
 
     const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
-    const progressPosition = (clientX - progressBarRect.left) / progressBarRect.width;
-    const time = progressPosition * duration;
+    const time = getLocalPlaybackSeekTime({
+      clientX,
+      left: progressBarRect.left,
+      width: progressBarRect.width,
+      duration,
+    });
+    if (time === null) return;
 
     const xRelativeToPlayer = clientX - playerRect.left;
 
@@ -7541,9 +8255,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     if (progressBarRef.current && duration && containerRef.current) {
       const progressBarRect = progressBarRef.current.getBoundingClientRect();
       const playerRect = containerRef.current.getBoundingClientRect();
-      let progressPosition = (clientX - progressBarRect.left) / progressBarRect.width;
-      progressPosition = Math.max(0, Math.min(1, progressPosition)); // Clamp between 0 and 1
-      const time = progressPosition * duration;
+      const time = getLocalPlaybackSeekTime({
+        clientX,
+        left: progressBarRect.left,
+        width: progressBarRect.width,
+        duration,
+      });
+      if (time === null) return;
       const xRelativeToPlayer = clientX - playerRect.left;
 
       // Check if source is MP4 - if so, don't show preview
@@ -7577,12 +8295,17 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     // Utiliser la dernière position connue du curseur/touch pour le seek
     if (videoRef.current && lastDragClientXRef.current !== null && progressBarRef.current && duration && containerRef.current) {
       const progressBarRect = progressBarRef.current.getBoundingClientRect();
-      let progressPosition = (lastDragClientXRef.current - progressBarRect.left) / progressBarRect.width;
-      progressPosition = Math.max(0, Math.min(1, progressPosition)); // Clamp between 0 and 1
-      const seekTime = progressPosition * duration;
-      videoRef.current.currentTime = seekTime;
-      setCurrentTime(seekTime);
-      setHoverState(prev => ({ ...prev, time: seekTime }));
+      const seekTime = getLocalPlaybackSeekTime({
+        clientX: lastDragClientXRef.current,
+        left: progressBarRect.left,
+        width: progressBarRect.width,
+        duration,
+      });
+      if (seekTime !== null) {
+        videoRef.current.currentTime = seekTime;
+        setCurrentTime(seekTime);
+        setHoverState(prev => ({ ...prev, time: seekTime }));
+      }
     }
     // On garde le preview visible un court instant après le drag
     setTimeout(() => {
@@ -7684,7 +8407,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         hls.attachMedia(previewVideoRef.current);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          safePlay(previewVideoRef.current).catch(e => console.error("Preview autoplay failed", e));
+          safePlay(previewVideoRef.current).catch(error => {
+            if (error instanceof DOMException && error.name === 'AbortError') return;
+            console.error("Preview autoplay failed", error);
+          });
         });
 
         return () => {
@@ -7711,10 +8437,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
       setSubtitles(tracks);
 
-      // Initially disable all tracks
-      tracks.forEach(track => {
-        track.mode = 'disabled';
-      });
+      applySelectedTextTrackMode(tracks, currentSubtitleRef.current);
     };
 
     // Set up the handler for when HLS.js adds subtitle tracks
@@ -7844,7 +8567,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         video.removeEventListener('timeupdate', handleTimeUpdate);
       }
     };
-  }, [subtitleStyle.delay]);
+  }, [isCasting, preparedKisskhSubtitles, subtitleStyle.delay]);
 
   // Add this effect to force refresh active cues when subtitle tracks change
   useEffect(() => {
@@ -7920,6 +8643,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
     const disableNativeTextTracks = () => {
       const video = videoRef.current;
       if (!video) return;
+      if (pipNativeSubtitleModeRef.current) return;
 
       // Désactiver les sous-titres natifs pour tous les tracks
       for (const track of Array.from(video.textTracks)) {
@@ -8244,6 +8968,8 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                         isActive = nexusHlsSources.some(ns => ns.url === src) || nexusFileSources.some(ns => ns.url === src);
                       } else if (source.type === 'mp4') {
                         isActive = src === source.url; // Direct comparison for MP4
+                      } else if (source.type === 'kisskh_main') {
+                        isActive = src === source.url;
                       } else if (source.type === 'm3u8') { // Added check for AdFree M3U8
                         isActive = src === source.url;
                       } else {
@@ -8256,7 +8982,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                           <div className="mb-2 flex items-stretch gap-2">
                             <button
                               onClick={() => handleSourceChange(source.type, source.id, source.url)}
-                              disabled={(source.type === 'rivestream_hls' && loadingRivestream)}
+                              disabled={(source.type === 'rivestream_hls' && loadingRivestream) || (source.type === 'kisskh_main' && loadingKisskh)}
                               className={`w-full flex-1 px-4 py-3 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isActive ? 'bg-gray-800 border-l-4 border-red-600 pl-3' : 'bg-gray-900/60 text-white'
                                 } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'opacity-70 cursor-not-allowed' : ''
                                 }`}
@@ -8269,7 +8995,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                     <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
                                   )}
                                 </span>
-                                {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
+                                {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                               </div>
                               <div className="ml-3 flex items-center gap-2">
                                 {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
@@ -8305,7 +9031,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                                 />
                               </div>
                             )}
-                            {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderCopySourceButton(source.url)}
+                            {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderCopySourceButton(source.url)}
                           </div>
                           {/* Sous-menus animés comme dans le player */}
                           {source.type === 'darkino_main' && (
@@ -9728,7 +10454,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
       {/* Cast Control Overlay - replaces HLS player when casting (Netflix-like) */}
       {isCasting && (
         <div
-          className="absolute inset-0 z-[15000] flex flex-col items-center justify-center p-4 sm:p-6 bg-gray-900 overflow-y-auto pb-[max(1rem,env(safe-area-inset-bottom))]"
+          className="absolute inset-0 z-[15000] flex flex-col bg-gray-900 overflow-hidden pb-[env(safe-area-inset-bottom)]"
           data-lenis-prevent
           style={{
             backgroundImage: backdrop ? `url(${getImageUrl(backdrop, 'original')})` : poster ? `url(${getImageUrl(poster, 'original')})` : undefined,
@@ -9737,24 +10463,25 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
           }}
         >
           {/* Cast Banner at the top */}
-          <div className="absolute top-0 left-0 right-0 z-20 bg-black/95 shadow-lg">
-            <div className="flex items-center justify-between px-6 py-3">
-              <div className="flex items-center gap-3">
-                <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 text-red-500" viewBox="0 0 24 24" fill="currentColor">
+          <div className="relative z-20 w-full flex-none bg-black/95 shadow-lg">
+            <div className="flex min-h-14 items-center justify-between px-3 py-1.5 sm:px-5 sm:py-2">
+              <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 flex-none text-red-500 sm:h-6 sm:w-6" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm0-4v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11zM21 3H3c-1.1 0-2 .9-2 2v3h2V5h18v14h-7v2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" />
                 </svg>
-                <div className="flex flex-col">
-                  <span className="text-white font-bold text-lg">{t('watch.castingInProgress')}</span>
-                  <span className="text-white text-sm">
+                <div className="flex min-w-0 flex-col">
+                  <span className="truncate text-sm font-bold text-white sm:text-base">{t('watch.castingInProgress')}</span>
+                  <span className="truncate text-xs text-white/75 sm:text-sm">
                     {castStatus.deviceName || 'Chromecast'}
                   </span>
                 </div>
               </div>
               <button
                 onClick={() => toggleCast()}
-                className="text-white hover:text-gray-300 transition-colors duration-200"
+                aria-label={t('common.close')}
+                className="inline-flex h-11 w-11 flex-none items-center justify-center rounded-lg text-white transition-colors duration-200 hover:bg-white/10 hover:text-gray-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
@@ -9781,23 +10508,29 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
 
           {/* Dim overlay over the backdrop (no blur) */}
           <div className="absolute inset-0 bg-black/60" />
-          <div className="flex flex-col md:flex-row items-center gap-4 sm:gap-6 max-w-3xl w-full pt-16 sm:pt-20">
+          <div
+            data-cast-main-content=""
+            className={`relative z-10 m-auto grid min-h-0 w-full max-w-3xl flex-1 items-center gap-3 overflow-y-auto px-3 py-3 sm:gap-5 sm:px-5 sm:py-4 ${poster ? 'grid-cols-[auto_minmax(0,1fr)]' : 'grid-cols-1'}`}
+          >
             {poster && (
-              <div className="w-56 h-80 md:w-64 md:h-96 rounded-xl overflow-hidden shadow-2xl border border-white/10 relative z-10">
+              <div
+                data-cast-poster=""
+                className="relative z-10 aspect-[2/3] w-20 flex-none overflow-hidden rounded-xl border border-white/10 shadow-2xl sm:w-24 md:w-40 lg:w-48"
+              >
                 <img src={getImageUrl(poster, 'w780')} alt={t('common.poster')} className="w-full h-full object-cover" />
               </div>
             )}
-            <div className="flex-1 flex flex-col items-center md:items-start text-center md:text-left">
-              <h2 className="text-white text-3xl md:text-4xl font-bold mb-2 line-clamp-2 drop-shadow-lg">
+            <div className="flex min-w-0 flex-1 flex-col items-center text-center md:items-start md:text-left">
+              <h2 className="mb-1 line-clamp-2 text-base font-bold leading-tight text-white drop-shadow-lg sm:text-2xl md:mb-2 md:text-3xl">
                 {title || tvShow?.name || (movieId ? t('watch.movie') : tvShowId ? t('watch.series') : t('watch.content'))}
               </h2>
               {tvShowId != null && seasonNumber != null && episodeNumber != null && (
-                <div className="mb-4">
-                  <p className="text-white text-lg font-semibold bg-black/30 px-3 py-1 rounded-full border border-white/20 drop-shadow-lg">
+                <div className="mb-1.5 min-w-0 sm:mb-3">
+                  <p className="inline-flex rounded-full border border-white/20 bg-black/30 px-2 py-0.5 text-xs font-semibold text-white drop-shadow-lg sm:px-3 sm:py-1 sm:text-sm">
                     {t('watch.seasonEpisodeLabel', { season: seasonNumber, episode: episodeNumber })}
                   </p>
                   {currentEpisodeInfo?.name && (
-                    <p className="text-white text-base font-medium mt-2 bg-black/20 px-3 py-1 rounded-lg border border-white/10 drop-shadow-lg">
+                    <p className="mt-1 line-clamp-1 rounded-lg border border-white/10 bg-black/20 px-2 py-0.5 text-xs font-medium text-white drop-shadow-lg sm:mt-2 sm:px-3 sm:py-1 sm:text-sm">
                       {shouldHide('episodeNames')
                         ? getMaskedContent(currentEpisodeInfo.name, 'episodeNames', undefined, episodeNumber)
                         : `${episodeNumber}. ${currentEpisodeInfo.name}`}
@@ -9806,7 +10539,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 </div>
               )}
 
-              <div className="mt-4 flex flex-wrap items-center justify-center gap-2 sm:gap-4 relative z-10">
+              <div className="relative z-10 mt-1.5 flex flex-wrap items-center justify-center gap-2 sm:mt-3 sm:gap-3">
                 {/* Reculer -10s */}
                 <button
                   onClick={() => {
@@ -9815,7 +10548,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                     setCastCurrentTime(target);
                     void runCastCommand(() => castController.seekTo(target));
                   }}
-                  className="inline-flex items-center gap-2 sm:gap-2 px-3 sm:px-4 py-3 sm:py-3 rounded-xl bg-black/40 text-white hover:bg-black/60 transition-all duration-200 border border-white/30 hover:border-white/50 font-semibold text-xs sm:text-sm shadow-lg backdrop-blur-sm min-w-0"
+                  className="inline-flex h-11 min-w-11 items-center justify-center gap-2 rounded-xl border border-white/30 bg-black/50 px-3 text-xs font-semibold text-white shadow-lg transition-colors duration-200 hover:border-white/50 hover:bg-black/70 sm:px-4 sm:text-sm"
                   title={t('watch.rewind10s')}
                 >
                   <Rewind className="w-5 h-5 sm:w-5 sm:h-5" />
@@ -9837,7 +10570,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                       );
                     }
                   }}
-                  className="inline-flex items-center gap-2 sm:gap-2 px-5 sm:px-6 py-3 sm:py-3 rounded-xl bg-red-600 text-white hover:bg-red-700 transition-all duration-200 border border-red-500 hover:border-red-400 font-bold text-sm sm:text-base shadow-xl backdrop-blur-sm min-w-0"
+                  className="inline-flex h-11 min-w-11 items-center justify-center gap-2 rounded-xl border border-red-500 bg-red-600 px-4 text-sm font-bold text-white shadow-xl transition-colors duration-200 hover:border-red-400 hover:bg-red-700 sm:px-5 sm:text-base"
                   title={t('watch.playPause')}
                 >
                   {castStatus.state === 'playing'
@@ -9861,7 +10594,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                     setCastCurrentTime(target);
                     void runCastCommand(() => castController.seekTo(target));
                   }}
-                  className="inline-flex items-center gap-2 sm:gap-2 px-3 sm:px-4 py-3 sm:py-3 rounded-xl bg-black/40 text-white hover:bg-black/60 transition-all duration-200 border border-white/30 hover:border-white/50 font-semibold text-xs sm:text-sm shadow-lg backdrop-blur-sm min-w-0"
+                  className="inline-flex h-11 min-w-11 items-center justify-center gap-2 rounded-xl border border-white/30 bg-black/50 px-3 text-xs font-semibold text-white shadow-lg transition-colors duration-200 hover:border-white/50 hover:bg-black/70 sm:px-4 sm:text-sm"
                   title={t('watch.forward10s')}
                 >
                   <span className="hidden sm:inline">{t('watch.forward10Short')}</span>
@@ -9871,10 +10604,10 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
               </div>
 
               {/* Cast Progress Bar */}
-              <div className="mt-4 sm:mt-6 w-full relative z-30">
-                <div className="flex items-center space-x-3 pointer-events-auto">
+              <div className="relative z-30 mt-2 w-full sm:mt-4">
+                <div className="flex items-center pointer-events-auto">
                   <div
-                    className="group relative w-full h-8 sm:h-10 flex items-center cursor-pointer select-none cast-progress-bar"
+                    className="group relative flex h-8 w-full cursor-pointer select-none items-center cast-progress-bar sm:h-9"
                     data-media-time-slider=""
                     aria-label={t('watch.seekLabel')}
                     role="slider"
@@ -9935,7 +10668,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                         style={{ width: 'var(--slider-fill)' }}
                       />
                       <div
-                        className="absolute top-1/2 rounded-full bg-white border border-white/50 shadow-md transition-opacity duration-150 -translate-x-1/2 -translate-y-1/2 group-data-[dragging]:opacity-100 opacity-100 w-4 h-4 sm:w-5 sm:h-5"
+                        className="absolute top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/50 bg-white opacity-100 shadow-md transition-opacity duration-150 group-data-[dragging]:opacity-100 sm:h-4 sm:w-4"
                         style={{ left: 'var(--slider-fill)' }}
                       />
                       <div
@@ -9956,9 +10689,13 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 </div>
               </div>
 
-              <div className="mt-4 sm:mt-6 text-white text-sm sm:text-lg font-bold bg-black/40 px-3 sm:px-4 py-2 rounded-xl border border-white/20 backdrop-blur-sm shadow-lg relative z-30 sticky bottom-4 sm:static">
-                {formatTime(isCastDragging ? castDragTime : castCurrentTime)} / {formatTime(castDuration)}
-              </div>
+                <div
+                  data-cast-time-row=""
+                  className="mt-0.5 flex w-full items-center justify-between px-0.5 text-xs font-semibold tabular-nums text-white/80 sm:text-sm"
+                >
+                  <span>{formatTime(isCastDragging ? castDragTime : castCurrentTime)}</span>
+                  <span>{formatTime(castDuration)}</span>
+                </div>
             </div>
           </div>
         </div>
@@ -9975,7 +10712,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
         >
           <video
             ref={videoRef}
-            className={`w-full h-full ${getVideoObjectFitClass()} ${className} ${!isPlaying ? 'grayscale' : ''} subtitles-disabled transition-all duration-500 ${isFullscreenAnimating ? 'z-[9999] scale-[1.04] grayscale bg-black' : ''} ${shouldHideCursor ? 'cursor-none' : ''}`}
+            className={`w-full h-full ${getVideoObjectFitClass()} ${className} ${!isPlaying ? 'grayscale' : ''} ${isPipActive ? '' : 'subtitles-disabled'} transition-all duration-500 ${isFullscreenAnimating ? 'z-[9999] scale-[1.04] grayscale bg-black' : ''} ${shouldHideCursor ? 'cursor-none' : ''}`}
             style={{
               filter: !isPlaying ? undefined : (videoOledMode !== 'off' ? getVideoOledFilter() : undefined),
               transition: 'filter 0.5s ease'
@@ -10002,6 +10739,16 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                 default
               />
             )}
+            {preparedKisskhSubtitles.map(track => (
+              <track
+                key={track.id}
+                kind="subtitles"
+                src={track.url}
+                srcLang={track.lang}
+                label={track.label}
+                data-kisskh-track="true"
+              />
+            ))}
           </video>
         </div>
       )}
@@ -10216,23 +10963,6 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             style={getSubtitleBackgroundStyle()}
           >
             {activeSubtitleCues.map((cue, index) => {
-              // Process subtitle text to handle dialogues with line breaks
-              const escapeHtml = (str: string): string =>
-                str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-              const processSubtitleText = (text: string): string => {
-                const lines = text.split('\n');
-                const processedLines = lines
-                  .map(line => line.trim())
-                  .filter(line => line.length > 0)
-                  // Escape for XSS safety, then restore i/b/u formatting tags
-                  // (VTT/SRT italic/bold/underline) so they render instead of
-                  // showing as literal <i>…</i>.
-                  .map(line => escapeHtml(line)
-                    .replace(/&lt;(\/?)([biu])(?:\.[^&\s]*)?&gt;/gi, '<$1$2>'));
-                return processedLines.join('<br>');
-              };
-
               const displayText = (translationLang && translatedCueTexts.get(cue.text)) || cue.text;
 
               return (
@@ -10240,7 +10970,7 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
                   key={index}
                   className="font-medium"
                   style={{ ...getSubtitleFontSizeStyle(), ...getSubtitleTextColorStyle() }}
-                  dangerouslySetInnerHTML={{ __html: processSubtitleText(displayText) }}
+                  dangerouslySetInnerHTML={{ __html: formatSubtitleTextToSafeHtml(displayText) }}
                 />
               );
             })}
@@ -11310,6 +12040,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             nexusFileSources,
             viperSources,
             voxSources,
+            kisskhSources,
+            kisskhSubtitles,
+            loadingKisskh,
             purstreamSources,
             embedUrl,
             onlyQualityMenu,
@@ -11361,6 +12094,9 @@ const HLSPlayer = forwardRef<HLSPlayerRef, HLSPlayerProps>(({
             setTranslateSubsTo,
             translationProgress,
             translationLang,
+            translatedSubtitleHistory,
+            activeTranslatedSubtitleId,
+            activateTranslatedSubtitle,
             startSubtitleTranslation,
             cancelSubtitleTranslation,
             loadingSubtitle,

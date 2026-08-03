@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.11
+// @version      1.4.12
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -43,9 +43,383 @@
 (() => {
   "use strict";
 
+  // BEGIN KISSKH FALLBACK
+  const KISSKH_REQUEST_TIMEOUT_MS = 10000;
+  const KISSKH_MAX_REDIRECTS = 5;
+  const KISSKH_MAX_MEDIA_URL_LENGTH = 8192;
+  const KISSKH_MAX_HEADER_VALUE_LENGTH = 2048;
+  const KISSKH_MAX_SUBTITLE_BYTES = 2097152;
+  const KISSKH_MAX_EXCHANGE_BYTES = 32768;
+  const KISSKH_MAX_EXCHANGE_LIFETIME_MS = 120000;
+  const KISSKH_ALLOWED_HEADER_ORIGIN = "https://kisskh.nl";
+
+  function kisskhFailure(code) {
+    return { success: false, code };
+  }
+
+  function kisskhHasExactKeys(value, keys) {
+    return (
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      JSON.stringify(Object.keys(value).sort()) ===
+        JSON.stringify([...keys].sort())
+    );
+  }
+
+  function kisskhValidateSubtitleUrl(value) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > KISSKH_MAX_MEDIA_URL_LENGTH ||
+      /[\r\n\0]/.test(value)
+    ) {
+      return null;
+    }
+    try {
+      const parsed = new URL(value);
+      if (
+        !["http:", "https:"].includes(parsed.protocol) ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash
+      ) {
+        return null;
+      }
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function kisskhValidateMediaUrl(value) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > KISSKH_MAX_MEDIA_URL_LENGTH ||
+      /[\r\n\0]/.test(value)
+    ) {
+      return null;
+    }
+    try {
+      const parsed = new URL(value);
+      if (
+        !["http:", "https:"].includes(parsed.protocol) ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash
+      ) {
+        return null;
+      }
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function kisskhValidateLocalProxyUrl(value) {
+    const url = kisskhValidateMediaUrl(value);
+    if (!url) return null;
+    try {
+      const parsed = new URL(url);
+      if (
+        parsed.protocol !== "http:" ||
+        !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname)
+      ) {
+        return null;
+      }
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function kisskhValidateHeaderValue(name, value) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > KISSKH_MAX_HEADER_VALUE_LENGTH ||
+      /[\r\n\0]/.test(value)
+    ) {
+      return null;
+    }
+    try {
+      const parsed = new URL(value);
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        parsed.hash ||
+        parsed.origin !== KISSKH_ALLOWED_HEADER_ORIGIN ||
+        (name === "Origin" && (parsed.pathname !== "/" || parsed.search))
+      ) {
+        return null;
+      }
+      return name === "Origin" ? parsed.origin : parsed.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function kisskhValidateExchange(value) {
+    if (
+      !kisskhHasExactKeys(value, ["url", "expiresAt", "requiredHeaders"])
+    ) {
+      return null;
+    }
+    const url = kisskhValidateMediaUrl(value.url);
+    if (
+      !url ||
+      !Number.isSafeInteger(value.expiresAt) ||
+      value.expiresAt <= Date.now() ||
+      value.expiresAt > Date.now() + KISSKH_MAX_EXCHANGE_LIFETIME_MS ||
+      value.requiredHeaders === null ||
+      typeof value.requiredHeaders !== "object" ||
+      Array.isArray(value.requiredHeaders)
+    ) {
+      return null;
+    }
+    const requiredHeaders = {};
+    for (const [name, rawValue] of Object.entries(value.requiredHeaders)) {
+      if (name !== "Referer" && name !== "Origin") return null;
+      const headerValue = kisskhValidateHeaderValue(name, rawValue);
+      if (!headerValue) return null;
+      requiredHeaders[name] = headerValue;
+    }
+    return { url, expiresAt: value.expiresAt, requiredHeaders };
+  }
+
+  function kisskhGmRequest(url, { method, headers, maxBytes }) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let requestHandle;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      try {
+        requestHandle = getGMRequest()({
+          method,
+          url,
+          headers,
+          responseType: "arraybuffer",
+          redirect: "manual",
+          anonymous: true,
+          timeout: KISSKH_REQUEST_TIMEOUT_MS,
+          onprogress: (progress) => {
+            if (Number(progress?.loaded) > maxBytes) {
+              try {
+                requestHandle?.abort?.();
+              } catch {}
+              finish({ error: "response_too_large" });
+            }
+          },
+          onload: (response) => {
+            if (response.finalUrl && response.finalUrl !== url) {
+              finish({ error: "invalid_request" });
+              return;
+            }
+            const responseHeaders = parseRawHeaders(response.responseHeaders);
+            const declared = responseHeaders["content-length"];
+            if (declared !== undefined) {
+              const length = Number(declared);
+              if (
+                !Number.isSafeInteger(length) ||
+                length < 0 ||
+                length > maxBytes
+              ) {
+                finish({ error: "response_too_large" });
+                return;
+              }
+            }
+            const bytes =
+              response.response instanceof ArrayBuffer
+                ? new Uint8Array(response.response)
+                : new TextEncoder().encode(String(response.response || ""));
+            if (bytes.byteLength > maxBytes) {
+              finish({ error: "response_too_large" });
+              return;
+            }
+            finish({
+              status: Number(response.status || 0),
+              headers: responseHeaders,
+              bytes,
+            });
+          },
+          onerror: () => finish({ error: "upstream_unavailable" }),
+          ontimeout: () => finish({ error: "timeout" }),
+          onabort: () => finish({ error: "upstream_unavailable" }),
+        });
+      } catch {
+        finish({ error: "unsupported_transport" });
+      }
+    });
+  }
+
+  function kisskhBytesToBase64(bytes) {
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 32768) {
+      binary += String.fromCharCode(
+        ...bytes.subarray(offset, offset + 32768),
+      );
+    }
+    return btoa(binary);
+  }
+
+  async function kisskhFetchSubtitle(sourceUrl) {
+    let currentUrl = sourceUrl;
+    for (
+      let redirects = 0;
+      redirects <= KISSKH_MAX_REDIRECTS;
+      redirects += 1
+    ) {
+      const response = await kisskhGmRequest(currentUrl, {
+        method: "GET",
+        headers: { Accept: "text/*", "Cache-Control": "no-store" },
+        maxBytes: KISSKH_MAX_SUBTITLE_BYTES,
+      });
+      if (response.error) return kisskhFailure(response.error);
+      if (response.status >= 300 && response.status < 400) {
+        if (redirects === KISSKH_MAX_REDIRECTS) {
+          return kisskhFailure("upstream_unavailable");
+        }
+        const location = response.headers.location;
+        let redirected = null;
+        try {
+          redirected = location
+            ? kisskhValidateSubtitleUrl(new URL(location, currentUrl).toString())
+            : null;
+        } catch {}
+        if (!redirected) return kisskhFailure("invalid_request");
+        currentUrl = redirected;
+        continue;
+      }
+      if (response.status === 429) {
+        return kisskhFailure("provider_rate_limited");
+      }
+      if (response.status < 200 || response.status >= 300) {
+        return kisskhFailure("upstream_unavailable");
+      }
+      const contentType = response.headers["content-type"] || "";
+      if (!/^text\/[a-z0-9!#$&^_.+-]+(?:\s*;|$)/i.test(contentType)) {
+        return kisskhFailure("invalid_content_type");
+      }
+      return {
+        success: true,
+        kind: "subtitle",
+        status: response.status,
+        contentType,
+        bodyBase64: kisskhBytesToBase64(response.bytes),
+      };
+    }
+    return kisskhFailure("upstream_unavailable");
+  }
+
+  async function kisskhExchangeMedia(fallbackToken) {
+    const response = await kisskhGmRequest(
+      `https://api.movix.fun/api/kisskh/fallback/${fallbackToken}`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Cache-Control": "no-store",
+        },
+        maxBytes: KISSKH_MAX_EXCHANGE_BYTES,
+      },
+    );
+    if (response.error) return kisskhFailure(response.error);
+    if (response.status === 429) return kisskhFailure("provider_rate_limited");
+    if (response.status < 200 || response.status >= 300) {
+      return kisskhFailure("upstream_unavailable");
+    }
+    if (
+      !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(
+        response.headers["cache-control"] || "",
+      ) ||
+      !/^application\/json(?:\s*;|$)/i.test(
+        response.headers["content-type"] || "",
+      )
+    ) {
+      return kisskhFailure("provider_changed");
+    }
+    let rawExchange;
+    try {
+      rawExchange = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(response.bytes),
+      );
+    } catch {
+      return kisskhFailure("provider_changed");
+    }
+    const exchange = kisskhValidateExchange(rawExchange);
+    if (!exchange) return kisskhFailure("provider_changed");
+    if (Object.keys(exchange.requiredHeaders).length > 0) {
+      if (typeof globalThis.GM_openMediaProxy !== "function") {
+        return kisskhFailure("unsupported_transport");
+      }
+      try {
+        const localUrl = kisskhValidateLocalProxyUrl(
+          await globalThis.GM_openMediaProxy({
+            url: exchange.url,
+            method: "GET",
+            headers: exchange.requiredHeaders,
+          }),
+        );
+        if (!localUrl) return kisskhFailure("unsupported_transport");
+        return {
+          success: true,
+          kind: "media",
+          url: localUrl,
+          expiresAt: exchange.expiresAt,
+          headersApplied: true,
+        };
+      } catch {
+        return kisskhFailure("unsupported_transport");
+      }
+    }
+    return {
+      success: true,
+      kind: "media",
+      url: exchange.url,
+      expiresAt: exchange.expiresAt,
+      headersApplied: false,
+    };
+  }
+
+  async function handleKisskhFallback(payload) {
+    if (
+      !kisskhHasExactKeys(
+        payload,
+        payload?.kind === "subtitle"
+          ? ["kind", "sourceUrl"]
+          : ["kind", "fallbackToken"],
+      )
+    ) {
+      return kisskhFailure("invalid_request");
+    }
+    if (payload.kind === "subtitle") {
+      const sourceUrl = kisskhValidateSubtitleUrl(payload.sourceUrl);
+      return sourceUrl
+        ? kisskhFetchSubtitle(sourceUrl)
+        : kisskhFailure("invalid_request");
+    }
+    if (
+      payload.kind !== "media" ||
+      typeof payload.fallbackToken !== "string" ||
+      payload.fallbackToken.length < 16 ||
+      payload.fallbackToken.length > 2048 ||
+      !/^[A-Za-z0-9_-]+$/.test(payload.fallbackToken)
+    ) {
+      return kisskhFailure("invalid_request");
+    }
+    return kisskhExchangeMedia(payload.fallbackToken);
+  }
+  // END KISSKH FALLBACK
+
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-    version: "1.4.11",
+      version: "1.4.12",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -1483,7 +1857,8 @@
       if (
         !candidate ||
         candidate.length > MAX_MEDIA_URL_LENGTH ||
-        !candidate.toLowerCase().includes(".m3u8")
+        !candidate.toLowerCase().includes(".m3u8") ||
+        candidate.toLowerCase().includes("troll")
       ) {
         return null;
       }
@@ -1518,6 +1893,120 @@
       }
       return parsed.href;
     };
+
+    // Fsvid/Vidzy currently derive a different XOR key for every byte, then
+    // optionally reverse the decoded byte sequence. Read every parameter from
+    // the player function instead of hard-coding the provider's current values.
+    const rollingXorPattern =
+      /(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,512}?for\s*\(\s*var\s+([A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\2\s*<\s*\1\.length\s*;\s*\2\+\+\s*\)\s*\{[\s\S]{0,512}?(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*\(\s*([\s\S]{1,128}?)\s*\)\s*&\s*(0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,512}?([A-Za-z_$][\w$]*)\s*\+=\s*String\.fromCharCode\(\s*\1\.charCodeAt\(\s*\2\s*\)\s*\^\s*\3\s*\)[\s\S]{0,256}?\}\s*return\s+\6(\s*\.split\(\s*["']["']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["']["']\s*\))?\s*\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    const numericLiteralPattern = "(?:0[xX][0-9a-fA-F]+|\\d+)";
+    const parseRollingParameters = (expression, indexName) => {
+      const indexToken = indexName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const normalized = expression.replace(/[\s()]/g, "");
+      const layouts = [
+        {
+          pattern: new RegExp(
+            `^(${numericLiteralPattern})\\+${indexToken}\\*(${numericLiteralPattern})$`,
+          ),
+          seed: 1,
+          step: 2,
+        },
+        {
+          pattern: new RegExp(
+            `^(${numericLiteralPattern})\\+(${numericLiteralPattern})\\*${indexToken}$`,
+          ),
+          seed: 1,
+          step: 2,
+        },
+        {
+          pattern: new RegExp(
+            `^${indexToken}\\*(${numericLiteralPattern})\\+(${numericLiteralPattern})$`,
+          ),
+          seed: 2,
+          step: 1,
+        },
+        {
+          pattern: new RegExp(
+            `^(${numericLiteralPattern})\\*${indexToken}\\+(${numericLiteralPattern})$`,
+          ),
+          seed: 2,
+          step: 1,
+        },
+        {
+          pattern: new RegExp(
+            `^(${numericLiteralPattern})\\+${indexToken}$`,
+          ),
+          seed: 1,
+          fixedStep: 1,
+        },
+        {
+          pattern: new RegExp(
+            `^${indexToken}\\+(${numericLiteralPattern})$`,
+          ),
+          seed: 1,
+          fixedStep: 1,
+        },
+      ];
+
+      for (const layout of layouts) {
+        const match = normalized.match(layout.pattern);
+        if (!match) continue;
+        return {
+          seed: Number(match[layout.seed]),
+          step:
+            layout.fixedStep === undefined
+              ? Number(match[layout.step])
+              : layout.fixedStep,
+        };
+      }
+      return null;
+    };
+
+    for (const match of String(script || "").matchAll(rollingXorPattern)) {
+      const parameters = parseRollingParameters(match[4], match[2]);
+      const mask = Number(match[5]);
+      if (
+        !parameters ||
+        !Number.isSafeInteger(parameters.seed) ||
+        parameters.seed < 0 ||
+        parameters.seed > 0xffffffff ||
+        !Number.isSafeInteger(parameters.step) ||
+        parameters.step < 0 ||
+        parameters.step > 0xffffffff ||
+        !Number.isSafeInteger(mask) ||
+        mask < 0 ||
+        mask > 255
+      ) {
+        continue;
+      }
+
+      const payload = match[8];
+      if (payload.length > MAX_XOR_PAYLOAD_LENGTH) continue;
+      const normalizedPayload = payload.replace(/-/g, "+").replace(/_/g, "/");
+      if (normalizedPayload.length % 4 === 1) continue;
+      const paddedPayload = normalizedPayload.padEnd(
+        normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+        "=",
+      );
+
+      try {
+        const encrypted = atob(paddedPayload);
+        const decodedBytes = Uint8Array.from(
+          encrypted,
+          (character, index) =>
+            character.charCodeAt(0) ^
+            ((parameters.seed + index * parameters.step) & mask),
+        );
+        if (match[7]) decodedBytes.reverse();
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+          decodedBytes,
+        );
+        const candidate = normalizeCandidate(decoded);
+        if (candidate) return candidate;
+      } catch {
+        // Try the next decoder or one of the legacy formats below.
+      }
+    }
 
     const xorPattern =
       /var\s+[A-Za-z_$][\w$]*\s*=\s*\[([0-9,\s]+)\]\s*,\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,2000}?\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
@@ -1572,6 +2061,16 @@
       if (candidate) return candidate;
     }
     return null;
+  }
+
+  function extractFsvidVidzyM3u8FromHtml(html, embedUrl) {
+    const direct = extractM3u8UrlFromDecodedScript(html, embedUrl);
+    if (direct) return direct;
+
+    const decoded = decodePackedScriptFromHtml(html);
+    return decoded
+      ? extractM3u8UrlFromDecodedScript(decoded, embedUrl)
+      : null;
   }
 
   function extractUqloadMediaUrl(html) {
@@ -1828,7 +2327,12 @@
 
     const cacheKey = md5Hash(fsvidUrl);
     const cached = caches.fsvid.get(cacheKey);
-    if (cached) {
+    if (
+      cached &&
+      !String(cached.m3u8Url || "")
+        .toLowerCase()
+        .includes("troll")
+    ) {
       console.log("[EXT-FSVID] Cache hit");
       return { ...cached, fromCache: true };
     }
@@ -1870,63 +2374,11 @@
 
       const html = await resp.text();
       console.log(`[EXT-FSVID] HTML length: ${html.length}`);
-
-      // Check if the page has packed script
-      const hasEval = html.includes(PACKER_MARKER);
-      console.log(`[EXT-FSVID] Contains eval packer: ${hasEval}`);
-
-      if (!hasEval) {
-        // Try to find m3u8 directly in page (some fsvid pages have it in plain)
-        const directM3u8 = html.match(
-          /["'](https?:\/\/[^"']*\.m3u8[^"']*)["']/,
-        );
-        if (directM3u8) {
-          console.log(
-            `[EXT-FSVID] Found direct M3U8 (no packer needed): ${directM3u8[1]}`,
-          );
-          const m3u8Url = directM3u8[1].replace(/\\\//g, "/");
-          const result = { m3u8Url, success: true, source: "fsvid" };
-          caches.fsvid.set(cacheKey, result);
-          return result;
-        }
-        console.error("[EXT-FSVID] No eval packer and no direct M3U8 found");
-        console.log(
-          "[EXT-FSVID] HTML snippet (first 500 chars):",
-          html.substring(0, 500),
-        );
-        return { success: false, error: "Fsvid: No packed script found" };
-      }
-
-      // Pass full HTML to decodePackedScriptFromHtml (handles escaped quotes)
-      const deobfuscated = decodePackedScriptFromHtml(html);
-      if (!deobfuscated) {
-        console.error("[EXT-FSVID] Deobfuscation returned null");
-        // Log area around eval for debugging
-        const evalIdx = html.indexOf(PACKER_MARKER);
-        if (evalIdx !== -1) {
-          console.log(
-            "[EXT-FSVID] Packer snippet:",
-            html.substring(evalIdx, evalIdx + 200),
-          );
-        }
-        return { success: false, error: "Fsvid: Deobfuscation failed" };
-      }
-
-      console.log(`[EXT-FSVID] Deobfuscated length: ${deobfuscated.length}`);
-      console.log(
-        "[EXT-FSVID] Deobfuscated snippet:",
-        deobfuscated.substring(0, 300),
-      );
-
-      const m3u8Url = extractM3u8UrlFromDecodedScript(
-        deobfuscated,
-        fsvidUrl,
-      );
+      const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, fsvidUrl);
 
       if (!m3u8Url) {
-        console.error("[EXT-FSVID] No M3U8 URL found in deobfuscated script");
-        console.log("[EXT-FSVID] Full deobfuscated:", deobfuscated);
-        return { success: false, error: "Fsvid: M3U8 not found in script" };
+        console.error("[EXT-FSVID] No safe M3U8 URL found in page");
+        return { success: false, error: "Fsvid: M3U8 not found in page" };
       }
 
       console.log(`[EXT-FSVID] Final M3U8 URL: ${m3u8Url}`);
@@ -1951,7 +2403,14 @@
 
     const cacheKey = md5Hash(vidzyUrl);
     const cached = caches.vidzy.get(cacheKey);
-    if (cached) return { ...cached, fromCache: true };
+    if (
+      cached &&
+      !String(cached.m3u8Url || "")
+        .toLowerCase()
+        .includes("troll")
+    ) {
+      return { ...cached, fromCache: true };
+    }
 
     try {
       const controller = new AbortController();
@@ -1971,19 +2430,10 @@
       if (!resp.ok)
         return { success: false, error: `Vidzy: HTTP ${resp.status}` };
       const html = await resp.text();
-
-      // Pass full HTML to decodePackedScriptFromHtml (handles escaped quotes)
-      const deobfuscated = decodePackedScriptFromHtml(html);
-      if (!deobfuscated)
-        return { success: false, error: "Vidzy: Deobfuscation failed" };
-
-      const m3u8Url = extractM3u8UrlFromDecodedScript(
-        deobfuscated,
-        vidzyUrl,
-      );
+      const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, vidzyUrl);
 
       if (!m3u8Url)
-        return { success: false, error: "Vidzy: M3U8 not found in script" };
+        return { success: false, error: "Vidzy: M3U8 not found in page" };
 
       const result = { m3u8Url, success: true, source: "vidzy" };
       caches.vidzy.set(cacheKey, result);
@@ -2699,6 +3149,10 @@
         Referer: "https://purstream.mx/",
         Origin: "https://purstream.mx",
       },
+      kisskh: {
+        Referer: "https://kisskh.nl/",
+        Origin: "https://kisskh.nl",
+      },
     };
 
     const hdrs = headerMap[type];
@@ -3020,6 +3474,8 @@
     }
 
     switch (action) {
+      case "KISSKH_FALLBACK":
+        return await handleKisskhFallback(payload);
       case "GET_MANIFEST":
         return await getManifest();
       case "GET_CATALOG": {
@@ -5761,6 +6217,13 @@
       return result.success
         ? result.data
         : { success: false, error: result.error || "Configuration impossible" };
+    };
+
+    pageWindow.movixKisskhFallback = async function movixKisskhFallback(request) {
+      const result = await requestAction("KISSKH_FALLBACK", request);
+      return result.success
+        ? result.data
+        : { success: false, code: "unsupported_transport" };
     };
 
     pageWindow.dispatchEvent(new CustomEvent("movix-extension-loaded"));

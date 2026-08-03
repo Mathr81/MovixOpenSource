@@ -444,6 +444,21 @@ voirdramaRouter.configure({
   shouldUpdateCache24h,
 });
 
+// --- Configure KissKH ---
+const kisskhRouter = require('./routes/kisskh');
+const {
+  fetchTmdbAlternativeTitles,
+  fetchTmdbDetails,
+} = require('./utils/tmdbCache');
+kisskhRouter.configure({
+  redis,
+  tmdbApiKey: TMDB_API_KEY,
+  tmdbApiUrl: TMDB_API_URL,
+  fetchTmdbAlternativeTitles,
+  fetchTmdbDetails,
+  verifyAccessKey: require('./checkVip').verifyAccessKey,
+});
+
 // --- Configure francetv ---
 const francetvRouter = require("./routes/francetv");
 francetvRouter.configure({
@@ -451,10 +466,7 @@ francetvRouter.configure({
   saveToCache,
 });
 
-const {
-  router: vipDonationsRouter,
-  ensureVipDonationsTables
-} = require('./routes/vipDonations');
+const { router: vipDonationsRouter } = require('./routes/vipDonations');
 const { router: vipPayblisRouter } = require('./routes/vipPayblis');
 const oauthRouter = require('./routes/oauth');
 
@@ -492,6 +504,7 @@ app.use('/api', vipDonationsRouter);
 app.use('/api', vipPayblisRouter);
 app.use('/api/darkiworld', darkiworldRouter);
 app.use('/api/drama', voirdramaRouter);
+app.use('/api/kisskh', kisskhRouter);
 app.use('/api/ftv', francetvRouter);
 const purstreamRouter = require('./routes/purstream');
 purstreamRouter.configure({
@@ -512,159 +525,46 @@ app.use('/api/download-links', downloadLinksLeaderboardRouter);
 // MySQL pool initialization — pool unique via mysqlPool.js
 // ==========================================================================
 
-const {
-  initPool,
-  getPool,
-  SCHEMA_BOOTSTRAP_LOCK_NAME,
-  withMysqlAdvisoryLock
-} = require('./mysqlPool');
-const { ensureAccountLinksStorage } = require('./utils/accountLinks');
-const { ensureCloneLinksStorage } = require('./utils/cloneLinks');
-const { ensureOAuthStorage } = require('./utils/oauthStorage');
+const { initPool, getPool } = require('./mysqlPool');
 
 const appReady = (async () => {
   try {
     const pool = await initPool();
     console.log("MySQL unified pool initialized successfully");
-    await withMysqlAdvisoryLock(pool, SCHEMA_BOOTSTRAP_LOCK_NAME, async () => {
-      console.log(
-        `[Bootstrap] Worker ${process.pid} acquired MySQL schema lock`,
-      );
 
-      // Créer la table user_sessions si elle n'existe pas
-      await pool.execute(`
-      CREATE TABLE IF NOT EXISTS user_sessions (
-        id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
-        user_type ENUM('oauth', 'bip39') NOT NULL,
-        user_agent TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_user_sessions_user (user_id, user_type),
-        INDEX idx_user_sessions_accessed (accessed_at)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-      console.log("Table user_sessions initialized successfully");
+    // Hydrate only the worker-local cache. Schema setup is handled explicitly
+    // with `npm run db:init`, never as a side effect of starting the API.
+    const oauthClientsDb = require('./utils/oauthClientsDb');
+    await oauthClientsDb.reloadCache();
+    oauthClientsDb.startClientsCacheSubscriber();
+    console.log('OAuth clients cache initialized successfully');
 
-      await ensureAccountLinksStorage();
-      console.log("Table account_links initialized successfully");
+    // Initialize Wishboard routes
+    const { createWishboardRouter } = require("./wishboardRoutes");
+    const wishboardRouter = createWishboardRouter(pool, redis);
+    app.use("/api/wishboard", wishboardRouter);
+    app.use("/api/admin/wishboard", wishboardRouter);
+    console.log("Wishboard routes initialized successfully");
 
-      await ensureCloneLinksStorage();
-      console.log("Table clone_links initialized successfully");
+    // Initialize Link Submissions routes (user-submitted streaming links)
+    const {
+      createLinkSubmissionsRouter,
+    } = require("./linkSubmissionsRoutes");
+    const linkSubmissionsRouter = createLinkSubmissionsRouter(pool, redis);
+    app.use("/api/link-submissions", linkSubmissionsRouter);
+    console.log("Link Submissions routes initialized successfully");
 
-    await ensureVipDonationsTables(pool);
-    console.log('VIP donations tables initialized successfully');
+    // Initialize Top 10 routes (public ranking)
+    const { router: top10Router, initTop10Routes } = require("./top10Routes");
+    initTop10Routes(pool, redis);
+    app.use("/api/top10", top10Router);
+    console.log("Top 10 routes initialized successfully");
 
-    await ensureOAuthStorage(pool);
-    console.log('OAuth tables initialized successfully');
-
-      // OAuth client config (table oauth_clients + stats + grants VIP).
-      // ensureTables et migrateLegacyJsonIfNeeded sont protégés par le lock
-      // mais idempotents — sûr sur restart cluster. reloadCache hydrate
-      // le cache in-process de CE worker (chaque worker a le sien).
-      const oauthClientsDb = require('./utils/oauthClientsDb');
-      await oauthClientsDb.ensureTables();
-      await oauthClientsDb.migrateLegacyJsonIfNeeded();
-      await oauthClientsDb.reloadCache();
-      // Cluster mode: subscribe so this worker reloads when any other worker
-      // mutates an OAuth client (see oauthClientsDb cross-worker invalidation).
-      oauthClientsDb.startClientsCacheSubscriber();
-      console.log('OAuth client tables initialized successfully');
-
-      // Initialize Wishboard routes
-      const { createWishboardRouter } = require("./wishboardRoutes");
-      const wishboardRouter = createWishboardRouter(pool, redis);
-      app.use("/api/wishboard", wishboardRouter);
-      app.use("/api/admin/wishboard", wishboardRouter);
-      console.log("Wishboard routes initialized successfully");
-
-      // Initialize Link Submissions routes (user-submitted streaming links)
-      const {
-        createLinkSubmissionsRouter,
-      } = require("./linkSubmissionsRoutes");
-      const linkSubmissionsRouter = createLinkSubmissionsRouter(pool, redis);
-      app.use("/api/link-submissions", linkSubmissionsRouter);
-      // Create link_submissions table if not exists
-      await pool.execute(`
-      CREATE TABLE IF NOT EXISTS link_submissions (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
-        profile_id VARCHAR(255) NOT NULL,
-        tmdb_id INT NOT NULL,
-        media_type ENUM('movie', 'tv') NOT NULL,
-        season_number INT DEFAULT NULL,
-        episode_number INT DEFAULT NULL,
-        url VARCHAR(2048) NOT NULL,
-        source_name VARCHAR(100) DEFAULT NULL,
-        status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
-        rejection_reason TEXT DEFAULT NULL,
-        reviewed_by VARCHAR(255) DEFAULT NULL,
-        reviewed_at DATETIME DEFAULT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_ls_status (status),
-        INDEX idx_ls_profile (profile_id),
-        INDEX idx_ls_tmdb (tmdb_id, media_type),
-        INDEX idx_ls_created (created_at)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-      console.log("Link Submissions routes initialized successfully");
-
-      // Download links schema (admin-managed downloads + history/leaderboard)
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS download_links_history (
-          id BIGINT PRIMARY KEY AUTO_INCREMENT,
-          admin_id VARCHAR(255) NOT NULL,
-          admin_auth_type ENUM('oauth','bip-39') NOT NULL,
-          action ENUM('added','removed') NOT NULL,
-          media_type ENUM('movie','tv') NOT NULL,
-          tmdb_id BIGINT NOT NULL,
-          season INT NULL,
-          episode INT NULL,
-          link_url TEXT NOT NULL,
-          link_type ENUM('streaming','download') NOT NULL DEFAULT 'download',
-          changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_dlh_admin (admin_id, admin_auth_type),
-          INDEX idx_dlh_changed (changed_at),
-          INDEX idx_dlh_action (action),
-          INDEX idx_dlh_link_type (link_type)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-      `);
-
-      // Ensure download_links JSON column on films and series (idempotent)
-      const ensureColumn = async (tableName, columnName, definitionSql) => {
-        const [rows] = await pool.execute(
-          `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1`,
-          [tableName, columnName]
-        );
-        if (rows.length === 0) {
-          await pool.execute(`ALTER TABLE \`${tableName}\` ADD COLUMN ${definitionSql}`);
-        }
-      };
-      await ensureColumn('films', 'download_links', 'download_links JSON NULL');
-      await ensureColumn('series', 'download_links', 'download_links JSON NULL');
-      // Retro-migration: ensure link_type column exists on download_links_history (for installations that created the table before this column was added)
-      await ensureColumn('download_links_history', 'link_type', "link_type ENUM('streaming','download') NOT NULL DEFAULT 'download'");
-      console.log("Download links schema initialized successfully");
-
-      // Initialize Top 10 routes (public ranking)
-      const { router: top10Router, initTop10Routes } = require("./top10Routes");
-      initTop10Routes(pool, redis);
-      app.use("/api/top10", top10Router);
-      console.log("Top 10 routes initialized successfully");
-
-      // Initialize Wrapped routes (Movix Wrapped 2026 data collection)
-      const {
-        router: wrappedRouter,
-        initWrappedRoutes,
-        initTables: initWrappedTables,
-      } = require("./wrappedRoutes");
-      initWrappedRoutes(pool, redis);
-      await initWrappedTables();
-      app.use("/api/wrapped", wrappedRouter);
-      console.log("Wrapped routes initialized successfully");
-    });
+    // Initialize Wrapped routes (Movix Wrapped 2026 data collection)
+    const { router: wrappedRouter, initWrappedRoutes } = require("./wrappedRoutes");
+    initWrappedRoutes(pool, redis);
+    app.use("/api/wrapped", wrappedRouter);
+    console.log("Wrapped routes initialized successfully");
   } catch (error) {
     console.error("MySQL connection error:", error.message);
     throw error;

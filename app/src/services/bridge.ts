@@ -78,6 +78,7 @@ const CAST_SOURCE_MAX_HEADER_NAME_LENGTH = 128;
 const CAST_SOURCE_MAX_HEADER_VALUE_LENGTH = 8_192;
 const CAST_SOURCE_MAX_HEADERS = 32;
 const CAST_SOURCE_MAX_TRACKS = 16;
+const CAST_INLINE_VTT_MAX_CHARS = 2 * 1024 * 1024;
 const CAST_TITLE_MAX_LENGTH = 256;
 const CAST_TRACK_LABEL_MAX_LENGTH = 128;
 const CAST_TRACK_LANGUAGE_MAX_LENGTH = 35;
@@ -389,9 +390,31 @@ function parsePreparedCastSource(
     }
     const tracks = [];
     for (const rawTrack of raw.tracks) {
-      const trackSource = parsePreparedCastSource(rawTrack, false);
-      if (!trackSource) return null;
       const metadata = rawTrack as Record<string, unknown>;
+      let trackSource: NonNullable<PreparedCastSource['tracks']>[number];
+      if (metadata.inlineVtt !== undefined) {
+        if (
+          typeof metadata.inlineVtt !== 'string'
+          || metadata.inlineVtt.length === 0
+          || metadata.inlineVtt.length > CAST_INLINE_VTT_MAX_CHARS
+          || metadata.inlineVtt.includes('\0')
+          || !/^\uFEFF?WEBVTT(?:[ \t]|\r?$)/m.test(metadata.inlineVtt)
+          || !metadata.inlineVtt.includes('-->')
+          || metadata.url !== undefined
+          || metadata.headers !== undefined
+          || metadata.protocolVersion !== 1
+          || (metadata.contentType !== undefined && metadata.contentType !== 'text/vtt')
+        ) return null;
+        trackSource = {
+          inlineVtt: metadata.inlineVtt,
+          contentType: 'text/vtt',
+          protocolVersion: 1,
+        };
+      } else {
+        const parsedTrack = parsePreparedCastSource(rawTrack, false);
+        if (!parsedTrack) return null;
+        trackSource = parsedTrack;
+      }
       if (
         metadata.language !== undefined
         && (
@@ -460,7 +483,7 @@ async function resolvePreparedCastSourceForNative(
   const resolvedRoot = await resolveSingle(root);
   if (!source.tracks?.length) return resolvedRoot;
   const tracks = await Promise.all(source.tracks.map(async track => ({
-    ...await resolveSingle(track),
+    ...('inlineVtt' in track ? track : await resolveSingle(track)),
     ...(track.language !== undefined ? { language: track.language } : {}),
     ...(track.name !== undefined ? { name: track.name } : {}),
     ...(track.active !== undefined ? { active: track.active } : {}),

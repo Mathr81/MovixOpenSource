@@ -1,0 +1,14 @@
+{
+  "episodeId": 86439,
+  "bundleSha256": "85b3dba9a8bf81abd48cbdd7d6d44e33a418c57830acac7f53f2c0211660d501",
+  "moduleSha256": "cffbf97c8caa4e2663dc800c50fb19a7459d4f74bfa215789160371b996aad27",
+  "episodeKkeySha256": "36586ab35e77ac1ef256e3af7607a6fc61faaad810e165547da73f17e224fd06",
+  "subKkeySha256": "9fc720a62cc3dc396e5590ad6196dea9740b81a13db3afe3338738ea98a0d61a",
+  "subtitleA1KeySha256": "c2cd5005517e3a9e2513764bf1ad17bbdefec5bb6022c6449bbe4f62a4fb4453",
+  "subtitleA1IvSha256": "d298ee5189b34c85c639f1326585a630e535977b23aa67610b6242a9152d8de5",
+  "lengths": {
+    "episode": 256,
+    "sub": 256
+  },
+  "capturedAt": "2026-08-02T18:41:32.595Z"
+}

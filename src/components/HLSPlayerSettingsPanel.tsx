@@ -23,6 +23,7 @@ import {
 import type {
   HosterId, PriorityCategory, TopLevelSourceId, LanguageId,
 } from '../types/sourcePriority';
+import type { KisskhSource, KisskhSubtitleTrack } from '../types/kisskh';
 
 /**
  * Milestone 4 — mapping des `source_main` types (labels internes du panneau
@@ -43,6 +44,7 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   multi_main: 'coflix', // multi = coflix (naming historique)
   viper_main: 'viper',
   vox_main: 'vox',
+  kisskh_main: 'kisskh',
   bravo_main: 'bravo',
   rivestream_main: 'rivestream_hls',
   vostfr_main: 'vostfr',
@@ -51,7 +53,11 @@ const SOURCE_MAIN_TO_TOP_LEVEL: Record<string, TopLevelSourceId> = {
   custom: 'custom',
 };
 
-type HLSPlayerSettingsPanelProps = Record<string, any>;
+interface HLSPlayerSettingsPanelProps extends Record<string, any> {
+  kisskhSources?: KisskhSource[];
+  kisskhSubtitles?: KisskhSubtitleTrack[];
+  loadingKisskh?: boolean;
+}
 
 // Mapping OpenSubtitles language codes to ISO country codes for flags
 const langToCountry: Record<string, string> = {
@@ -65,7 +71,8 @@ const TRANSLATION_LANGS = [
   { code: 'ru', country: 'RU' }, { code: 'ja', country: 'JP' }, { code: 'ko', country: 'KR' },
   { code: 'zh', country: 'CN' }, { code: 'ar', country: 'SA' }, { code: 'hi', country: 'IN' },
   { code: 'tr', country: 'TR' }, { code: 'nl', country: 'NL' }, { code: 'pl', country: 'PL' },
-  { code: 'uk', country: 'UA' },
+  { code: 'uk', country: 'UA' }, { code: 'id', country: 'ID' }, { code: 'ms', country: 'MY' },
+  { code: 'km', country: 'KH' },
 ] as const;
 
 const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
@@ -108,6 +115,8 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     nexusFileSources,
     viperSources,
     voxSources,
+    kisskhSources = [],
+    loadingKisskh = false,
     purstreamSources,
     embedUrl,
     onlyQualityMenu,
@@ -159,6 +168,9 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
     setTranslateSubsTo,
     translationProgress,
     translationLang,
+    translatedSubtitleHistory = [],
+    activeTranslatedSubtitleId,
+    activateTranslatedSubtitle,
     startSubtitleTranslation,
     cancelSubtitleTranslation,
     loadingSubtitle,
@@ -211,6 +223,15 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
   } = props;
 
   const category: PriorityCategory = priorityCategory === 'anime' ? 'anime' : 'moviesTv';
+  const [showExternalResults, setShowExternalResults] = useState(true);
+
+  useEffect(() => {
+    if (selectedExternalSub) setShowExternalResults(false);
+  }, [selectedExternalSub]);
+
+  useEffect(() => {
+    setShowExternalResults(true);
+  }, [selectedExternalLang]);
 
   // ===== Milestone 3 — sort hoster lists by user priority =====
   // Re-render when priority prefs change (e.g. user reorders in Settings).
@@ -594,6 +615,10 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                               (nexusFileSources && nexusFileSources.some(ns => ns.url === src));
                           } else if (source.type === 'mp4') {
                             isActive = src === source.url; // Direct comparison for MP4
+                          } else if (source.type === 'kisskh_main') {
+                            isActive = kisskhSources.some((kisskhSource: KisskhSource) => (
+                              kisskhSource.url === src && kisskhSource.id === source.id
+                            ));
                           } else if (source.type === 'm3u8') { // Added check for AdFree M3U8
                             isActive = src === source.url;
                           } else if (source.type === 'viper_main') {
@@ -620,7 +645,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                               <div className="mb-2 flex items-stretch gap-2">
                                 <button
                                   onClick={() => handleSourceChange(source.type, source.id, source.url)}
-                                  disabled={(source.type === 'rivestream_hls' && loadingRivestream)}
+                                  disabled={(source.type === 'rivestream_hls' && loadingRivestream) || (source.type === 'kisskh_main' && loadingKisskh)}
                                   className={`w-full flex-1 px-4 py-3 text-sm text-left hover:bg-gray-800/80 rounded-lg flex justify-between items-center ${isActive ? 'bg-gray-800 border-l-4 border-red-600 pl-3' : 'bg-gray-900/60 text-white'
                                     } ${onlyQualityMenu && embedType && embedUrl && source.type === embedType && source.url === embedUrl ? 'ring-2 ring-red-500 bg-gray-800/80' : ''} ${(source.type === 'rivestream_hls' && loadingRivestream) ? 'opacity-70 cursor-not-allowed' : ''
                                     }`}
@@ -633,7 +658,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                         <span className="ml-2 text-xs text-amber-400 font-semibold">#1</span>
                                       )}
                                     </span>
-                                    {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
+                                    {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderSourceQualityMeta(source.url, isActive, source.quality, source.label)}
                                   </div>
                                   <div className="ml-3 flex items-center gap-2">
                                     {(source.type === 'darkino_main' || source.type === 'omega_main' || source.type === 'multi_main' || source.type === 'fstream_main' || source.type === 'wiflix_main' || source.type === 'j1f_main' || source.type === 'swiftflow_main' || source.type === 'nexus_main' || source.type === 'rivestream_main' || source.type === 'bravo_main' || source.type === 'viper_main' || source.type === 'vox_main') && (
@@ -669,7 +694,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                     />
                                   </div>
                                 )}
-                                {group.type === 'hls' && (source.type === 'mp4' || source.type === 'm3u8') && renderCopySourceButton(source.url)}
+                                {group.type === 'hls' && (source.mediaType === 'mp4' || source.type === 'mp4' || source.type === 'm3u8') && renderCopySourceButton(source.url)}
                               </div>
                               {/* Sous-menu Darkino */}
                               {source.type === 'darkino_main' && (
@@ -1904,25 +1929,25 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                           <div className="text-xs text-gray-400 px-2 py-1">{t('watch.searchingSubtitles')}</div>
                         )}
 
-                        {!externalLoading && externalSubs.length > 0 && (
+                        {!externalLoading && showExternalResults && externalSubs.length > 0 && (
                           <div className="mt-2">
                             <div className="flex items-center justify-between mb-2">
                               <h5 className="text-sm text-white">{t('watch.subtitleResults')}</h5>
                               <span className="text-xs text-gray-400 italic ml-2">{t('watch.subtitleRetryHint')}</span>
                             </div>
-                            <div className="space-y-2 max-h-40 overflow-auto pr-2">
+                            <div className="space-y-2 pr-2">
                               {externalSubs.map((sub, idx) => {
                                 const id = `external:${sub.IDSubtitle || sub.IDSubtitleFile || idx}`;
                                 return (
                                   <button
                                     key={id}
                                     onClick={() => {
-                                      loadExternalSubtitle(sub, id);
+                                      loadExternalSubtitle(sub);
                                     }}
                                     className={`w-full px-3 py-2 text-sm text-left hover:bg-gray-800/50 rounded flex justify-between items-center ${currentSubtitle === id ? 'bg-red-800/60 ring-1 ring-red-600' : 'bg-gray-900/40 text-white'}`}
                                   >
-                                    <div>
-                                      <div className="font-medium text-white">{sub.SubFileName || sub.MovieReleaseName || `Subtitle ${idx + 1}`}</div>
+                                    <div className="min-w-0 flex-1 pr-3">
+                                      <div className="font-medium text-white whitespace-normal break-words [overflow-wrap:anywhere]">{sub.SubFileName || sub.MovieReleaseName || `Subtitle ${idx + 1}`}</div>
                                       <div className="text-xs text-gray-400">
                                         {(externalLanguages.find(l => l.code === sub.SubLanguageID)?.label || sub.LanguageName || sub.SubLanguageID) || t('common.unknown')} • {sub.SubFormat || 'srt'}
                                         {tvShowId != null && seasonNumber != null && episodeNumber != null && (
@@ -1932,7 +1957,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                                         )}
                                       </div>
                                     </div>
-                                    <div className="text-xs text-gray-300">{sub.SubDownloadsCnt ? `${sub.SubDownloadsCnt} DL` : ''}</div>
+                                    <div className="text-xs text-gray-300 shrink-0">{sub.SubDownloadsCnt ? `${sub.SubDownloadsCnt} DL` : ''}</div>
                                   </button>
                                 );
                               })}
@@ -1940,7 +1965,7 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                           </div>
                         )}
 
-                        {!externalLoading && selectedExternalLang && externalSubs.length === 0 && (
+                        {!externalLoading && showExternalResults && selectedExternalLang && externalSubs.length === 0 && (
                           <div className="text-xs text-gray-400 px-2 py-1">
                             {t('watch.noSubtitleFound')}
                             {tvShowId != null && seasonNumber != null && episodeNumber != null && (
@@ -1954,17 +1979,15 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         {loadingSubtitle && (
                           <div className="text-xs text-gray-400 px-2 py-1">{t('watch.loadingSubtitle')}</div>
                         )}
-                        {/* Active external subtitle display */}
-                        {selectedExternalSub && (
-                          <div className="mt-3 px-2 py-2 bg-gray-900/40 rounded">
-                            <div className="flex items-center justify-between">
-                              <div>
-                                <div className="text-sm text-white font-medium">{selectedExternalSub.SubFileName || selectedExternalSub.MovieReleaseName}</div>
-                                <div className="text-xs text-gray-400">{selectedExternalSub.LanguageName || selectedExternalSub.SubLanguageID}</div>
-                              </div>
-                              <div className="text-xs text-red-500">{t('watch.selectedLabel')}</div>
-                            </div>
-                          </div>
+                        {/* La piste sélectionnée est désormais visible dans les sous-titres intégrés. */}
+                        {selectedExternalSub && !showExternalResults && (
+                          <button
+                            type="button"
+                            onClick={() => setShowExternalResults(true)}
+                            className="mt-3 w-full px-3 py-2 text-sm text-white bg-gray-900/60 hover:bg-gray-800 rounded-lg border border-gray-700/60 transition-colors"
+                          >
+                            {t('watch.changeSubtitle')}
+                          </button>
                         )}
                       </div>
                     </div>
@@ -2057,6 +2080,47 @@ const HLSPlayerSettingsPanel = (props: HLSPlayerSettingsPanelProps) => {
                         </div>
                       )}
                     </div>
+
+                    {translatedSubtitleHistory.length > 0 && (
+                      <div className="mb-4 border-t border-gray-800 pt-3">
+                        <h4 className="text-gray-400 text-xs uppercase tracking-wider mb-2 px-2">
+                          {t('watch.translatedSubtitles')}
+                        </h4>
+                        <div className="space-y-2">
+                          {translatedSubtitleHistory.map((entry: any) => {
+                            const isActive = activeTranslatedSubtitleId === entry.id;
+                            return (
+                              <button
+                                type="button"
+                                key={entry.id}
+                                onClick={() => activateTranslatedSubtitle(entry.id)}
+                                className={`w-full px-3 py-2.5 text-left rounded-lg transition-colors ${isActive
+                                  ? 'bg-red-950/50 ring-1 ring-red-600/80'
+                                  : 'bg-gray-900/40 hover:bg-gray-800/70'}`}
+                              >
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center gap-2 text-sm text-white">
+                                      <span>{getLanguageName(entry.sourceLanguage)}</span>
+                                      <span className="text-gray-500" aria-hidden="true">→</span>
+                                      <span>{getLanguageName(entry.targetLanguage)}</span>
+                                    </div>
+                                    <div className="mt-1 text-xs text-gray-400 whitespace-normal break-words [overflow-wrap:anywhere]">
+                                      {entry.sourceLabel}
+                                    </div>
+                                  </div>
+                                  {isActive && (
+                                    <span className="shrink-0 text-xs px-2 py-1 bg-red-600 text-white rounded-full">
+                                      {t('watch.active')}
+                                    </span>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </motion.div>
                 )}
                 {settingsTab === 'style' && (

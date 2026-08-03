@@ -131,6 +131,8 @@ type WebCastSession = {
   ) => unknown;
   addUpdateListener?: (listener: (alive?: boolean) => void) => void;
   removeUpdateListener?: (listener: (alive?: boolean) => void) => void;
+  addMediaListener?: (listener: (media: WebCastMediaSession) => void) => void;
+  removeMediaListener?: (listener: (media: WebCastMediaSession) => void) => void;
 };
 
 type WebCastMediaSession = {
@@ -161,7 +163,7 @@ type WebCastMediaSession = {
 
 function getWebMedia(session: WebCastSession): WebCastMediaSession | null {
   return session.getMediaSession?.()
-    ?? (Array.isArray(session.media) ? session.media[0] : null)
+    ?? (Array.isArray(session.media) ? session.media.at(-1) ?? null : null)
     ?? null;
 }
 
@@ -182,8 +184,10 @@ function mapWebState(state: string | undefined): CastRemoteStatus['state'] {
   }
 }
 
-function readWebStatus(session: WebCastSession): CastRemoteStatus {
-  const media = getWebMedia(session);
+function readWebStatus(
+  session: WebCastSession,
+  media: WebCastMediaSession | null = getWebMedia(session),
+): CastRemoteStatus {
   const position = media?.getEstimatedTime?.() ?? media?.currentTime ?? 0;
   const duration = media?.getDuration?.() ?? media?.duration;
   return {
@@ -228,14 +232,16 @@ export function createWebCastRemoteController(
   loadSource: (source: CastSource) => Promise<void>,
 ): CastRemoteController {
   const refreshSubscriptionsAfterLoad = new Set<() => void>();
+  let announcedMedia = getWebMedia(session);
+  const currentMedia = () => announcedMedia ?? getWebMedia(session);
   const requireMedia = () => {
-    const media = getWebMedia(session);
+    const media = currentMedia();
     if (!media) throw new Error('CAST_MEDIA_SESSION_UNAVAILABLE');
     return media;
   };
 
   return createController('web', {
-    getStatus: async () => readWebStatus(session),
+    getStatus: async () => readWebStatus(session, currentMedia()),
     play: () => {
       const media = requireMedia();
       if (!media.play) return Promise.reject(new Error('CAST_PLAY_UNAVAILABLE'));
@@ -265,6 +271,7 @@ export function createWebCastRemoteController(
     },
     load: async source => {
       await loadSource(source);
+      announcedMedia = getWebMedia(session) ?? announcedMedia;
       for (const refresh of [...refreshSubscriptionsAfterLoad]) refresh();
     },
     stop: () => {
@@ -277,24 +284,33 @@ export function createWebCastRemoteController(
       let subscribedMedia: WebCastMediaSession | null = null;
       let active = true;
 
-      function bindCurrentMedia(): boolean {
-        const currentMedia = getWebMedia(session);
-        if (currentMedia === subscribedMedia) return false;
+      function bindCurrentMedia(media = currentMedia()): boolean {
+        if (media === subscribedMedia) return false;
         subscribedMedia?.removeUpdateListener?.(onUpdate);
-        subscribedMedia = currentMedia;
+        subscribedMedia = media;
         subscribedMedia?.addUpdateListener?.(onUpdate);
         return true;
       }
 
       function onUpdate(): void {
         if (!active) return;
-        bindCurrentMedia();
-        listener(readWebStatus(session));
+        bindCurrentMedia(subscribedMedia ?? currentMedia());
+        listener(readWebStatus(session, subscribedMedia));
+      }
+
+      function onMedia(media: WebCastMediaSession): void {
+        if (!active) return;
+        announcedMedia = media;
+        bindCurrentMedia(media);
+        listener(readWebStatus(session, media));
       }
 
       session.addUpdateListener?.(onUpdate);
+      session.addMediaListener?.(onMedia);
       const refreshAfterLoad = () => {
-        if (active && bindCurrentMedia()) listener(readWebStatus(session));
+        if (!active) return;
+        bindCurrentMedia(currentMedia());
+        listener(readWebStatus(session, subscribedMedia));
       };
       refreshSubscriptionsAfterLoad.add(refreshAfterLoad);
       bindCurrentMedia();
@@ -302,6 +318,7 @@ export function createWebCastRemoteController(
         active = false;
         refreshSubscriptionsAfterLoad.delete(refreshAfterLoad);
         session.removeUpdateListener?.(onUpdate);
+        session.removeMediaListener?.(onMedia);
         subscribedMedia?.removeUpdateListener?.(onUpdate);
         subscribedMedia = null;
       };

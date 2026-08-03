@@ -637,7 +637,7 @@ SIBNET_PROXY = PROXIES[0] if len(PROXIES) > 0 else None
 VIDMOLY_PROXY = PROXIES[1] if len(PROXIES) > 1 else (PROXIES[0] if len(PROXIES) > 0 else None)
 
 # Logging — default WARNING (errors/warns only); set LOG_LEVEL=INFO|DEBUG to reenable.
-_LOG_LEVEL = getattr(logging, os.environ.get('LOG_LEVEL', 'WARNING').upper(), logging.WARNING)
+_LOG_LEVEL = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.WARNING)
 logging.basicConfig(level=_LOG_LEVEL)
 logger = logging.getLogger(__name__)
 logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
@@ -1119,7 +1119,7 @@ class ProxyServer:
         
         # Sessions container
         self.sessions = {}
-        
+
         # MySQL pool (initialized async in start_server)
         self.mysql_pool = None
         
@@ -1554,6 +1554,8 @@ class ProxyServer:
         self.app.router.add_get('/doodstream-proxy', self.doodstream_proxy_handler)
         self.app.router.add_get('/seekstreaming-proxy', self.seekstreaming_proxy_handler)
         self.app.router.add_get('/cinep-proxy', self.cinep_proxy_handler)
+        self.app.router.add_get('/kisskh-proxy', self.kisskh_proxy_handler)
+        self.app.router.add_route('OPTIONS', '/kisskh-proxy', self.kisskh_proxy_handler)
         # DRM Proxy routes (widefrog integration, API-only)
         self.app.router.add_get('/drm/extract', self.drm_extract_handler)
         self.app.router.add_post('/drm/extract', self.drm_extract_handler)
@@ -3125,9 +3127,12 @@ class ProxyServer:
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.fsvid_cache.get(cache_key)
             if cached:
-                resp = web.json_response(cached)
-                resp.headers['X-Cache'] = 'HIT'
-                return resp
+                cached_url = cached.get('m3u8Url') if isinstance(cached, dict) else None
+                if cached_url and 'troll' not in str(cached_url).lower():
+                    resp = web.json_response(cached)
+                    resp.headers['X-Cache'] = 'HIT'
+                    return resp
+                self.fsvid_cache.delete(cache_key)
             
             headers = {
                 'accept': 'text/html,*/*',
@@ -3142,16 +3147,8 @@ class ProxyServer:
                     return web.json_response({'error': 'Fetch failed'}, status=500)
                 
                 html = await response.text(encoding='utf-8')
-                
-                # Regex au lieu de BeautifulSoup â€” bien plus lÃ©ger
-                script_match = re.search(r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',\d+,\d+,'[^']+'\.", html, re.DOTALL)
-                
-                if not script_match:
-                    return web.json_response({'error': 'Script not found'}, status=404)
-                
-                deobfuscated = self._deobfuscate_fsvid_script(script_match.group(0))
 
-                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                m3u8_url = self._extract_fsvid_vidzy_m3u8_from_html(html, url)
                 if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
@@ -3170,12 +3167,42 @@ class ProxyServer:
     
     def _deobfuscate_fsvid_script(self, script: str) -> str:
         """Deobfuscate packed JavaScript"""
-        match = re.search(r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+?)',(\d+),(\d+),'(.+?)'\.", script, re.DOTALL)
+        marker = re.search(
+            r'eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,'
+            r'\s*k\s*,\s*e\s*,\s*d\s*\)',
+            script,
+        )
+        if not marker:
+            raise ValueError('Pattern not found')
+
+        split = re.search(
+            r'\.split\(\s*(["\'])\|\1\s*\)',
+            script[marker.start():],
+        )
+        if not split:
+            raise ValueError('Pattern not found')
+
+        section_end = marker.start() + split.end()
+        section = script[marker.start():section_end]
+        single_quote_pattern = re.compile(
+            r"\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)"
+            r"\s*,\s*'((?:[^'\\]|\\.)*)'\s*\.split",
+            re.DOTALL,
+        )
+        double_quote_pattern = re.compile(
+            r'\}\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\s*,\s*(\d+)'
+            r'\s*,\s*"((?:[^"\\]|\\.)*)"\s*\.split',
+            re.DOTALL,
+        )
+        match = single_quote_pattern.search(section) or double_quote_pattern.search(section)
         if not match:
             raise ValueError('Pattern not found')
         
         p, a, c, k_str = match.group(1), int(match.group(2)), int(match.group(3)), match.group(4)
+        p = p.replace(r"\'", "'").replace(r'\"', '"')
         k = k_str.split('|')
+        if a < 2 or a > 62 or c < 0 or c > 10000 or c > len(k):
+            raise ValueError('Invalid packer parameters')
         
         def to_base(num: int, base: int) -> str:
             chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -3201,7 +3228,8 @@ class ProxyServer:
 
         def normalize(candidate: str) -> Optional[str]:
             candidate = candidate.replace(r'\/', '/').replace('&amp;', '&').strip().rstrip('\\')
-            if '.m3u8' not in candidate.lower():
+            candidate_lower = candidate.lower()
+            if '.m3u8' not in candidate_lower or 'troll' in candidate_lower:
                 return None
 
             parsed = urlparse(candidate)
@@ -3212,6 +3240,86 @@ class ProxyServer:
                 return urljoin(embed_url, candidate)
 
             return None
+
+        # Current Fsvid/Vidzy pages derive the XOR key for each byte from an
+        # affine expression, then optionally reverse the decoded byte sequence.
+        # Capture the page's variable names and parameters instead of evaluating
+        # remote JavaScript or hard-coding today's seed/step values.
+        rolling_xor_pattern = re.compile(
+            r'(?:var\s+)?(?P<bytes>[A-Za-z_$][\w$]*)\s*=\s*atob\('
+            r'\s*[A-Za-z_$][\w$]*\s*\)'
+            r'.{0,512}?for\s*\(\s*var\s+(?P<index>[A-Za-z_$][\w$]*)'
+            r'\s*=\s*0\s*;\s*(?P=index)\s*<\s*(?P=bytes)\.length\s*;'
+            r'\s*(?P=index)\+\+\s*\)\s*\{'
+            r'.{0,512}?(?:var\s+)?(?P<key>[A-Za-z_$][\w$]*)\s*=\s*\('
+            r'\s*(?P<key_expr>.{1,128}?)\s*\)\s*&\s*'
+            r'(?P<mask>0[xX][0-9a-fA-F]+|\d+)\s*;'
+            r'.{0,512}?(?P<output>[A-Za-z_$][\w$]*)\s*\+=\s*'
+            r'String\.fromCharCode\(\s*(?P=bytes)\.charCodeAt\('
+            r'\s*(?P=index)\s*\)\s*\^\s*(?P=key)\s*\)'
+            r'.{0,256}?\}\s*return\s+(?P=output)'
+            r'(?P<reverse>\s*\.split\(\s*["\']["\']\s*\)\s*'
+            r'\.reverse\(\s*\)\s*\.join\(\s*["\']["\']\s*\))?'
+            r'\s*\}\)\s*\(\s*["\']'
+            r'(?P<payload>[A-Za-z0-9+/_=-]{1,32768})["\']\s*\)',
+            re.DOTALL,
+        )
+        numeric_literal = r'(?:0[xX][0-9a-fA-F]+|\d+)'
+
+        def parse_rolling_parameters(expression: str, index_name: str) -> Optional[Tuple[int, int]]:
+            normalized = re.sub(r'[\s()]', '', expression)
+            index_token = re.escape(index_name)
+            layouts = [
+                (rf'^({numeric_literal})\+{index_token}\*({numeric_literal})$', 1, 2),
+                (rf'^({numeric_literal})\+({numeric_literal})\*{index_token}$', 1, 2),
+                (rf'^{index_token}\*({numeric_literal})\+({numeric_literal})$', 2, 1),
+                (rf'^({numeric_literal})\*{index_token}\+({numeric_literal})$', 2, 1),
+            ]
+            for pattern, seed_group, step_group in layouts:
+                match = re.fullmatch(pattern, normalized)
+                if match:
+                    return int(match.group(seed_group), 0), int(match.group(step_group), 0)
+
+            for pattern in [
+                rf'^({numeric_literal})\+{index_token}$',
+                rf'^{index_token}\+({numeric_literal})$',
+            ]:
+                match = re.fullmatch(pattern, normalized)
+                if match:
+                    return int(match.group(1), 0), 1
+            return None
+
+        for match in rolling_xor_pattern.finditer(script):
+            try:
+                parameters = parse_rolling_parameters(
+                    match.group('key_expr'),
+                    match.group('index'),
+                )
+                if parameters is None:
+                    continue
+                seed, step = parameters
+                mask = int(match.group('mask'), 0)
+                if not (
+                    0 <= seed <= 0xFFFFFFFF
+                    and 0 <= step <= 0xFFFFFFFF
+                    and 0 <= mask <= 0xFF
+                ):
+                    continue
+
+                payload = match.group('payload')
+                payload += '=' * (-len(payload) % 4)
+                encrypted = base64.b64decode(payload, altchars=b'-_', validate=True)
+                decoded_bytes = bytes(
+                    value ^ ((seed + index * step) & mask)
+                    for index, value in enumerate(encrypted)
+                )
+                if match.group('reverse'):
+                    decoded_bytes = decoded_bytes[::-1]
+                candidate = normalize(decoded_bytes.decode('utf-8'))
+                if candidate:
+                    return candidate
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                continue
 
         # New fsvid/vidzy player format:
         # (function(s){var k=[...],b=atob(s),r=""; ... XOR ...})("...")
@@ -3255,6 +3363,22 @@ class ProxyServer:
                     return candidate
 
         return None
+
+    def _extract_fsvid_vidzy_m3u8_from_html(
+        self,
+        html: str,
+        embed_url: str,
+    ) -> Optional[str]:
+        """Extract a safe direct source, then fall back to tolerant unpacking."""
+        direct = self._extract_m3u8_url(html, embed_url)
+        if direct:
+            return direct
+
+        try:
+            decoded = self._deobfuscate_fsvid_script(html)
+        except ValueError:
+            return None
+        return self._extract_m3u8_url(decoded, embed_url)
     
     async def vidzy_extract_handler(self, request: Request) -> Response:
         """VIDZY M3U8 extraction"""
@@ -3268,9 +3392,12 @@ class ProxyServer:
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.vidzy_cache.get(cache_key)
             if cached:
-                resp = web.json_response(cached)
-                resp.headers['X-Cache'] = 'HIT'
-                return resp
+                cached_url = cached.get('m3u8Url') if isinstance(cached, dict) else None
+                if cached_url and 'troll' not in str(cached_url).lower():
+                    resp = web.json_response(cached)
+                    resp.headers['X-Cache'] = 'HIT'
+                    return resp
+                self.vidzy_cache.delete(cache_key)
             
             headers = {
                 'accept': 'text/html,*/*',
@@ -3285,17 +3412,7 @@ class ProxyServer:
                     return web.json_response({'error': 'Fetch failed'}, status=500)
                 
                 html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                script = next((s for s in soup.find_all('script') 
-                              if s.string and 'eval(function' in s.string), None)
-                
-                if not script:
-                    return web.json_response({'error': 'Script not found'}, status=404)
-                
-                deobfuscated = self._deobfuscate_fsvid_script(script.string)
-
-                m3u8_url = self._extract_m3u8_url(deobfuscated, url)
+                m3u8_url = self._extract_fsvid_vidzy_m3u8_from_html(html, url)
                 if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
@@ -4119,6 +4236,27 @@ class ProxyServer:
                         CHUNK_DEFAULT,
                     )
                 
+                # Les playlists KissKH utilisent des centaines de BYTERANGE sur
+                # des .ts. Une requête Range doit commencer à répondre dès le
+                # premier chunk, comme le chemin MP4, au lieu d'attendre que la
+                # plage complète soit chargée en mémoire.
+                if range_header and (content.is_ts or content.is_m4s):
+                    resp_headers['Content-Type'] = (
+                        'video/mp2t' if content.is_ts else 'video/iso.segment'
+                    )
+                    resp_headers['Accept-Ranges'] = 'bytes'
+                    resp_headers['Cache-Control'] = 'public, max-age=7200'
+                    if response.status == 206 and 'content-range' in response.headers:
+                        resp_headers['Content-Range'] = response.headers['content-range']
+                    if 'content-length' in response.headers:
+                        resp_headers['Content-Length'] = response.headers['content-length']
+                    return await self._stream_response_fast(
+                        request,
+                        response,
+                        resp_headers,
+                        CHUNK_LARGE,
+                    )
+
                 # TS segments â€” buffer + cache (shared with main proxy segment buffer)
                 if content.is_ts:
                     body = await response.read()
@@ -4250,6 +4388,77 @@ class ProxyServer:
             'Referer': 'https://fsvid.lol/',
             'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0'
         })
+
+    async def kisskh_proxy_handler(self, request: Request) -> Response:
+        """KissKH HLS relay: direct egress, then one deterministic SOCKS retry on 403."""
+        if request.method == 'OPTIONS':
+            return web.Response(headers=CORS_HEADERS)
+
+        target_url = request.query.get('url')
+        try:
+            parsed_target = urlparse(target_url or '')
+        except ValueError:
+            parsed_target = None
+        if (
+            parsed_target is None
+            or parsed_target.scheme.lower() not in {'http', 'https'}
+            or not parsed_target.netloc
+        ):
+            return web.json_response(
+                {'error': 'Invalid url parameter'},
+                status=400,
+                headers=CORS_HEADERS,
+            )
+
+        headers = {
+            'Accept': 'application/vnd.apple.mpegurl,*/*',
+            'Origin': 'https://kisskh.nl',
+            'Referer': 'https://kisskh.nl/',
+            'User-Agent': 'Mozilla/5.0 Chrome/139.0.0.0',
+        }
+        started_at = time.monotonic()
+        response = await self._service_proxy(
+            request,
+            'kisskh',
+            headers,
+            session_key='normal',
+        )
+        direct_ms = (time.monotonic() - started_at) * 1000
+        logger.info(
+            "[KISSKH-PROXY] egress=direct status=%s elapsed_ms=%.1f url=%s",
+            response.status,
+            direct_ms,
+            redact_url_for_log(target_url),
+        )
+        if response.status != 403:
+            return response
+
+        logger.warning(
+            "[KISSKH-PROXY] direct_403 retry=proxy_0 url=%s",
+            redact_url_for_log(target_url),
+        )
+        proxy_session = self.sessions.get('proxy_0')
+        if proxy_session is None or getattr(proxy_session, 'closed', False):
+            return web.json_response(
+                {'error': 'SOCKS5 proxy unavailable'},
+                status=503,
+                headers=CORS_HEADERS,
+            )
+        retry_started_at = time.monotonic()
+        response = await self._service_proxy(
+            request,
+            'kisskh',
+            headers,
+            session_key='proxy_0',
+        )
+        logger.info(
+            "[KISSKH-PROXY] egress=proxy_0 status=%s elapsed_ms=%.1f total_ms=%.1f url=%s",
+            response.status,
+            (time.monotonic() - retry_started_at) * 1000,
+            (time.monotonic() - started_at) * 1000,
+            redact_url_for_log(target_url),
+        )
+        return response
 
     async def vidzy_proxy_handler(self, request: Request) -> Response:
         """Vidzy proxy"""
@@ -4889,7 +5098,6 @@ async def main():
                 cleanup_tasks.append(session.close())
         if server.curl_session is not None:
             cleanup_tasks.append(server.curl_session.close())
-
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             
