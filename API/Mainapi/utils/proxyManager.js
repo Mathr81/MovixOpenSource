@@ -1502,6 +1502,10 @@ async function getKisskhProxyCandidates(options = {}) {
   return candidates;
 }
 
+function isKisskhProxyConfigured() {
+  return KISSKH_PROXY_CONFIGURATION_PRESENT;
+}
+
 function reserveKisskhProxy(proxy, options = {}) {
   const requestedInterval = Math.floor(Number(options.minIntervalMs) || 0);
   const minIntervalMs = Math.max(
@@ -1748,6 +1752,10 @@ const PROXYSCRAPE_ACCOUNT_ID = (
 ).trim();
 const PROXYSCRAPE_ENABLED = Boolean(
   PROXYSCRAPE_API_TOKEN && PROXYSCRAPE_ACCOUNT_ID,
+);
+const KISSKH_PROXY_CONFIGURATION_PRESENT = Boolean(
+  PROXYSCRAPE_API_TOKEN || PROXYSCRAPE_ACCOUNT_ID ||
+  String(process.env.SOCKS5_PROXIES || "").trim(),
 );
 const PROXY_POOL_REDIS_TTL_SECONDS = 60 * 60;
 const PROXYSCRAPE_ACCOUNT_BASE_URL = "https://api.proxyscrape.com";
@@ -2557,6 +2565,7 @@ module.exports = {
   pickProxyscrapeCandidates,
   pickNextSocks5Proxy,
   getKisskhProxyCandidates,
+  isKisskhProxyConfigured,
   reserveKisskhProxy,
   pickNextKisskhProxy,
   pickDedicatedSocks5Proxy,

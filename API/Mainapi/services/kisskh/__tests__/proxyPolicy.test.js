@@ -276,17 +276,39 @@ test('reservation enforces hard candidate and wall-clock bounds', async () => {
   assert.ok(Date.now() - startedAt < 500);
 });
 
+test('direct transport is allowed only when no KissKH proxy source is configured', () => {
+  const { createKisskhProxyPolicy } = require('../proxyPolicy');
+  const directPolicy = createKisskhProxyPolicy({
+    redis: createRedisDouble(),
+    ...selectionDouble([[]]),
+    isProxyConfigured: () => false,
+  });
+  const configuredPolicy = createKisskhProxyPolicy({
+    redis: createRedisDouble(),
+    ...selectionDouble([[]]),
+    isProxyConfigured: () => true,
+  });
+
+  assert.equal(directPolicy.allowsDirectTransport(), true);
+  assert.equal(configuredPolicy.allowsDirectTransport(), false);
+});
+
 test('proxyManager exposes a distinct rotated snapshot and atomic KissKH reservation API', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '../../../utils/proxyManager.js'), 'utf8');
   assert.match(source, /function getKisskhProxyCandidates\(options = \{\}\)/);
   assert.match(source, /function reserveKisskhProxy\(proxy, options = \{\}\)/);
   assert.match(source, /function pickNextKisskhProxy\(options = \{\}\)/);
+  assert.match(source, /function isKisskhProxyConfigured\(\)/);
+  assert.match(source, /const KISSKH_PROXY_CONFIGURATION_PRESENT\s*=/);
+  assert.match(source, /PROXYSCRAPE_API_TOKEN\s*\|\|\s*PROXYSCRAPE_ACCOUNT_ID/);
+  assert.match(source, /process\.env\.SOCKS5_PROXIES/);
   assert.match(source, /poolName:\s*["']KISSKH_METADATA["']/);
   assert.match(source, /minIntervalMs:\s*1000/);
   assert.match(source, /digestIdentity:\s*true/);
   assert.match(source, /getKisskhProxyCandidates,/);
   assert.match(source, /reserveKisskhProxy,/);
   assert.match(source, /pickNextKisskhProxy,/);
+  assert.match(source, /isKisskhProxyConfigured,/);
   const snapshot = source.match(/async function getKisskhProxyCandidates[\s\S]*?\n\}/)?.[0] || '';
   assert.match(snapshot, /reserveProxyWindow/);
   assert.match(snapshot, /new Set\(\)/);

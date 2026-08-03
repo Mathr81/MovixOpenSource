@@ -17,6 +17,7 @@ function fakePolicy(overrides = {}) {
   const calls = { assert: 0, reserve: 0, reserveGlobal: 0, success: [], failure: [], rateLimited: [] };
   return {
     calls,
+    allowsDirectTransport() { return false; },
     async assertCircuitClosed() { calls.assert += 1; },
     async reserve() {
       calls.reserve += 1;
@@ -31,6 +32,49 @@ function fakePolicy(overrides = {}) {
     ...overrides,
   };
 }
+
+test('metadata requests use direct HTTPS only when the proxy policy explicitly allows it', async () => {
+  const calls = [];
+  const policy = fakePolicy({
+    allowsDirectTransport() { return true; },
+    async reserve() {
+      policy.calls.reserve += 1;
+      return null;
+    },
+  });
+  const client = require('../kisskhClient').createKisskhClient(createDeps(async (options) => {
+    calls.push(options);
+    return ok([{ id: 1 }]);
+  }, { proxyPolicy: policy }));
+
+  assert.deepEqual(await client.search('Business Proposal'), [{ id: 1 }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].proxy, undefined);
+  assert.equal(policy.calls.success.length, 0);
+  assert.equal(policy.calls.failure.length, 0);
+  assert.equal(policy.calls.rateLimited.length, 0);
+});
+
+test('metadata requests stay fail-closed when proxies are configured but none can be reserved', async () => {
+  let requestCalls = 0;
+  const policy = fakePolicy({
+    allowsDirectTransport() { return false; },
+    async reserve() {
+      policy.calls.reserve += 1;
+      return null;
+    },
+  });
+  const client = require('../kisskhClient').createKisskhClient(createDeps(async () => {
+    requestCalls += 1;
+    return ok([]);
+  }, { proxyPolicy: policy }));
+
+  await assert.rejects(
+    client.search('Business Proposal'),
+    (error) => error.code === 'provider_unavailable',
+  );
+  assert.equal(requestCalls, 0);
+});
 
 function createDeps(request, overrides = {}) {
   return {
