@@ -1,13 +1,13 @@
 {
-  "version": "2.5.8",
-  "buildNumber": 17,
+  "version": "2.5.10",
+  "buildNumber": 19,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72222238,
-  "apkSha256": "290317f1002f3bfda746626951e221a4de8bb37828461bffb8bfc92e078b3ac2",
+  "apkSizeBytes": 72222642,
+  "apkSha256": "5e3dc71772cd88d08c48668611232fc3c894028166084a9f5e83c44b1814253a",
   "mandatory": false,
-  "releasedAt": "2026-08-03T19:19:40.810Z",
+  "releasedAt": "2026-08-04T21:48:22.530Z",
   "releaseNotes": {
-    "fr": "Correction des proxys Fsvid et Vidzy pour l’extraction fiable des flux vidéo. Ajout du support de la nouvelle source KissKH. Correction du Cast pour prendre en charge les sous-titres.",
-    "en": "Fixed the Fsvid and Vidzy proxy extractors for reliable video streams. Added support for the new KissKH source. Fixed Cast support for subtitles."
+    "fr": "Correction et amélioration de l’extraction Fsvid et Vidzy.",
+    "en": "Fixed and improved Fsvid and Vidzy extraction."
   }
 }

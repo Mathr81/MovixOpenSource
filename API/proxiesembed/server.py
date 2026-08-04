@@ -60,6 +60,7 @@ from seekstreaming_utils import (
     validate_seekstreaming_media_url,
     validate_seekstreaming_resolved_address,
 )
+from fsvid_vidzy_sandbox import execute_player_scripts
 
 # Load local .env from proxiesembed folder
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -3121,14 +3122,13 @@ class ProxyServer:
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
-            if not url or 'fsvid.lol' not in url:
+            if not url or not self._is_fsvid_vidzy_embed_url(url, 'fsvid'):
                 return web.json_response({'error': 'Invalid URL'}, status=400)
             
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.fsvid_cache.get(cache_key)
             if cached:
-                cached_url = cached.get('m3u8Url') if isinstance(cached, dict) else None
-                if cached_url and 'troll' not in str(cached_url).lower():
+                if self._is_fsvid_vidzy_cached_result(cached, 'fsvid'):
                     resp = web.json_response(cached)
                     resp.headers['X-Cache'] = 'HIT'
                     return resp
@@ -3148,7 +3148,7 @@ class ProxyServer:
                 
                 html = await response.text(encoding='utf-8')
 
-                m3u8_url = self._extract_fsvid_vidzy_m3u8_from_html(html, url)
+                m3u8_url = await self._resolve_fsvid_vidzy_m3u8(html, url, 'fsvid')
                 if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 
@@ -3379,6 +3379,97 @@ class ProxyServer:
         except ValueError:
             return None
         return self._extract_m3u8_url(decoded, embed_url)
+
+    @staticmethod
+    def _is_fsvid_vidzy_embed_url(url: str, provider: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme != 'https' or not parsed.hostname:
+                return False
+            if parsed.username or parsed.password or parsed.port not in (None, 443):
+                return False
+            hostname = parsed.hostname.lower().rstrip('.')
+            allowed_suffixes = (
+                ('fsvid.lol',)
+                if provider == 'fsvid'
+                else ('vidzy.org', 'vidzy.cc')
+            )
+            return any(
+                hostname == suffix or hostname.endswith(f'.{suffix}')
+                for suffix in allowed_suffixes
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_fsvid_vidzy_media_candidate(candidate: str, provider: str) -> bool:
+        try:
+            if not candidate or len(candidate) > 16384:
+                return False
+            if '.m3u8' not in candidate.lower() or 'troll' in candidate.lower():
+                return False
+            parsed = urlparse(candidate)
+            if parsed.scheme != 'https' or not parsed.hostname:
+                return False
+            if parsed.username or parsed.password or parsed.port not in (None, 443):
+                return False
+            hostname = parsed.hostname.lower().rstrip('.')
+            allowed_suffixes = ('fsvid.lol',) if provider == 'fsvid' else ('vidzy.cc',)
+            return any(
+                hostname == suffix or hostname.endswith(f'.{suffix}')
+                for suffix in allowed_suffixes
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_fsvid_vidzy_cached_result(cached: object, provider: str) -> bool:
+        if not isinstance(cached, dict):
+            return False
+        cached_url = cached.get('m3u8Url')
+        if not isinstance(cached_url, str):
+            return False
+
+        try:
+            parsed = urlparse(cached_url)
+            if parsed.path.rstrip('/') != f'/{provider}-proxy':
+                return False
+            targets = urllib.parse.parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+            ).get('url', [])
+            if len(targets) != 1:
+                return False
+            return ProxyServer._is_fsvid_vidzy_media_candidate(
+                targets[0],
+                provider,
+            )
+        except (TypeError, ValueError):
+            return False
+
+    async def _resolve_fsvid_vidzy_m3u8(
+        self,
+        html: str,
+        embed_url: str,
+        provider: str,
+    ) -> Optional[str]:
+        direct = self._extract_m3u8_url(html, embed_url)
+        if direct and self._is_fsvid_vidzy_media_candidate(direct, provider):
+            return direct
+
+        sandbox_result = await execute_player_scripts(html, embed_url, provider)
+        for candidate in sandbox_result.candidates:
+            normalized = candidate.replace(r'\/', '/').replace('&amp;', '&').strip()
+            if self._is_fsvid_vidzy_media_candidate(normalized, provider):
+                return normalized
+
+        if sandbox_result.error:
+            logger.info('[%s] JavaScript sandbox: %s', provider, sandbox_result.error)
+
+        fallback = self._extract_fsvid_vidzy_m3u8_from_html(html, embed_url)
+        if fallback and self._is_fsvid_vidzy_media_candidate(fallback, provider):
+            return fallback
+        return None
     
     async def vidzy_extract_handler(self, request: Request) -> Response:
         """VIDZY M3U8 extraction"""
@@ -3386,14 +3477,13 @@ class ProxyServer:
             return self._vip_denied_response()
         try:
             url = request.query.get('url')
-            if not url or 'vidzy' not in url.lower():
+            if not url or not self._is_fsvid_vidzy_embed_url(url, 'vidzy'):
                 return web.json_response({'error': 'Invalid URL'}, status=400)
             
             cache_key = hashlib.md5(url.encode()).hexdigest()
             cached = self.vidzy_cache.get(cache_key)
             if cached:
-                cached_url = cached.get('m3u8Url') if isinstance(cached, dict) else None
-                if cached_url and 'troll' not in str(cached_url).lower():
+                if self._is_fsvid_vidzy_cached_result(cached, 'vidzy'):
                     resp = web.json_response(cached)
                     resp.headers['X-Cache'] = 'HIT'
                     return resp
@@ -3412,7 +3502,7 @@ class ProxyServer:
                     return web.json_response({'error': 'Fetch failed'}, status=500)
                 
                 html = await response.text()
-                m3u8_url = self._extract_fsvid_vidzy_m3u8_from_html(html, url)
+                m3u8_url = await self._resolve_fsvid_vidzy_m3u8(html, url, 'vidzy')
                 if not m3u8_url:
                     return web.json_response({'error': 'M3U8 not found'}, status=404)
                 

@@ -416,6 +416,45 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         return null;
     };
 
+    const reverseBeforeXorPattern =
+        /(?:var\s+)?(?<encoded>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)\s*,\s*(?<bytes>[A-Za-z_$][\w$]*)\s*=\s*\k<encoded>\.split\(\s*["']["']\s*\)\.reverse\(\s*\)\.join\(\s*["']["']\s*\)\s*,\s*(?<output>[A-Za-z_$][\w$]*)\s*=\s*["']["']\s*;[\s\S]{0,256}?for\s*\(\s*var\s+(?<index>[A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\k<index>\s*<\s*\k<bytes>\.length\s*;\s*\k<index>\+\+\s*\)\s*\{[\s\S]{0,256}?(?:var\s+)?(?<key>[A-Za-z_$][\w$]*)\s*=\s*\(\s*(?<keyExpression>[\s\S]{1,128}?)\s*\)\s*&\s*(?<mask>0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,256}?\k<output>\s*\+=\s*String\.fromCharCode\(\s*\k<bytes>\.charCodeAt\(\s*\k<index>\s*\)\s*\^\s*\k<key>\s*\)[\s\S]{0,128}?\}\s*return\s+\k<output>\s*\}\)\s*\(\s*["'](?<payload>[A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    for (const match of String(script || '').matchAll(reverseBeforeXorPattern)) {
+        const groups = match.groups || {};
+        const parameters = parseRollingParameters(groups.keyExpression || '', groups.index || '');
+        const mask = Number(groups.mask);
+        if (
+            !parameters ||
+            !Number.isSafeInteger(parameters.seed) ||
+            parameters.seed < 0 ||
+            parameters.seed > 0xffffffff ||
+            !Number.isSafeInteger(parameters.step) ||
+            parameters.step < 0 ||
+            parameters.step > 0xffffffff ||
+            !Number.isSafeInteger(mask) ||
+            mask < 0 ||
+            mask > 255
+        ) continue;
+        const payload = groups.payload || '';
+        const normalizedPayload = payload.replace(/-/g, '+').replace(/_/g, '/');
+        if (!payload || normalizedPayload.length % 4 === 1) continue;
+        const paddedPayload = normalizedPayload.padEnd(
+            normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+            '=',
+        );
+        try {
+            const reversed = Array.from(atob(paddedPayload)).reverse();
+            const decodedBytes = Uint8Array.from(
+                reversed,
+                (character, index) =>
+                    character.charCodeAt(0) ^
+                    ((parameters.seed + index * parameters.step) & mask),
+            );
+            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
+            const candidate = normalizeCandidate(decoded);
+            if (candidate) return candidate;
+        } catch {}
+    }
+
     for (const match of String(script || '').matchAll(rollingXorPattern)) {
         const parameters = parseRollingParameters(match[4], match[2]);
         const mask = Number(match[5]);
@@ -516,6 +555,77 @@ function extractFsvidVidzyM3u8FromHtml(html, embedUrl) {
 
     const decoded = decodePackedScriptFromHtml(html);
     return decoded ? extractM3u8UrlFromDecodedScript(decoded, embedUrl) : null;
+}
+
+function normalizeFsvidVidzyEmbedUrl(rawUrl, provider) {
+    if (provider !== 'fsvid' && provider !== 'vidzy') return null;
+    try {
+        const parsed = new URL(String(rawUrl || '').trim());
+        if (
+            parsed.protocol !== 'https:' ||
+            parsed.username ||
+            parsed.password ||
+            (parsed.port && parsed.port !== '443') ||
+            !parsed.hostname ||
+            !/\/embed(?:[-/])/i.test(parsed.pathname)
+        ) return null;
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeFsvidVidzyMediaUrl(rawCandidate, embedUrl, provider) {
+    if (!normalizeFsvidVidzyEmbedUrl(embedUrl, provider)) return null;
+    const candidate = String(rawCandidate || '')
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/gi, '&')
+        .trim()
+        .replace(/\\+$/, '');
+    if (
+        !candidate ||
+        candidate.length > 16384 ||
+        !candidate.toLowerCase().includes('.m3u8') ||
+        candidate.toLowerCase().includes('troll')
+    ) return null;
+    try {
+        const parsed = /^https:\/\//i.test(candidate)
+            ? new URL(candidate)
+            : new URL(candidate, embedUrl);
+        if (
+            parsed.protocol !== 'https:' ||
+            parsed.username ||
+            parsed.password ||
+            (parsed.port && parsed.port !== '443') ||
+            !parsed.hostname ||
+            !parsed.pathname.toLowerCase().includes('.m3u8') ||
+            parsed.href.length > 16384
+        ) return null;
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+async function extractFsvidVidzyM3u8(html, embedUrl, provider) {
+    const staticCandidate = normalizeFsvidVidzyMediaUrl(
+        extractFsvidVidzyM3u8FromHtml(html, embedUrl),
+        embedUrl,
+        provider,
+    );
+    if (staticCandidate) return staticCandidate;
+    if (!globalThis.MovixQuickJS?.extractPlayerM3u8) return null;
+    try {
+        const dynamicCandidate = await globalThis.MovixQuickJS.extractPlayerM3u8(
+            html,
+            embedUrl,
+            provider,
+        );
+        return normalizeFsvidVidzyMediaUrl(dynamicCandidate, embedUrl, provider);
+    } catch (error) {
+        console.warn(`[EXT-${provider.toUpperCase()}] QuickJS fallback failed:`, error);
+        return null;
+    }
 }
 
 function extractUqloadMediaUrl(html) {
@@ -730,22 +840,24 @@ async function extractVoe(voeUrl) {
 async function extractFsvid(fsvidUrl) {
     console.log(`[EXT-FSVID] Extracting from: ${fsvidUrl}`);
 
-    if (!fsvidUrl || !fsvidUrl.toLowerCase().includes('fsvid')) {
+    const embedUrl = normalizeFsvidVidzyEmbedUrl(fsvidUrl, 'fsvid');
+    if (!embedUrl) {
         console.warn('[EXT-FSVID] Invalid URL, skipping');
         return { success: false, error: 'Fsvid: Invalid URL' };
     }
 
-    const cacheKey = md5Hash(fsvidUrl);
+    const cacheKey = md5Hash(embedUrl);
     const cached = caches.fsvid.get(cacheKey);
-    if (cached && !String(cached.m3u8Url || '').toLowerCase().includes('troll')) {
+    const cachedMediaUrl = normalizeFsvidVidzyMediaUrl(cached?.m3u8Url, embedUrl, 'fsvid');
+    if (cached && cachedMediaUrl) {
         console.log('[EXT-FSVID] Cache hit');
-        return { ...cached, fromCache: true };
+        return { ...cached, m3u8Url: cachedMediaUrl, fromCache: true };
     }
 
     try {
         // Fsvid requires referer from one of the allowed streaming sites
         // (not from fsvid.lol itself - it returns "Veuillez utiliser une URL valide" otherwise)
-        const FSVID_REFERERS = ['https://fs12.lol/', 'https://french-stream.one/', 'https://fstream.info/'];
+        const FSVID_REFERERS = ['https://fsmirror46.lol/', 'https://fs12.lol/', 'https://french-stream.one/'];
 
         const headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -760,7 +872,7 @@ async function extractFsvid(fsvidUrl) {
 
         let resp;
         try {
-            resp = await fetch(fsvidUrl, { headers, signal: controller.signal });
+            resp = await fetch(embedUrl, { headers, signal: controller.signal });
         } finally {
             clearTimeout(timer);
         }
@@ -773,7 +885,7 @@ async function extractFsvid(fsvidUrl) {
 
         const html = await resp.text();
         console.log(`[EXT-FSVID] HTML length: ${html.length}`);
-        const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, fsvidUrl);
+        const m3u8Url = await extractFsvidVidzyM3u8(html, embedUrl, 'fsvid');
 
         if (!m3u8Url) {
             console.error('[EXT-FSVID] No safe M3U8 URL found in page');
@@ -801,10 +913,14 @@ async function extractFsvid(fsvidUrl) {
 async function extractVidzy(vidzyUrl) {
     console.log(`[EXT-VIDZY] Extracting from: ${vidzyUrl}`);
 
-    const cacheKey = md5Hash(vidzyUrl);
+    const embedUrl = normalizeFsvidVidzyEmbedUrl(vidzyUrl, 'vidzy');
+    if (!embedUrl) return { success: false, error: 'Vidzy: Invalid URL' };
+
+    const cacheKey = md5Hash(embedUrl);
     const cached = caches.vidzy.get(cacheKey);
-    if (cached && !String(cached.m3u8Url || '').toLowerCase().includes('troll')) {
-        return { ...cached, fromCache: true };
+    const cachedMediaUrl = normalizeFsvidVidzyMediaUrl(cached?.m3u8Url, embedUrl, 'vidzy');
+    if (cached && cachedMediaUrl) {
+        return { ...cached, m3u8Url: cachedMediaUrl, fromCache: true };
     }
 
     try {
@@ -817,11 +933,15 @@ async function extractVidzy(vidzyUrl) {
             'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
         };
 
-        const resp = await fetch(vidzyUrl, { headers, signal: controller.signal });
-        clearTimeout(timer);
+        let resp;
+        try {
+            resp = await fetch(embedUrl, { headers, signal: controller.signal });
+        } finally {
+            clearTimeout(timer);
+        }
         if (!resp.ok) return { success: false, error: `Vidzy: HTTP ${resp.status}` };
         const html = await resp.text();
-        const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, vidzyUrl);
+        const m3u8Url = await extractFsvidVidzyM3u8(html, embedUrl, 'vidzy');
 
         if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in page' };
 
@@ -1385,7 +1505,7 @@ async function extractAll(sources) {
  */
 async function setupHeadersForService(type, url, referer) {
     // Fsvid needs different referers:
-    // - Embed page (fsvid.lol/embed-xxx) → fs12.lol (required by fsvid to serve content)
+    // - Embed page (fsvid.lol/embed-xxx) → fsmirror46.lol (required by fsvid to serve content)
     // - CDN/M3U8 (s1.fsvid.lol, s2.fsvid.lol, etc.) → fsvid.lol (required by CDN)
     let fsvidHeaders;
     let uqloadHeaders;
@@ -1393,9 +1513,9 @@ async function setupHeadersForService(type, url, referer) {
         try {
             const hostname = new URL(url).hostname;
             // CDN subdomains (s1.fsvid.lol, s2.fsvid.lol, etc.) need fsvid.lol referer
-            // Embed pages (fsvid.lol) need fs12.lol referer
+            // Embed pages (fsvid.lol) need the current mirror referer
             if (hostname === 'fsvid.lol') {
-                fsvidHeaders = { 'Referer': 'https://fs12.lol/', 'Origin': 'https://fs12.lol' };
+                fsvidHeaders = { 'Referer': 'https://fsmirror46.lol/', 'Origin': 'https://fsmirror46.lol' };
             } else {
                 fsvidHeaders = { 'Referer': 'https://fsvid.lol/', 'Origin': 'https://fsvid.lol' };
             }

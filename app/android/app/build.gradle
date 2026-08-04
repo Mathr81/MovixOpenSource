@@ -21,8 +21,8 @@ android {
         applicationId "com.movix.app"
         minSdk rootProject.ext.minSdkVersion
         targetSdk rootProject.ext.targetSdkVersion
-        versionCode 17
-        versionName "2.5.8"
+        versionCode 19
+        versionName "2.5.10"
 
         buildConfigField "int", "VERSION_CODE_INT", "${versionCode}"
         buildConfigField "String", "VERSION_NAME_STR", "\"${versionName}\""

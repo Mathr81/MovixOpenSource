@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Movix Proxy Extension (Tampermonkey)
 // @namespace    https://movix.cash
-// @version      1.4.12
+// @version      1.4.14
 // @description  Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus - version userscript Tampermonkey
 // @author       Movix
 // @updateURL    https://github.com/movixcorp/MovixOpenSource/raw/refs/heads/main/userscript/movix.user.js
@@ -419,7 +419,7 @@
 
   const USERSCRIPT_MANIFEST = {
     name: "Movix Proxy Extension",
-      version: "1.4.12",
+      version: "1.4.14",
     description:
       "Extension proxy pour Live TV Movix - Contourne CORS, injecte les headers et extrait les sources Nexus",
   };
@@ -1962,6 +1962,51 @@
       return null;
     };
 
+    const reverseBeforeXorPattern =
+      /(?:var\s+)?(?<encoded>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)\s*,\s*(?<bytes>[A-Za-z_$][\w$]*)\s*=\s*\k<encoded>\.split\(\s*["']["']\s*\)\.reverse\(\s*\)\.join\(\s*["']["']\s*\)\s*,\s*(?<output>[A-Za-z_$][\w$]*)\s*=\s*["']["']\s*;[\s\S]{0,256}?for\s*\(\s*var\s+(?<index>[A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\k<index>\s*<\s*\k<bytes>\.length\s*;\s*\k<index>\+\+\s*\)\s*\{[\s\S]{0,256}?(?:var\s+)?(?<key>[A-Za-z_$][\w$]*)\s*=\s*\(\s*(?<keyExpression>[\s\S]{1,128}?)\s*\)\s*&\s*(?<mask>0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,256}?\k<output>\s*\+=\s*String\.fromCharCode\(\s*\k<bytes>\.charCodeAt\(\s*\k<index>\s*\)\s*\^\s*\k<key>\s*\)[\s\S]{0,128}?\}\s*return\s+\k<output>\s*\}\)\s*\(\s*["'](?<payload>[A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+    for (const match of String(script || "").matchAll(reverseBeforeXorPattern)) {
+      const groups = match.groups || {};
+      const parameters = parseRollingParameters(
+        groups.keyExpression || "",
+        groups.index || "",
+      );
+      const mask = Number(groups.mask);
+      if (
+        !parameters ||
+        !Number.isSafeInteger(parameters.seed) ||
+        parameters.seed < 0 ||
+        parameters.seed > 0xffffffff ||
+        !Number.isSafeInteger(parameters.step) ||
+        parameters.step < 0 ||
+        parameters.step > 0xffffffff ||
+        !Number.isSafeInteger(mask) ||
+        mask < 0 ||
+        mask > 255
+      )
+        continue;
+      const payload = groups.payload || "";
+      const normalizedPayload = payload.replace(/-/g, "+").replace(/_/g, "/");
+      if (!payload || normalizedPayload.length % 4 === 1) continue;
+      const paddedPayload = normalizedPayload.padEnd(
+        normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+        "=",
+      );
+      try {
+        const reversed = Array.from(atob(paddedPayload)).reverse();
+        const decodedBytes = Uint8Array.from(
+          reversed,
+          (character, index) =>
+            character.charCodeAt(0) ^
+            ((parameters.seed + index * parameters.step) & mask),
+        );
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
+          decodedBytes,
+        );
+        const candidate = normalizeCandidate(decoded);
+        if (candidate) return candidate;
+      } catch {}
+    }
+
     for (const match of String(script || "").matchAll(rollingXorPattern)) {
       const parameters = parseRollingParameters(match[4], match[2]);
       const mask = Number(match[5]);
@@ -2071,6 +2116,447 @@
     return decoded
       ? extractM3u8UrlFromDecodedScript(decoded, embedUrl)
       : null;
+  }
+
+  const FSVID_VIDZY_QUICKJS_CDN_URL =
+    "https://cdn.jsdelivr.net/npm/quickjs-emscripten@0.32.0/dist/index.global.js";
+  const FSVID_VIDZY_QUICKJS_CDN_SHA256 =
+    "5da6906cbf09eef0b150d2759bf371f496e4ba6b57f55d775666feef58da8d20";
+  const FSVID_VIDZY_QUICKJS_MAX_CDN_BYTES = 3 * 1024 * 1024;
+  const FSVID_VIDZY_QUICKJS_MAX_HTML_LENGTH = 512 * 1024;
+  const FSVID_VIDZY_QUICKJS_MAX_SCRIPT_LENGTH = 128 * 1024;
+  const FSVID_VIDZY_QUICKJS_MAX_TOTAL_SCRIPT_LENGTH = 256 * 1024;
+  const FSVID_VIDZY_QUICKJS_MAX_SCRIPT_COUNT = 16;
+  const FSVID_VIDZY_QUICKJS_MEMORY_LIMIT = 16 * 1024 * 1024;
+  const FSVID_VIDZY_QUICKJS_STACK_LIMIT = 512 * 1024;
+  const FSVID_VIDZY_QUICKJS_TIMEOUT_MS = 1500;
+  const FSVID_VIDZY_MAX_MEDIA_URL_LENGTH = 16 * 1024;
+  const FSVID_VIDZY_PLAYER_SIGNALS = [
+    "videojs",
+    "jwplayer",
+    "sources",
+    "atob(",
+    "eval(function",
+    "eval ( function",
+    ".m3u8",
+  ];
+  let fsvidVidzyQuickJsPromise = null;
+
+  function fsvidVidzyBytesToHex(bytes) {
+    return Array.from(bytes, (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+
+  function normalizeFsvidVidzyEmbedUrl(rawUrl, provider) {
+    if (provider !== "fsvid" && provider !== "vidzy") return null;
+    try {
+      const parsed = new URL(String(rawUrl || "").trim());
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        !parsed.hostname ||
+        !/\/embed(?:[-/])/i.test(parsed.pathname)
+      ) {
+        return null;
+      }
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  function normalizeFsvidVidzyMediaUrl(rawCandidate, embedUrl, provider) {
+    const safeEmbedUrl = normalizeFsvidVidzyEmbedUrl(embedUrl, provider);
+    if (!safeEmbedUrl) return null;
+
+    const candidate = String(rawCandidate || "")
+      .replace(/\\\//g, "/")
+      .replace(/&amp;/gi, "&")
+      .trim()
+      .replace(/\\+$/, "");
+    if (
+      !candidate ||
+      candidate.length > FSVID_VIDZY_MAX_MEDIA_URL_LENGTH ||
+      !candidate.toLowerCase().includes(".m3u8") ||
+      candidate.toLowerCase().includes("troll")
+    ) {
+      return null;
+    }
+
+    try {
+      const parsed = /^https:\/\//i.test(candidate)
+        ? new URL(candidate)
+        : new URL(candidate, safeEmbedUrl);
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.username ||
+        parsed.password ||
+        (parsed.port && parsed.port !== "443") ||
+        !parsed.hostname ||
+        !parsed.pathname.toLowerCase().includes(".m3u8") ||
+        parsed.href.length > FSVID_VIDZY_MAX_MEDIA_URL_LENGTH
+      ) {
+        return null;
+      }
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  function requestFsvidVidzyQuickJsSource() {
+    return new Promise((resolve, reject) => {
+      let request;
+      try {
+        request = getGMRequest()({
+          method: "GET",
+          url: FSVID_VIDZY_QUICKJS_CDN_URL,
+          timeout: 15000,
+          anonymous: true,
+          responseType: "text",
+          onprogress: (event) => {
+            if (
+              Number(event?.loaded || 0) > FSVID_VIDZY_QUICKJS_MAX_CDN_BYTES
+            ) {
+              request?.abort?.();
+              reject(new Error("quickjs_cdn_too_large"));
+            }
+          },
+          onload: (response) => {
+            const status = Number(response?.status || 0);
+            if (status < 200 || status >= 300) {
+              reject(new Error(`quickjs_cdn_http_${status}`));
+              return;
+            }
+
+            try {
+              const expectedUrl = new URL(FSVID_VIDZY_QUICKJS_CDN_URL).href;
+              const finalUrl = new URL(
+                response?.finalUrl || FSVID_VIDZY_QUICKJS_CDN_URL,
+              ).href;
+              if (finalUrl !== expectedUrl) {
+                reject(new Error("quickjs_cdn_redirect_rejected"));
+                return;
+              }
+            } catch {
+              reject(new Error("quickjs_cdn_invalid_final_url"));
+              return;
+            }
+
+            const source = String(
+              response?.responseText ?? response?.response ?? "",
+            );
+            const bytes = new TextEncoder().encode(source);
+            if (
+              !bytes.byteLength ||
+              bytes.byteLength > FSVID_VIDZY_QUICKJS_MAX_CDN_BYTES
+            ) {
+              reject(new Error("quickjs_cdn_invalid_size"));
+              return;
+            }
+            resolve({ source, bytes });
+          },
+          onerror: () => reject(new Error("quickjs_cdn_network_error")),
+          ontimeout: () => reject(new Error("quickjs_cdn_timeout")),
+          onabort: () => reject(new Error("quickjs_cdn_aborted")),
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function loadFsvidVidzyQuickJsFromCdn() {
+    if (!fsvidVidzyQuickJsPromise) {
+      fsvidVidzyQuickJsPromise = (async () => {
+        const { source, bytes } = await requestFsvidVidzyQuickJsSource();
+        const webCrypto = globalThis.crypto || pageWindow.crypto;
+        if (!webCrypto?.subtle) throw new Error("quickjs_crypto_unavailable");
+        const digest = await webCrypto.subtle.digest("SHA-256", bytes);
+        if (
+          fsvidVidzyBytesToHex(new Uint8Array(digest)) !==
+          FSVID_VIDZY_QUICKJS_CDN_SHA256
+        ) {
+          throw new Error("quickjs_cdn_hash_mismatch");
+        }
+
+        // The only dynamically evaluated code is this immutable, hash-pinned
+        // QuickJS loader. Player scripts are evaluated later inside QuickJS.
+        const quickJsApi = eval(`${source}\n;typeof QJS !== "undefined" ? QJS : null`);
+        if (
+          !quickJsApi ||
+          typeof quickJsApi.getQuickJS !== "function" ||
+          typeof quickJsApi.shouldInterruptAfterDeadline !== "function"
+        ) {
+          throw new Error("quickjs_cdn_invalid_api");
+        }
+        return quickJsApi;
+      })().catch((error) => {
+        fsvidVidzyQuickJsPromise = null;
+        throw error;
+      });
+    }
+    return fsvidVidzyQuickJsPromise;
+  }
+
+  function selectFsvidVidzyPlayerScripts(html) {
+    if (
+      typeof html !== "string" ||
+      html.length > FSVID_VIDZY_QUICKJS_MAX_HTML_LENGTH
+    ) {
+      return [];
+    }
+
+    const scripts = [];
+    let totalLength = 0;
+    const pattern = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+    for (const match of html.matchAll(pattern)) {
+      const attributes = match[1] || "";
+      const source = (match[2] || "").trim();
+      if (
+        !source ||
+        source.length > FSVID_VIDZY_QUICKJS_MAX_SCRIPT_LENGTH ||
+        /\bsrc\s*=/i.test(attributes) ||
+        /\btype\s*=\s*["'](?:application\/json|application\/ld\+json|module)["']/i.test(
+          attributes,
+        )
+      ) {
+        continue;
+      }
+      const lowered = source.toLowerCase();
+      if (!FSVID_VIDZY_PLAYER_SIGNALS.some((signal) => lowered.includes(signal))) {
+        continue;
+      }
+      if (scripts.length >= FSVID_VIDZY_QUICKJS_MAX_SCRIPT_COUNT) break;
+      if (
+        totalLength + source.length >
+        FSVID_VIDZY_QUICKJS_MAX_TOTAL_SCRIPT_LENGTH
+      ) {
+        break;
+      }
+      scripts.push(source);
+      totalLength += source.length;
+    }
+    return scripts;
+  }
+
+  function createFsvidVidzyQuickJsBootstrap(embedUrl) {
+    const safeEmbedUrl = JSON.stringify(embedUrl);
+    const safeEmbedOrigin = JSON.stringify(new URL(embedUrl).origin);
+    return `
+      "use strict";
+      var __movixCandidates = [];
+      var __movixMaxCandidates = 64;
+      var __movixMaxString = ${FSVID_VIDZY_MAX_MEDIA_URL_LENGTH};
+      var __movixSeen = new WeakSet();
+      function __movixCapture(value, depth) {
+        depth = depth || 0;
+        if (depth > 6 || value == null || __movixCandidates.length >= __movixMaxCandidates) return;
+        if (typeof value === "string") {
+          if (value.length <= __movixMaxString && value.toLowerCase().indexOf(".m3u8") !== -1) {
+            __movixCandidates.push(value);
+          }
+          return;
+        }
+        if ((typeof value !== "object" && typeof value !== "function") || __movixSeen.has(value)) return;
+        __movixSeen.add(value);
+        var keys;
+        try { keys = Object.keys(value); } catch (_) { return; }
+        for (var j = 0; j < keys.length && j < 64; j++) {
+          try { __movixCapture(value[keys[j]], depth + 1); } catch (_) {}
+        }
+      }
+      function atob(input) {
+        var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var value = String(input).replace(/[\\t\\n\\f\\r ]/g, "").replace(/-/g, "+").replace(/_/g, "/");
+        if (value.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(value)) throw new TypeError("Invalid base64");
+        value = value.replace(/=+$/, "");
+        var output = "", buffer = 0, bits = 0;
+        for (var i = 0; i < value.length; i++) {
+          var index = chars.indexOf(value.charAt(i));
+          if (index < 0) throw new TypeError("Invalid base64");
+          buffer = (buffer << 6) | index;
+          bits += 6;
+          if (bits >= 8) {
+            bits -= 8;
+            output += String.fromCharCode((buffer >> bits) & 255);
+          }
+        }
+        return output;
+      }
+      function btoa(input) {
+        var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var value = String(input), output = "";
+        for (var i = 0; i < value.length; i += 3) {
+          var a = value.charCodeAt(i), b = value.charCodeAt(i + 1), c = value.charCodeAt(i + 2);
+          if (a > 255 || b > 255 || c > 255) throw new TypeError("Invalid character");
+          output += chars.charAt(a >> 2);
+          output += chars.charAt(((a & 3) << 4) | (isNaN(b) ? 0 : b >> 4));
+          output += isNaN(b) ? "=" : chars.charAt(((b & 15) << 2) | (isNaN(c) ? 0 : c >> 6));
+          output += isNaN(c) ? "=" : chars.charAt(c & 63);
+        }
+        return output;
+      }
+      var __movixChainTarget = function () {};
+      var __movixChain = new Proxy(__movixChainTarget, {
+        apply: function (_target, _thisArg, args) {
+          for (var i = 0; i < args.length; i++) __movixCapture(args[i], 0);
+          return __movixChain;
+        },
+        construct: function (_target, args) {
+          for (var i = 0; i < args.length; i++) __movixCapture(args[i], 0);
+          return __movixChain;
+        },
+        get: function (_target, property) {
+          if (property === "then") return undefined;
+          if (property === Symbol.toPrimitive) return function () { return ""; };
+          return __movixChain;
+        },
+        set: function () { return true; }
+      });
+      function __movixPlayerFactory() {
+        for (var i = 0; i < arguments.length; i++) __movixCapture(arguments[i], 0);
+        return __movixChain;
+      }
+      __movixPlayerFactory.addLanguage = __movixPlayerFactory;
+      __movixPlayerFactory.getPlayers = function () { return {}; };
+      var __movixLooseObject = new Proxy(function () {}, {
+        apply: function () { return __movixLooseObject; },
+        construct: function () { return __movixLooseObject; },
+        get: function (_target, property) {
+          if (property === "then") return undefined;
+          if (property === Symbol.toPrimitive) return function () { return ""; };
+          return __movixLooseObject;
+        },
+        set: function () { return true; }
+      });
+      var console = { log: function(){}, info: function(){}, warn: function(){}, error: function(){}, debug: function(){} };
+      var location = { href: ${safeEmbedUrl}, origin: ${safeEmbedOrigin}, protocol: "https:" };
+      var navigator = { userAgent: "Mozilla/5.0 Chrome/140.0.0.0", language: "fr-FR" };
+      var document = __movixLooseObject;
+      var videojs = __movixPlayerFactory;
+      var player = __movixPlayerFactory;
+      var jwplayer = __movixPlayerFactory;
+      var fluidPlayer = __movixPlayerFactory;
+      var Playerjs = __movixPlayerFactory;
+      var Clappr = { Player: __movixPlayerFactory };
+      function setTimeout(callback) { if (typeof callback === "function") callback(); return 1; }
+      function clearTimeout() {}
+      function setInterval() { return 0; }
+      function clearInterval() {}
+      function requestAnimationFrame() { return 0; }
+      function cancelAnimationFrame() {}
+      function addEventListener() {}
+      var fetch = undefined;
+      var XMLHttpRequest = undefined;
+      var WebSocket = undefined;
+      var EventSource = undefined;
+      var Worker = undefined;
+      var SharedWorker = undefined;
+      var window = globalThis;
+      var self = globalThis;
+    `;
+  }
+
+  function disposeFsvidVidzyQuickJsResult(result) {
+    try {
+      if (result?.error) result.error.dispose();
+      else result?.value?.dispose();
+    } catch {}
+  }
+
+  async function extractFsvidVidzyWithQuickJs(html, embedUrl, provider) {
+    const safeEmbedUrl = normalizeFsvidVidzyEmbedUrl(embedUrl, provider);
+    if (!safeEmbedUrl) return null;
+    const scripts = selectFsvidVidzyPlayerScripts(html);
+    if (!scripts.length) return null;
+
+    let quickJsApi;
+    let QuickJS;
+    try {
+      quickJsApi = await loadFsvidVidzyQuickJsFromCdn();
+      QuickJS = await quickJsApi.getQuickJS();
+    } catch (error) {
+      console.warn("[EXT-FSVID-VIDZY] QuickJS CDN unavailable:", error?.message);
+      return null;
+    }
+
+    const runtime = QuickJS.newRuntime();
+    runtime.setMemoryLimit(FSVID_VIDZY_QUICKJS_MEMORY_LIMIT);
+    runtime.setMaxStackSize(FSVID_VIDZY_QUICKJS_STACK_LIMIT);
+    const deadline = Date.now() + FSVID_VIDZY_QUICKJS_TIMEOUT_MS;
+    runtime.setInterruptHandler(
+      quickJsApi.shouldInterruptAfterDeadline(deadline),
+    );
+    const context = runtime.newContext();
+
+    try {
+      const bootstrapResult = context.evalCode(
+        createFsvidVidzyQuickJsBootstrap(safeEmbedUrl),
+        "movix-bootstrap.js",
+      );
+      if (bootstrapResult.error) {
+        disposeFsvidVidzyQuickJsResult(bootstrapResult);
+        return null;
+      }
+      disposeFsvidVidzyQuickJsResult(bootstrapResult);
+
+      for (let index = 0; index < scripts.length; index++) {
+        const result = context.evalCode(
+          scripts[index],
+          `player-script-${index + 1}.js`,
+        );
+        disposeFsvidVidzyQuickJsResult(result);
+        if (Date.now() > deadline) break;
+      }
+
+      const captureResult = context.evalCode(
+        `(function () {
+          var names = ["sources", "source", "file", "hls", "hlsUrl", "m3u8", "config", "playerConfig"];
+          for (var i = 0; i < names.length; i++) {
+            try { __movixCapture(globalThis[names[i]], 0); } catch (_) {}
+          }
+          return JSON.stringify(__movixCandidates);
+        })()`,
+        "movix-result.js",
+      );
+      if (captureResult.error) {
+        disposeFsvidVidzyQuickJsResult(captureResult);
+        return null;
+      }
+      const dumped = context.dump(captureResult.value);
+      disposeFsvidVidzyQuickJsResult(captureResult);
+      const candidates = JSON.parse(String(dumped || "[]"));
+      for (const candidate of candidates) {
+        const normalized = normalizeFsvidVidzyMediaUrl(
+          candidate,
+          safeEmbedUrl,
+          provider,
+        );
+        if (normalized) return normalized;
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      context.dispose();
+      runtime.dispose();
+    }
+  }
+
+  async function extractFsvidVidzyM3u8(html, embedUrl, provider) {
+    const safeEmbedUrl = normalizeFsvidVidzyEmbedUrl(embedUrl, provider);
+    if (!safeEmbedUrl) return null;
+    const staticCandidate = normalizeFsvidVidzyMediaUrl(
+      extractFsvidVidzyM3u8FromHtml(html, safeEmbedUrl),
+      safeEmbedUrl,
+      provider,
+    );
+    if (staticCandidate) return staticCandidate;
+    return extractFsvidVidzyWithQuickJs(html, safeEmbedUrl, provider);
   }
 
   function extractUqloadMediaUrl(html) {
@@ -2320,19 +2806,15 @@
   async function extractFsvid(fsvidUrl) {
     console.log(`[EXT-FSVID] Extracting from: ${fsvidUrl}`);
 
-    if (!fsvidUrl || !fsvidUrl.toLowerCase().includes("fsvid")) {
+    const safeFsvidUrl = normalizeFsvidVidzyEmbedUrl(fsvidUrl, "fsvid");
+    if (!safeFsvidUrl) {
       console.warn("[EXT-FSVID] Invalid URL, skipping");
       return { success: false, error: "Fsvid: Invalid URL" };
     }
 
-    const cacheKey = md5Hash(fsvidUrl);
+    const cacheKey = md5Hash(safeFsvidUrl);
     const cached = caches.fsvid.get(cacheKey);
-    if (
-      cached &&
-      !String(cached.m3u8Url || "")
-        .toLowerCase()
-        .includes("troll")
-    ) {
+    if (cached && normalizeFsvidVidzyMediaUrl(cached.m3u8Url, safeFsvidUrl, "fsvid")) {
       console.log("[EXT-FSVID] Cache hit");
       return { ...cached, fromCache: true };
     }
@@ -2341,7 +2823,7 @@
       // Fsvid requires referer from one of the allowed streaming sites
       // (not from fsvid.lol itself - it returns "Veuillez utiliser une URL valide" otherwise)
       const FSVID_REFERERS = [
-        "https://fs13.lol/",
+        "https://fsmirror46.lol/",
         "https://french-stream.one/",
         "https://fstream.info/",
       ];
@@ -2361,7 +2843,10 @@
 
       let resp;
       try {
-        resp = await fetch(fsvidUrl, { headers, signal: controller.signal });
+        resp = await fetch(safeFsvidUrl, {
+          headers,
+          signal: controller.signal,
+        });
       } finally {
         clearTimeout(timer);
       }
@@ -2374,7 +2859,11 @@
 
       const html = await resp.text();
       console.log(`[EXT-FSVID] HTML length: ${html.length}`);
-      const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, fsvidUrl);
+      const m3u8Url = await extractFsvidVidzyM3u8(
+        html,
+        safeFsvidUrl,
+        "fsvid",
+      );
 
       if (!m3u8Url) {
         console.error("[EXT-FSVID] No safe M3U8 URL found in page");
@@ -2401,14 +2890,14 @@
   async function extractVidzy(vidzyUrl) {
     console.log(`[EXT-VIDZY] Extracting from: ${vidzyUrl}`);
 
-    const cacheKey = md5Hash(vidzyUrl);
+    const safeVidzyUrl = normalizeFsvidVidzyEmbedUrl(vidzyUrl, "vidzy");
+    if (!safeVidzyUrl) {
+      return { success: false, error: "Vidzy: Invalid URL" };
+    }
+
+    const cacheKey = md5Hash(safeVidzyUrl);
     const cached = caches.vidzy.get(cacheKey);
-    if (
-      cached &&
-      !String(cached.m3u8Url || "")
-        .toLowerCase()
-        .includes("troll")
-    ) {
+    if (cached && normalizeFsvidVidzyMediaUrl(cached.m3u8Url, safeVidzyUrl, "vidzy")) {
       return { ...cached, fromCache: true };
     }
 
@@ -2422,15 +2911,23 @@
         "user-agent": "Mozilla/5.0 Chrome/140.0.0.0",
       };
 
-      const resp = await fetch(vidzyUrl, {
-        headers,
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
+      let resp;
+      try {
+        resp = await fetch(safeVidzyUrl, {
+          headers,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
       if (!resp.ok)
         return { success: false, error: `Vidzy: HTTP ${resp.status}` };
       const html = await resp.text();
-      const m3u8Url = extractFsvidVidzyM3u8FromHtml(html, vidzyUrl);
+      const m3u8Url = await extractFsvidVidzyM3u8(
+        html,
+        safeVidzyUrl,
+        "vidzy",
+      );
 
       if (!m3u8Url)
         return { success: false, error: "Vidzy: M3U8 not found in page" };
