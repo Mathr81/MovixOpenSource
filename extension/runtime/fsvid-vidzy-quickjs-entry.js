@@ -170,8 +170,15 @@ async function getQuickJsModule() {
 }
 
 export function createBootstrap(embedUrl) {
+  const urlObj = new URL(embedUrl);
   const safeEmbedUrl = JSON.stringify(embedUrl);
-  const safeEmbedOrigin = JSON.stringify(new URL(embedUrl).origin);
+  const safeEmbedOrigin = JSON.stringify(urlObj.origin);
+  const safeEmbedHostname = JSON.stringify(urlObj.hostname);
+  const safeEmbedHost = JSON.stringify(urlObj.host);
+  const safeEmbedPathname = JSON.stringify(urlObj.pathname || '');
+  const safeEmbedSearch = JSON.stringify(urlObj.search || '');
+  const safeEmbedHash = JSON.stringify(urlObj.hash || '');
+  const safeEmbedPort = JSON.stringify(urlObj.port || '');
   return `
     'use strict';
     var __movixCandidates = [];
@@ -238,7 +245,7 @@ export function createBootstrap(embedUrl) {
         return __movixChain;
       },
       construct: function (_target, args) {
-        for (var i = 0; i < args.length; i++) __movixCapture(args[i], 0);
+        for (var i = 0; i < args.length; i++) __movixCapture(arguments[i], 0);
         return __movixChain;
       },
       get: function (_target, property) {
@@ -258,6 +265,10 @@ export function createBootstrap(embedUrl) {
       apply: function () { return __movixLooseObject; },
       construct: function () { return __movixLooseObject; },
       get: function (_target, property) {
+        if (property === 'canPlayType') return function (type) { return type && (type.indexOf('hls') !== -1 || type.indexOf('mpegURL') !== -1 || type.indexOf('mp4') !== -1) ? 'probably' : 'maybe'; };
+        if (property === 'getAttribute') return function (attr) { return attr === 'src' ? '' : 'true'; };
+        if (property === 'hasAttribute') return function () { return true; };
+        if (property === 'referrer') return ${safeEmbedOrigin};
         if (property === 'then') return undefined;
         if (property === Symbol.toPrimitive) return function () { return ''; };
         return __movixLooseObject;
@@ -265,7 +276,18 @@ export function createBootstrap(embedUrl) {
       set: function () { return true; }
     });
     var console = { log: function(){}, info: function(){}, warn: function(){}, error: function(){}, debug: function(){} };
-    var location = { href: ${safeEmbedUrl}, origin: ${safeEmbedOrigin}, protocol: 'https:' };
+    var location = {
+      href: ${safeEmbedUrl},
+      origin: ${safeEmbedOrigin},
+      hostname: ${safeEmbedHostname},
+      host: ${safeEmbedHost},
+      pathname: ${safeEmbedPathname},
+      search: ${safeEmbedSearch},
+      hash: ${safeEmbedHash},
+      port: ${safeEmbedPort},
+      ancestorOrigins: [${safeEmbedOrigin}],
+      protocol: 'https:'
+    };
     var navigator = { userAgent: 'Mozilla/5.0 Chrome/140.0.0.0', language: 'fr-FR' };
     var document = __movixLooseObject;
     var videojs = __movixPlayerFactory;

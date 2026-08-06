@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Python Proxy Server - Ultra High Performance Version
 Optimized for massive concurrent connections and high-load streaming
@@ -3246,59 +3246,68 @@ class ProxyServer:
         # Capture the page's variable names and parameters instead of evaluating
         # remote JavaScript or hard-coding today's seed/step values.
         rolling_xor_pattern = re.compile(
-            r'(?:var\s+)?(?P<bytes>[A-Za-z_$][\w$]*)\s*=\s*atob\('
-            r'\s*[A-Za-z_$][\w$]*\s*\)'
+            r'(?:var\s+)?(?P<raw_bytes>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)'
+            r'(?:\s*,\s*(?P<bytes>[A-Za-z_$][\w$]*)\s*=\s*(?P=raw_bytes)\.split\(\s*["\']["\']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["\']["\']\s*\))?'
             r'.{0,512}?for\s*\(\s*var\s+(?P<index>[A-Za-z_$][\w$]*)'
-            r'\s*=\s*0\s*;\s*(?P=index)\s*<\s*(?P=bytes)\.length\s*;'
+            r'\s*=\s*0\s*;\s*(?P=index)\s*<\s*(?:[A-Za-z_$][\w$]*)\.length\s*;'
             r'\s*(?P=index)\+\+\s*\)\s*\{'
             r'.{0,512}?(?:var\s+)?(?P<key>[A-Za-z_$][\w$]*)\s*=\s*\('
             r'\s*(?P<key_expr>.{1,128}?)\s*\)\s*&\s*'
             r'(?P<mask>0[xX][0-9a-fA-F]+|\d+)\s*;'
             r'.{0,512}?(?P<output>[A-Za-z_$][\w$]*)\s*\+=\s*'
-            r'String\.fromCharCode\(\s*(?P=bytes)\.charCodeAt\('
-            r'\s*(?P=index)\s*\)\s*\^\s*(?P=key)\s*\)'
-            r'.{0,256}?\}\s*return\s+(?P=output)'
-            r'(?P<reverse>\s*\.split\(\s*["\']["\']\s*\)\s*'
-            r'\.reverse\(\s*\)\s*\.join\(\s*["\']["\']\s*\))?'
-            r'\s*\}\)\s*\(\s*["\']'
+            r'String\.fromCharCode\(\s*(?:[A-Za-z_$][\w$]*)\.charCodeAt\(\s*(?P=index)\s*\)\s*\^\s*(?P=key)\s*\)'
+            r'.{0,256}?\}\s*return\b'
+            r'.{1,512}?\)\s*\(\s*["\']'
             r'(?P<payload>[A-Za-z0-9+/_=-]{1,32768})["\']\s*\)',
             re.DOTALL,
         )
-        numeric_literal = r'(?:0[xX][0-9a-fA-F]+|\d+)'
 
-        def parse_rolling_parameters(expression: str, index_name: str) -> Optional[Tuple[int, int]]:
-            normalized = re.sub(r'[\s()]', '', expression)
-            index_token = re.escape(index_name)
-            layouts = [
-                (rf'^({numeric_literal})\+{index_token}\*({numeric_literal})$', 1, 2),
-                (rf'^({numeric_literal})\+({numeric_literal})\*{index_token}$', 1, 2),
-                (rf'^{index_token}\*({numeric_literal})\+({numeric_literal})$', 2, 1),
-                (rf'^({numeric_literal})\*{index_token}\+({numeric_literal})$', 2, 1),
-            ]
-            for pattern, seed_group, step_group in layouts:
-                match = re.fullmatch(pattern, normalized)
-                if match:
-                    return int(match.group(seed_group), 0), int(match.group(step_group), 0)
+        def parse_rolling_expression(expression: str, index_name: str, mask: int) -> Optional[Tuple[int, int]]:
+            expr = expression.strip().replace(' ', '')
+            if not expr.startswith(('+', '-')):
+                expr = '+' + expr
+            terms = re.findall(r'[-+][^+-]+', expr)
+            seed = 0
+            step = 0
+            
+            hostname_sum = 0
+            if re.search(r'location(?:\.hostname|\[[\'"]hostname[\'"]\])?', script) or 'charCodeAt' in script:
+                try:
+                    parsed = urlparse(embed_url)
+                    hostname = parsed.hostname or ''
+                    hostname_sum = sum(ord(c) for c in hostname) & mask
+                except Exception:
+                    hostname_sum = 0
 
-            for pattern in [
-                rf'^({numeric_literal})\+{index_token}$',
-                rf'^{index_token}\+({numeric_literal})$',
-            ]:
-                match = re.fullmatch(pattern, normalized)
-                if match:
-                    return int(match.group(1), 0), 1
-            return None
+            index_pattern = re.escape(index_name)
+            for term in terms:
+                sign = -1 if term.startswith('-') else 1
+                t = term[1:].strip('()')
+                if re.search(r'\b' + index_pattern + r'\b', t):
+                    parts = t.split('*')
+                    if len(parts) == 1:
+                        step += sign * 1
+                    elif len(parts) == 2:
+                        num_part = parts[0] if parts[1] == index_name else parts[1]
+                        step += sign * int(num_part, 0)
+                elif re.match(r'^(?:0[xX][0-9a-fA-F]+|\d+)$', t):
+                    seed += sign * int(t, 0)
+                elif re.match(r'^[A-Za-z_$][\w$]*$', t):
+                    seed += sign * hostname_sum
+
+            return seed, step
 
         for match in rolling_xor_pattern.finditer(script):
             try:
-                parameters = parse_rolling_parameters(
+                mask = int(match.group('mask'), 0)
+                parameters = parse_rolling_expression(
                     match.group('key_expr'),
                     match.group('index'),
+                    mask,
                 )
                 if parameters is None:
                     continue
                 seed, step = parameters
-                mask = int(match.group('mask'), 0)
                 if not (
                     0 <= seed <= 0xFFFFFFFF
                     and 0 <= step <= 0xFFFFFFFF
@@ -3309,13 +3318,21 @@ class ProxyServer:
                 payload = match.group('payload')
                 payload += '=' * (-len(payload) % 4)
                 encrypted = base64.b64decode(payload, altchars=b'-_', validate=True)
+
+                reverse_before = bool(match.group('bytes'))
+                if reverse_before:
+                    encrypted = encrypted[::-1]
+
                 decoded_bytes = bytes(
                     value ^ ((seed + index * step) & mask)
                     for index, value in enumerate(encrypted)
                 )
-                if match.group('reverse'):
+
+                reverse_after = '.reverse(' in script[match.start('output'):match.end()] and 'return' in script[match.start('output'):match.end()]
+                if reverse_after:
                     decoded_bytes = decoded_bytes[::-1]
-                candidate = normalize(decoded_bytes.decode('utf-8'))
+
+                candidate = normalize(decoded_bytes.decode('utf-8', errors='ignore'))
                 if candidate:
                     return candidate
             except (ValueError, UnicodeDecodeError, binascii.Error):

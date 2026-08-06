@@ -312,85 +312,63 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
     // Replay the decoder described by the player without evaluating remote JS.
     // Seed, step, mask, variable names, payload, and reverse order all come
     // from the current page, so provider-side parameter rotations keep working.
-    const rollingXorPattern =
-        /(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,512}?for\s*\(\s*var\s+([A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\2\s*<\s*\1\.length\s*;\s*\2\+\+\s*\)\s*\{[\s\S]{0,512}?(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*\(\s*([\s\S]{1,128}?)\s*\)\s*&\s*(0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,512}?([A-Za-z_$][\w$]*)\s*\+=\s*String\.fromCharCode\(\s*\1\.charCodeAt\(\s*\2\s*\)\s*\^\s*\3\s*\)[\s\S]{0,256}?\}\s*return\s+\6(\s*\.split\(\s*["']["']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["']["']\s*\))?\s*\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
-    const numericLiteralPattern = '(?:0[xX][0-9a-fA-F]+|\\d+)';
-    const parseRollingParameters = (expression, indexName) => {
-        const indexToken = indexName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const normalized = expression.replace(/[\s()]/g, '');
-        const layouts = [
-            {
-                pattern: new RegExp(
-                    `^(${numericLiteralPattern})\\+${indexToken}\\*(${numericLiteralPattern})$`,
-                ),
-                seed: 1,
-                step: 2,
-            },
-            {
-                pattern: new RegExp(
-                    `^(${numericLiteralPattern})\\+(${numericLiteralPattern})\\*${indexToken}$`,
-                ),
-                seed: 1,
-                step: 2,
-            },
-            {
-                pattern: new RegExp(
-                    `^${indexToken}\\*(${numericLiteralPattern})\\+(${numericLiteralPattern})$`,
-                ),
-                seed: 2,
-                step: 1,
-            },
-            {
-                pattern: new RegExp(
-                    `^(${numericLiteralPattern})\\*${indexToken}\\+(${numericLiteralPattern})$`,
-                ),
-                seed: 2,
-                step: 1,
-            },
-            {
-                pattern: new RegExp(
-                    `^(${numericLiteralPattern})\\+${indexToken}$`,
-                ),
-                seed: 1,
-                fixedStep: 1,
-            },
-            {
-                pattern: new RegExp(
-                    `^${indexToken}\\+(${numericLiteralPattern})$`,
-                ),
-                seed: 1,
-                fixedStep: 1,
-            },
-        ];
-
-        for (const layout of layouts) {
-            const match = normalized.match(layout.pattern);
-            if (!match) continue;
-            return {
-                seed: Number(match[layout.seed]),
-                step:
-                    layout.fixedStep === undefined
-                        ? Number(match[layout.step])
-                        : layout.fixedStep,
-            };
+    const parseRollingParameters = (expression, indexName, mask) => {
+        let expr = String(expression || '').replace(/\s+/g, '');
+        if (!expr.startsWith('+') && !expr.startsWith('-')) {
+            expr = '+' + expr;
         }
-        return null;
+        const terms = expr.match(/[-+][^+-]+/g) || [];
+        let seed = 0;
+        let step = 0;
+
+        let hostnameSum = 0;
+        if (/location(?:\.hostname|\[['"]hostname['"]\])?/.test(script) || script.includes('charCodeAt')) {
+            try {
+                const parsed = new URL(embedUrl);
+                const hostname = parsed.hostname || '';
+                for (let i = 0; i < hostname.length; i++) {
+                    hostnameSum = (hostnameSum + hostname.charCodeAt(i)) & mask;
+                }
+            } catch {
+                hostnameSum = 0;
+            }
+        }
+
+        const indexToken = indexName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const indexReg = new RegExp(`\\b${indexToken}\\b`);
+
+        for (const term of terms) {
+            const sign = term.startsWith('-') ? -1 : 1;
+            const t = term.slice(1).replace(/^[()]+|[()]+$/g, '');
+            if (indexReg.test(t)) {
+                const parts = t.split('*');
+                if (parts.length === 1) {
+                    step += sign * 1;
+                } else if (parts.length === 2) {
+                    const numPart = parts[0] === indexName ? parts[1] : parts[0];
+                    step += sign * parseInt(numPart, 10);
+                }
+            } else if (/^(?:0[xX][0-9a-fA-F]+|\d+)$/.test(t)) {
+                seed += sign * parseInt(t, 10);
+            } else if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+                seed += sign * hostnameSum;
+            }
+        }
+
+        return { seed, step };
     };
 
-    const reverseBeforeXorPattern =
-        /(?:var\s+)?(?<encoded>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)\s*,\s*(?<bytes>[A-Za-z_$][\w$]*)\s*=\s*\k<encoded>\.split\(\s*["']["']\s*\)\.reverse\(\s*\)\.join\(\s*["']["']\s*\)\s*,\s*(?<output>[A-Za-z_$][\w$]*)\s*=\s*["']["']\s*;[\s\S]{0,256}?for\s*\(\s*var\s+(?<index>[A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\k<index>\s*<\s*\k<bytes>\.length\s*;\s*\k<index>\+\+\s*\)\s*\{[\s\S]{0,256}?(?:var\s+)?(?<key>[A-Za-z_$][\w$]*)\s*=\s*\(\s*(?<keyExpression>[\s\S]{1,128}?)\s*\)\s*&\s*(?<mask>0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,256}?\k<output>\s*\+=\s*String\.fromCharCode\(\s*\k<bytes>\.charCodeAt\(\s*\k<index>\s*\)\s*\^\s*\k<key>\s*\)[\s\S]{0,128}?\}\s*return\s+\k<output>\s*\}\)\s*\(\s*["'](?<payload>[A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
-    for (const match of String(script || '').matchAll(reverseBeforeXorPattern)) {
+    const unifiedRollingXorPattern =
+        /(?:var\s+)?(?<rawBytes>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)(?:\s*,\s*(?<bytes>[A-Za-z_$][\w$]*)\s*=\s*\k<rawBytes>\.split\(\s*["']["']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["']["']\s*\))?[\s\S]{0,512}?for\s*\(\s*var\s+(?<index>[A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\k<index>\s*<\s*(?:[A-Za-z_$][\w$]*)\.length\s*;\s*\k<index>\+\+\s*\)\s*\{[\s\S]{0,512}?(?:var\s+)?(?<key>[A-Za-z_$][\w$]*)\s*=\s*\(\s*(?<keyExpression>[\s\S]{1,128}?)\s*\)\s*&\s*(?<mask0>0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,512}?(?<output>[A-Za-z_$][\w$]*)\s*\+=\s*String\.fromCharCode\(\s*(?:[A-Za-z_$][\w$]*)\.charCodeAt\(\s*\k<index>\s*\)\s*\^\s*\k<key>\s*\)[\s\S]{0,256}?\}\s*return\b[\s\S]{1,512}?\)\s*\(\s*["'](?<payload>[A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+
+    for (const match of String(script || '').matchAll(unifiedRollingXorPattern)) {
         const groups = match.groups || {};
-        const parameters = parseRollingParameters(groups.keyExpression || '', groups.index || '');
-        const mask = Number(groups.mask);
+        const mask = Number(groups.mask0);
+        const parameters = parseRollingParameters(groups.keyExpression || '', groups.index || '', mask);
         if (
             !parameters ||
             !Number.isSafeInteger(parameters.seed) ||
-            parameters.seed < 0 ||
-            parameters.seed > 0xffffffff ||
             !Number.isSafeInteger(parameters.step) ||
-            parameters.step < 0 ||
-            parameters.step > 0xffffffff ||
             !Number.isSafeInteger(mask) ||
             mask < 0 ||
             mask > 255
@@ -403,61 +381,22 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
             '=',
         );
         try {
-            const reversed = Array.from(atob(paddedPayload)).reverse();
+            const rawDecoded = atob(paddedPayload);
+            const byteArray = Array.from(rawDecoded, c => c.charCodeAt(0));
+            if (groups.bytes) byteArray.reverse();
             const decodedBytes = Uint8Array.from(
-                reversed,
-                (character, index) =>
-                    character.charCodeAt(0) ^
-                    ((parameters.seed + index * parameters.step) & mask),
+                byteArray,
+                (byteVal, index) => byteVal ^ ((parameters.seed + index * parameters.step) & mask),
             );
-            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
+            const matchIndex = match.index || 0;
+            const matchTail = script.substring(matchIndex);
+            if (!groups.bytes && /\.reverse\(\s*\)\s*\.join/.test(matchTail.substring(0, 500))) {
+                decodedBytes.reverse();
+            }
+            const decoded = new TextDecoder('utf-8', { fatal: false }).decode(decodedBytes);
             const candidate = normalizeCandidate(decoded);
             if (candidate) return candidate;
         } catch {}
-    }
-
-    for (const match of String(script || '').matchAll(rollingXorPattern)) {
-        const parameters = parseRollingParameters(match[4], match[2]);
-        const mask = Number(match[5]);
-        if (
-            !parameters ||
-            !Number.isSafeInteger(parameters.seed) ||
-            parameters.seed < 0 ||
-            parameters.seed > 0xffffffff ||
-            !Number.isSafeInteger(parameters.step) ||
-            parameters.step < 0 ||
-            parameters.step > 0xffffffff ||
-            !Number.isSafeInteger(mask) ||
-            mask < 0 ||
-            mask > 255
-        ) {
-            continue;
-        }
-
-        const payload = match[8];
-        if (payload.length > MAX_XOR_PAYLOAD_LENGTH) continue;
-        const normalizedPayload = payload.replace(/-/g, '+').replace(/_/g, '/');
-        if (normalizedPayload.length % 4 === 1) continue;
-        const paddedPayload = normalizedPayload.padEnd(
-            normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
-            '=',
-        );
-
-        try {
-            const encrypted = atob(paddedPayload);
-            const decodedBytes = Uint8Array.from(
-                encrypted,
-                (character, index) =>
-                    character.charCodeAt(0) ^
-                    ((parameters.seed + index * parameters.step) & mask),
-            );
-            if (match[7]) decodedBytes.reverse();
-            const decoded = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
-            const candidate = normalizeCandidate(decoded);
-            if (candidate) return candidate;
-        } catch {
-            // Try the next decoder or one of the legacy formats below.
-        }
     }
 
     const xorPattern =

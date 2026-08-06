@@ -106,6 +106,10 @@ BOOTSTRAP = r"""
     apply() { return looseObject; },
     construct() { return looseObject; },
     get(_target, property) {
+      if (property === 'canPlayType') return function (type) { return type && (type.includes('hls') || type.includes('mpegURL') || type.includes('mp4')) ? 'probably' : 'maybe'; };
+      if (property === 'getAttribute') return function (attr) { return attr === 'src' ? '' : 'true'; };
+      if (property === 'hasAttribute') return function () { return true; };
+      if (property === 'referrer') return globalThis.location ? globalThis.location.origin || '' : '';
       if (property === 'then') return undefined;
       if (property === Symbol.toPrimitive) return () => '';
       return looseObject;
@@ -188,14 +192,17 @@ def emit(payload: dict[str, object], exit_code: int = 0) -> None:
 def main() -> None:
     raw_request = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     if len(raw_request) > MAX_REQUEST_BYTES:
-        emit({"candidates": [], "error": "sandbox_input_too_large"}, 2)
+        emit({"candidates": [], "error": "sandbox_request_too_large"}, 2)
 
     try:
         request = json.loads(raw_request.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except json.JSONDecodeError:
+        emit({"candidates": [], "error": "sandbox_invalid_json"}, 2)
+
+    if not isinstance(request, dict):
         emit({"candidates": [], "error": "sandbox_invalid_request"}, 2)
 
-    scripts = request.get("scripts") if isinstance(request, dict) else None
+    scripts = request.get("scripts")
     if not isinstance(scripts, list) or not scripts:
         emit({"candidates": [], "error": "no_player_script"}, 2)
     if any(not isinstance(script, str) for script in scripts):
@@ -207,11 +214,35 @@ def main() -> None:
         emit({"candidates": [], "error": "sandbox_unavailable"}, 1)
 
     try:
+        import urllib.parse
         context = quickjs.Context()
         context.set_memory_limit(MEMORY_LIMIT_BYTES)
         context.set_max_stack_size(STACK_LIMIT_BYTES)
         context.set_time_limit(TIME_LIMIT_SECONDS)
         context.eval(BOOTSTRAP)
+        embed_url = request.get("embedUrl") if isinstance(request, dict) else ""
+        if isinstance(embed_url, str) and embed_url:
+            try:
+                parsed = urllib.parse.urlparse(embed_url)
+                origin_str = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+                loc_js = f"""
+                globalThis.location = {{
+                    href: {json.dumps(parsed.geturl())},
+                    origin: {json.dumps(origin_str)},
+                    protocol: {json.dumps(f"{parsed.scheme}:" if parsed.scheme else "https:")},
+                    host: {json.dumps(parsed.netloc or "")},
+                    hostname: {json.dumps(parsed.hostname or "")},
+                    pathname: {json.dumps(parsed.path or "")},
+                    search: {json.dumps(f"?{parsed.query}" if parsed.query else "")},
+                    hash: {json.dumps(f"#{parsed.fragment}" if parsed.fragment else "")},
+                    port: {json.dumps(str(parsed.port) if parsed.port else "")},
+                    ancestorOrigins: [{json.dumps(origin_str)}]
+                }};
+                try {{ globalThis.document.referrer = {json.dumps(origin_str)}; }} catch (_) {{}}
+                """
+                context.eval(loc_js)
+            except Exception:
+                pass
         run_script = context.get("__movixRunPlayerScript")
         runtime_error = None
         for script in scripts:

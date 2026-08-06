@@ -1,13 +1,13 @@
 {
-  "version": "2.5.10",
-  "buildNumber": 19,
+  "version": "2.5.11",
+  "buildNumber": 20,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72222642,
-  "apkSha256": "70f68a63653ace4ab1904cef16b996d5bc35f243fdf6bb068a06f4e7329bebdc",
+  "apkSizeBytes": 72227910,
+  "apkSha256": "9d63d01bf64d677b3e508c1538c62e5030dc0e5cde0752242fe7e26751dc8dd4",
   "mandatory": false,
-  "releasedAt": "2026-08-04T21:48:22.530Z",
+  "releasedAt": "2026-08-06T17:06:10.354Z",
   "releaseNotes": {
-    "fr": "Correction et amélioration de l’extraction Fsvid et Vidzy.",
-    "en": "Fixed and improved Fsvid and Vidzy extraction."
+    "fr": "Correction de l'extraction Fsvid et Vidzy.",
+    "en": "Fixed Fsvid and Vidzy extraction."
   }
 }
