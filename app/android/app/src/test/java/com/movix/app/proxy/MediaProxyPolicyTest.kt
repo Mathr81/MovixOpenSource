@@ -159,6 +159,22 @@ class MediaProxyPolicyTest {
     }
 
     @Test
+    fun usesSigningCompatibleUserAgentForEveryPlaybackHost() {
+        val signedUserAgent = "Mozilla/5.0 Chrome/140.0.0.0"
+
+        for (url in listOf(
+            "https://r1.fsvid.lol/video/master.m3u8",
+            "https://u14.vidzy.cc/video/master.m3u8",
+            "https://vidzy.org/embed-example",
+            "https://fsvid.lol.attacker.example/video/master.m3u8",
+            "https://media.example/video/master.m3u8",
+            "not-a-url",
+        )) {
+            assertEquals(signedUserAgent, MediaProxyPolicy.playbackUserAgent(url))
+        }
+    }
+
+    @Test
     fun buildsOpaqueLoopbackUrls() {
         val localUrl = MediaProxyPolicy.buildLoopbackUrl(
             port = 28123,

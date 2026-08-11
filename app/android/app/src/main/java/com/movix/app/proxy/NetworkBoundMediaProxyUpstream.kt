@@ -100,7 +100,10 @@ internal class NetworkBoundMediaProxyUpstream(
         headers.putIfAbsent("Sec-Fetch-Site", "cross-site")
         headers.putIfAbsent("Sec-Fetch-Mode", "cors")
         headers.putIfAbsent("Sec-Fetch-Dest", "empty")
-        headers.putIfAbsent("User-Agent", DEFAULT_USER_AGENT)
+        headers.putIfAbsent(
+            "User-Agent",
+            MediaProxyPolicy.playbackUserAgent(target.upstreamUrl),
+        )
 
         var currentUrl = target.upstreamUrl
         repeat(MAX_REDIRECTS + 1) { redirectCount ->
@@ -152,10 +155,6 @@ internal class NetworkBoundMediaProxyUpstream(
 
     companion object {
         private const val MAX_REDIRECTS = 5
-        private const val DEFAULT_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-
         private fun executeOkHttp(
             client: OkHttpClient,
             request: Request,

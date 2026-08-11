@@ -1,3 +1,5 @@
+const PROVIDER_SIGNED_USER_AGENT = 'Mozilla/5.0 Chrome/140.0.0.0';
+
 function setCanonicalHeader(
   headers: Record<string, string>,
   name: string,
@@ -23,14 +25,26 @@ export function applyMediaProxyHeaderRules(
     return headers;
   }
 
-  if (hostname !== 'fsvid.lol' && !hostname.endsWith('.fsvid.lol')) {
+  const isFsvidHost = hostname === 'fsvid.lol' || hostname.endsWith('.fsvid.lol');
+  const isVidzyHost =
+    hostname === 'vidzy.org'
+    || hostname.endsWith('.vidzy.org')
+    || hostname === 'vidzy.cc'
+    || hostname.endsWith('.vidzy.cc');
+  if (!isFsvidHost && !isVidzyHost) {
     return headers;
   }
 
-  const origin = hostname === 'fsvid.lol'
-    ? 'https://fs13.lol'
-    : 'https://fsvid.lol';
-  setCanonicalHeader(headers, 'Origin', origin);
-  setCanonicalHeader(headers, 'Referer', `${origin}/`);
+  if (isFsvidHost) {
+    const origin = hostname === 'fsvid.lol'
+      ? 'https://fs13.lol'
+      : 'https://fsvid.lol';
+    setCanonicalHeader(headers, 'Origin', origin);
+    setCanonicalHeader(headers, 'Referer', `${origin}/`);
+  }
+  setCanonicalHeader(headers, 'Sec-Fetch-Site', 'cross-site');
+  setCanonicalHeader(headers, 'Sec-Fetch-Mode', 'cors');
+  setCanonicalHeader(headers, 'Sec-Fetch-Dest', 'empty');
+  setCanonicalHeader(headers, 'User-Agent', PROVIDER_SIGNED_USER_AGENT);
   return headers;
 }

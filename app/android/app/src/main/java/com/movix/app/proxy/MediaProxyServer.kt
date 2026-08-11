@@ -331,7 +331,10 @@ internal class OkHttpMediaProxyUpstream(
         mergedHeaders.putIfAbsent("Sec-Fetch-Site", "cross-site")
         mergedHeaders.putIfAbsent("Sec-Fetch-Mode", "cors")
         mergedHeaders.putIfAbsent("Sec-Fetch-Dest", "empty")
-        mergedHeaders.putIfAbsent("User-Agent", DEFAULT_USER_AGENT)
+        mergedHeaders.putIfAbsent(
+            "User-Agent",
+            MediaProxyPolicy.playbackUserAgent(target.upstreamUrl),
+        )
 
         var currentUrl = target.upstreamUrl
         repeat(MAX_REDIRECTS + 1) { redirectCount ->
@@ -382,9 +385,6 @@ internal class OkHttpMediaProxyUpstream(
 
     companion object {
         private const val MAX_REDIRECTS = 5
-        private const val DEFAULT_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 }
 

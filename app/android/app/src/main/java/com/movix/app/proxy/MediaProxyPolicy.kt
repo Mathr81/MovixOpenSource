@@ -65,6 +65,7 @@ internal data class MediaProxySessionAccess(
 object MediaProxyPolicy {
     private const val MAX_URL_LENGTH = 16_384
     private const val MAX_HEADER_VALUE_LENGTH = 8_192
+    private const val PLAYBACK_USER_AGENT = "Mozilla/5.0 Chrome/140.0.0.0"
     private val tokenPattern = Regex("^[A-Za-z0-9_-]{8,128}$")
     private val numericIpv4Pattern = Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")
     private val uriAttributePattern = Regex("""URI=(["'])(.*?)\1""", RegexOption.IGNORE_CASE)
@@ -93,6 +94,9 @@ object MediaProxyPolicy {
         "if-none-match",
         "range",
     )
+
+    @Suppress("UNUSED_PARAMETER")
+    fun playbackUserAgent(rawUrl: String): String = PLAYBACK_USER_AGENT
 
     fun validatePublicHttpsUrl(
         rawUrl: String,
