@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode } from 'react';
 import { Profile, ProfileContextType } from '../types/profile';
 import axios from 'axios';
 import { useLocation } from 'react-router-dom';
@@ -8,13 +8,19 @@ import {
   getSyncableLocalStorageEntries,
   hasSyncableLocalStorageData,
   isSyncableStorageKey,
-  shouldPreserveStorageKeyOnProfileLoad,
   SYNC_OUTBOX_STORAGE_KEY
 } from '../utils/syncStorage';
 import { checkVipStatus } from '../utils/vipUtils';
+import {
+  clearDeletedProfileSelectionIfStillActive,
+  commitProfileSelection,
+  createLatestProfileHydrationGuard,
+  createLatestProfileIntentGuard,
+} from '../utils/profileSelectionTransaction';
+import { replaceProfileStorage } from '../utils/profileStorage';
 
 // Pending sync ops persisted by App.tsx flushPendingOpsSync at unload time.
-// We POST these to /api/sync BEFORE applyProfileEntriesToLocalStorage wipes
+// We POST these to /api/sync BEFORE replaceProfileStorage wipes
 // localStorage — otherwise unsynced writes (Firefox keepalive flake, network
 // hiccup) would be destroyed by the wipe-and-restore restoring stale backend
 // state. On success the outbox is cleared; on transient failure it's kept for
@@ -70,12 +76,40 @@ async function replayOutboxIfAny(): Promise<void> {
     return;
   }
 
+  // Cross-user guard: if a different account is logged in than the one that
+  // wrote the outbox, do NOT replay. Replaying would POST with the outbox's
+  // userId, the backend would respond 401 "UserId mismatch", and the catch
+  // below would mark the outbox permanently failed → clearing the original
+  // owner's pending writes forever. Keep the outbox idle instead; the 7-day
+  // TTL evicts stale entries, and the original owner can return and replay.
+  const currentUserId = localStorage.getItem('resolved_user_id') || localStorage.getItem('user_id');
+  if (payload.userId && currentUserId && payload.userId !== currentUserId) {
+    console.warn('[outbox] skipping replay — different user logged in than outbox owner');
+    return;
+  }
+
+  // Filter out ops whose keys are no longer syncable. Legacy outboxes may
+  // contain keys removed from the allowlist after a backend security update
+  // (e.g. `is_vip` per audit P0). Without filtering, the backend rejects the
+  // whole batch with 400 INVALID_SYNC_KEY → replayOutboxIfAny treats 400 as
+  // permanent → outbox is dropped, taking legitimate co-batched ops with it.
+  const validOps = payload.ops.filter((op): op is Record<string, unknown> & { key: string } => {
+    if (!op || typeof op !== 'object') return false;
+    const candidateKey = (op as { key?: unknown }).key;
+    return typeof candidateKey === 'string' && isSyncableStorageKey(candidateKey);
+  });
+
+  if (validOps.length === 0) {
+    try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+
   try {
     await axios.post(`${API_URL}/api/sync`, {
       userType: payload.userType,
       profileId: payload.profileId,
       userId: payload.userId,
-      ops: payload.ops
+      ops: validOps
     }, {
       headers: { Authorization: `Bearer ${authToken}` }
     });
@@ -121,11 +155,65 @@ async function replayOutboxIfAny(): Promise<void> {
 
 const API_URL = import.meta.env.VITE_MAIN_API;
 
+// Per-device record of which profiles have been confirmed to hold server-side
+// data on a prior load. Used by loadProfileData to detect the "server returned
+// empty for a profile that previously had data" scenario (corrupted profile
+// file, transient backend bug, partial response) and preserve local state
+// instead of wiping it. NOT synced — prefixed to fall outside the syncable
+// allowlist and not in PROFILE_LOAD_PRESERVED_KEYS removal path.
+const KNOWN_PROFILE_DATA_KEY = '__movix_known_profile_data';
+
+interface KnownProfileDataMap {
+  [profileId: string]: number;
+}
+
+function readKnownProfileData(): KnownProfileDataMap {
+  try {
+    const raw = localStorage.getItem(KNOWN_PROFILE_DATA_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed as KnownProfileDataMap;
+  } catch {
+    return {};
+  }
+}
+
+function markProfileHasData(profileId: string) {
+  try {
+    const current = readKnownProfileData();
+    current[profileId] = Date.now();
+    localStorage.setItem(KNOWN_PROFILE_DATA_KEY, JSON.stringify(current));
+  } catch { /* noop — markers are best-effort */ }
+}
+
+function hasLocalSyncableContent(): boolean {
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (!isSyncableStorageKey(key)) continue;
+    const value = localStorage.getItem(key);
+    if (typeof value !== 'string') continue;
+    if (value.trim() === '' || value === '[]' || value === '{}') continue;
+    return true;
+  }
+  return false;
+}
+
 const ProfileContext = createContext<ProfileContextType | undefined>(undefined);
 
 interface ProfileProviderProps {
   children: ReactNode;
 }
+
+interface LoadProfileDataOptions {
+  notifyConsumers?: boolean;
+  preserveLocalOnUnexpectedEmpty?: boolean;
+  isIntentCurrent?: () => boolean;
+}
+
+type ProfileDataLoadingWindow = Window & {
+  setProfileDataLoading?: (loading: boolean) => void;
+};
 
 export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) => {
   const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
@@ -133,22 +221,35 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
   const [isLoading, setIsLoading] = useState(false);
   const location = useLocation();
 
-  // Check if we're on a watch route - if so, disable profile data loading (but allow sync)
+  // Dedupes the two useEffects below (mount timer + auth_changed listener)
+  // that can both call loadProfiles within ~500ms of each other. Without
+  // this guard, two concurrent GET /api/profiles → loadProfileData chains
+  // race the wipe-and-restore against in-flight user writes.
+  const loadProfilesInFlightRef = useRef(false);
+
+  // The /watch/* skip only applies to automatic hydration during loadProfiles;
+  // an explicit profile selection always hydrates its target before publishing.
   const isWatchRoute = location.pathname.startsWith('/watch/');
 
-  const applyProfileEntriesToLocalStorage = (entries: Record<string, string>) => {
-    Object.keys(localStorage).forEach((key) => {
-      if (isSyncableStorageKey(key) && !shouldPreserveStorageKeyOnProfileLoad(key)) {
-        localStorage.removeItem(key);
-      }
+  // Perf : l'ancien pattern [isWatchRoute] sur les effets de montage relançait TOUT le
+  // cycle réseau (GET /api/profiles + GET /api/profiles/:id/data + wipe/rewrite du
+  // localStorage) à CHAQUE transition watch <-> reste du site — le chemin le plus
+  // emprunté (retour sur Home après une vidéo). On ne garde que le strict nécessaire :
+  // un chargement au boot, un rattrapage si l'app a démarré sur /watch/ (deep-link).
+  const profileDataHydratedRef = useRef(false);
+  const prevIsWatchRouteRef = useRef(isWatchRoute);
+  const profileHydrationGuardRef = useRef<ReturnType<typeof createLatestProfileHydrationGuard> | null>(null);
+  if (!profileHydrationGuardRef.current) {
+    profileHydrationGuardRef.current = createLatestProfileHydrationGuard((loading) => {
+      (window as ProfileDataLoadingWindow).setProfileDataLoading?.(loading);
     });
-
-    Object.entries(entries).forEach(([key, value]) => {
-      if (typeof value === 'string' && isSyncableStorageKey(key)) {
-        localStorage.setItem(key, value);
-      }
-    });
-  };
+  }
+  const profileHydrationGuard = profileHydrationGuardRef.current;
+  const profileIntentGuardRef = useRef<ReturnType<typeof createLatestProfileIntentGuard> | null>(null);
+  if (!profileIntentGuardRef.current) {
+    profileIntentGuardRef.current = createLatestProfileIntentGuard();
+  }
+  const profileIntentGuard = profileIntentGuardRef.current;
 
   const refreshVipState = () => {
     if (localStorage.getItem('access_code')) {
@@ -158,8 +259,25 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
     }
   };
 
+  const notifyProfileDataUpdated = () => {
+    window.dispatchEvent(new CustomEvent('sync_storage_updated'));
+    refreshVipState();
+  };
+
+  const clearDeletedProfileSelection = (deletedProfileId: string) => (
+    clearDeletedProfileSelectionIfStillActive({
+      deletedProfileId,
+      readSelectedProfileId: () => localStorage.getItem('selected_profile_id'),
+      clearCurrentProfile: () => setCurrentProfile(null),
+      clearSelectedProfileId: () => localStorage.removeItem('selected_profile_id'),
+      notifyProfileDataUpdated,
+    })
+  );
+
   // Load profiles from server
   const loadProfiles = async () => {
+    if (loadProfilesInFlightRef.current) return;
+    loadProfilesInFlightRef.current = true;
     try {
       setIsLoading(true);
       const authToken = localStorage.getItem('auth_token');
@@ -225,6 +343,7 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
     } catch (error) {
       console.error('Error loading profiles:', error);
     } finally {
+      loadProfilesInFlightRef.current = false;
       setIsLoading(false);
       // Libère la garde anti-sync (App.tsx l'init à true au boot pour bloquer
       // tout push pendant la fenêtre où des composants pourraient écrire des
@@ -232,9 +351,7 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
       // loadProfileData a son propre try/finally qui la baisse aussi ; cet
       // appel couvre les branches qui ne l'invoquent pas (pas d'auth_token,
       // route /watch/*, profiles.length === 0).
-      if ((window as any).setProfileDataLoading) {
-        (window as any).setProfileDataLoading(false);
-      }
+      profileHydrationGuard.releaseLoadingIfIdle();
     }
   };
 
@@ -252,7 +369,9 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
   };
 
   // Create default profile for new users
-  const createDefaultProfileForNewUser = async () => {
+  const createDefaultProfileForNewUser = async (
+    isIntentCurrent: () => boolean = () => true,
+  ) => {
     try {
       const authToken = localStorage.getItem('auth_token');
       if (!authToken) return;
@@ -287,6 +406,7 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
       });
 
       if (response.data.success) {
+        if (!isIntentCurrent()) return;
         const defaultProfile = response.data.profile;
         setProfiles([defaultProfile]);
         setCurrentProfile(defaultProfile);
@@ -333,72 +453,112 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
     }
   };
 
-  // Select a profile
-  const selectProfile = async (profileId: string) => {
-    const profile = profiles.find(p => p.id === profileId);
-    if (profile) {
-      setCurrentProfile(profile);
-      localStorage.setItem('selected_profile_id', profileId);
-      
-      // Load profile data from server and update localStorage (unless on watch route)
-      if (!isWatchRoute) {
-        await loadProfileData(profileId);
-      } else {
-        console.log('Skipping profile data loading on profile selection - on watch route');
-      }
-    }
-  };
-
   // Load profile data from server and update localStorage
-  const loadProfileData = async (profileId: string) => {
+  const loadProfileData = async (
+    profileId: string,
+    {
+      notifyConsumers = true,
+      preserveLocalOnUnexpectedEmpty = true,
+      isIntentCurrent = () => true,
+    }: LoadProfileDataOptions = {},
+  ): Promise<boolean> => {
+    const hydrationRequest = profileHydrationGuard.begin();
     try {
       const authToken = localStorage.getItem('auth_token');
-      if (!authToken) return;
-
-      // Skip profile data loading on watch routes
-      if (isWatchRoute) {
-        console.log('Skipping profile data loading - on watch route');
-        return;
-      }
-
-      // Signal that we're starting to load profile data
-      if ((window as any).setProfileDataLoading) {
-        (window as any).setProfileDataLoading(true);
-      }
+      if (!authToken) return false;
 
       // Recovery flush: replay any sync ops persisted at the previous unload
       // BEFORE the GET below pulls server state. Without this, a write that
       // didn't reach the server (Firefox keepalive flake, network hiccup,
-      // browser crash) would be destroyed when applyProfileEntriesToLocalStorage
+      // browser crash) would be destroyed when replaceProfileStorage
       // wipes localStorage and restores stale backend data.
       await replayOutboxIfAny();
+      if (!hydrationRequest.isCurrent() || !isIntentCurrent()) return false;
 
       const response = await axios.get(`${API_URL}/api/profiles/${profileId}/data`, {
         headers: { Authorization: `Bearer ${authToken}` }
       });
 
-      if (response.data.success && response.data.data) {
-        const profileData = response.data.data;
-        const profileEntries = Object.fromEntries(
-          Object.entries(profileData).filter(
-            ([key, value]) => typeof value === 'string' && isSyncableStorageKey(key)
-          )
-        ) as Record<string, string>;
+      if (!hydrationRequest.isCurrent() || !isIntentCurrent()) return false;
+      if (!response.data.success || !response.data.data) return false;
 
-        applyProfileEntriesToLocalStorage(profileEntries);
-        window.dispatchEvent(new CustomEvent('sync_storage_updated'));
-        refreshVipState();
+      const profileData = response.data.data;
+      const profileEntries = Object.fromEntries(
+        Object.entries(profileData).filter(
+          ([key, value]) => typeof value === 'string' && isSyncableStorageKey(key)
+        )
+      ) as Record<string, string>;
 
-        console.log('Profile data loaded for profile:', profileId);
+      const serverHasData = Object.keys(profileEntries).length > 0;
+      const known = readKnownProfileData();
+      const profileWasKnownToHaveData = Object.prototype.hasOwnProperty.call(known, profileId);
+
+      // Wipe guard: if the server returns an empty profile for a profile
+      // we previously confirmed had data on this device, AND we still have
+      // local syncable content, do NOT wipe. A transient backend error or
+      // corrupted profile file would otherwise silently destroy the user's
+      // local state. Preserve local; the next sync push will restore the
+      // server side from localStorage.
+      if (
+        preserveLocalOnUnexpectedEmpty
+        && !serverHasData
+        && profileWasKnownToHaveData
+        && hasLocalSyncableContent()
+      ) {
+        console.warn(
+          `[sync] Server returned empty profile ${profileId} that previously held data — preserving local state`
+        );
+        profileDataHydratedRef.current = true;
+        if (notifyConsumers) notifyProfileDataUpdated();
+        return true;
       }
+
+      if (!isIntentCurrent()) return false;
+      replaceProfileStorage(profileEntries);
+      profileDataHydratedRef.current = true;
+
+      if (serverHasData) {
+        markProfileHasData(profileId);
+      }
+
+      if (notifyConsumers) notifyProfileDataUpdated();
+
+      console.log('Profile data loaded for profile:', profileId);
+      return true;
     } catch (error) {
       console.error('Error loading profile data:', error);
+      return false;
     } finally {
-      // Signal that we're done loading profile data
-      if ((window as any).setProfileDataLoading) {
-        (window as any).setProfileDataLoading(false);
-      }
+      hydrationRequest.finish();
     }
+  };
+
+  const activateProfile = async (
+    profile: Profile,
+    isIntentCurrent: () => boolean,
+  ): Promise<boolean> => (
+    commitProfileSelection({
+      profile,
+      hydrateProfileData: (profileId, currentIntent) => loadProfileData(profileId, {
+        notifyConsumers: false,
+        preserveLocalOnUnexpectedEmpty: false,
+        isIntentCurrent: currentIntent,
+      }),
+      persistSelectedProfileId: (profileId) => {
+        localStorage.setItem('selected_profile_id', profileId);
+      },
+      publishCurrentProfile: setCurrentProfile,
+      notifyProfileDataUpdated,
+      isIntentCurrent,
+    })
+  );
+
+  // Select a profile
+  const selectProfile = async (profileId: string): Promise<boolean> => {
+    const selectionIntent = profileIntentGuard.begin();
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (!profile) return false;
+    return activateProfile(profile, selectionIntent.isCurrent);
   };
 
   // Create a new profile
@@ -464,6 +624,7 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
 
   // Delete a profile
   const deleteProfile = async (profileId: string) => {
+    const deletionIntent = profileIntentGuard.begin();
     try {
       setIsLoading(true);
       const authToken = localStorage.getItem('auth_token');
@@ -478,11 +639,15 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
         if (response.data.newDefaultProfile) {
           // Server created a new default profile, use it directly
           const newDefaultProfile = response.data.newDefaultProfile;
+          if (!deletionIntent.isCurrent()) return;
           setProfiles([newDefaultProfile]);
-          setCurrentProfile(newDefaultProfile);
-          localStorage.setItem('selected_profile_id', newDefaultProfile.id);
-          if (!isWatchRoute) {
-            await loadProfileData(newDefaultProfile.id);
+          const activated = await activateProfile(
+            newDefaultProfile,
+            deletionIntent.isCurrent,
+          );
+          if (!activated && deletionIntent.isCurrent()) {
+            console.error('Failed to activate replacement profile:', newDefaultProfile.id);
+            clearDeletedProfileSelection(profileId);
           }
           console.log('New default profile created by server:', newDefaultProfile.name);
         } else {
@@ -499,18 +664,20 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
             if (currentProfile?.id === profileId) {
               if (updatedProfiles.length > 0) {
                 const newCurrent = updatedProfiles.find((p: Profile) => p.isDefault) || updatedProfiles[0];
-                setCurrentProfile(newCurrent);
-                localStorage.setItem('selected_profile_id', newCurrent.id);
-                // Load data for the new current profile (unless on watch route)
-                if (!isWatchRoute) {
-                  await loadProfileData(newCurrent.id);
-                } else {
-                  console.log('Skipping profile data loading after profile deletion - on watch route');
+                if (!deletionIntent.isCurrent()) return;
+                const activated = await activateProfile(
+                  newCurrent,
+                  deletionIntent.isCurrent,
+                );
+                if (!activated && deletionIntent.isCurrent()) {
+                  console.error('Failed to activate profile after deletion:', newCurrent.id);
+                  clearDeletedProfileSelection(profileId);
                 }
               } else {
                 // No profiles left, create a new default profile automatically
                 console.log('No profiles left, creating new default profile...');
-                await createDefaultProfileForNewUser();
+                if (!deletionIntent.isCurrent()) return;
+                await createDefaultProfileForNewUser(deletionIntent.isCurrent);
               }
             }
           }
@@ -524,28 +691,48 @@ export const ProfileProvider: React.FC<ProfileProviderProps> = ({ children }) =>
     }
   };
 
-  // Load profiles on mount with delay for BIP39 users
+  // Ref vers la dernière version de loadProfiles (closure fraîche, avec le bon
+  // isWatchRoute) pour les effets/listeners montés une seule fois ci-dessous
+  const loadProfilesRef = useRef(loadProfiles);
+  useEffect(() => {
+    loadProfilesRef.current = loadProfiles;
+  });
+
+  // Load profiles on mount with delay for BIP39 users — montage unique (perf)
   useEffect(() => {
     // Add a small delay to ensure auth data is fully loaded
     const timer = setTimeout(() => {
-      loadProfiles();
+      loadProfilesRef.current();
     }, 100);
 
     return () => clearTimeout(timer);
+  }, []);
+
+  // Rattrapage deep-link : si l'app a démarré sur /watch/*, l'hydratation automatique
+  // de loadProfiles a été ignorée. La première sortie de /watch/ déclenche alors le
+  // chargement ; une sélection explicite, elle, hydrate toujours immédiatement.
+  useEffect(() => {
+    const wasWatch = prevIsWatchRouteRef.current;
+    prevIsWatchRouteRef.current = isWatchRoute;
+    if (wasWatch && !isWatchRoute && !profileDataHydratedRef.current) {
+      loadProfilesRef.current();
+    }
   }, [isWatchRoute]);
 
-  // Listen for auth changes to reload profiles
+  // Listen for auth changes to reload profiles — montage unique (perf)
   useEffect(() => {
     const handleAuthChange = () => {
+      // Nouveau compte → les données profil devront être réhydratées
+      profileDataHydratedRef.current = false;
       // Reload profiles when auth changes (especially for BIP39)
       setTimeout(() => {
-        loadProfiles();
+        loadProfilesRef.current();
       }, 500);
     };
 
     window.addEventListener('auth_changed', handleAuthChange);
     return () => window.removeEventListener('auth_changed', handleAuthChange);
-  }, [isWatchRoute]);
+  }, []);
 
   // Memoize value with state-only deps. The 4 callbacks (selectProfile,
   // createProfile, updateProfile, deleteProfile) are recreated each render

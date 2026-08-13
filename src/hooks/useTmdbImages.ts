@@ -30,33 +30,58 @@ function normalizeEntry(raw: unknown): ImageEntry {
   };
 }
 
+// Copie mémoire du cache sessionStorage, tenue au niveau module (même pattern
+// que le `inflight` Map ci-dessous). getCache() est appelé plusieurs dizaines
+// de fois par row révélée au scroll (2× par mount de CarouselCard + 2× dans
+// fetchAndCache) — sans ça, chaque appel refaisait un sessionStorage.getItem
+// + JSON.parse du blob COMPLET. Hydratée depuis sessionStorage seulement au
+// premier appel ou après expiration TTL ; setCache met à jour la copie
+// mémoire ET sessionStorage. Best-effort multi-onglets : une divergence
+// temporaire entre onglets (un autre onglet écrit pendant que le TTL courant
+// est encore valide ici) est acceptable.
+let memoryCache: Record<string, ImageEntry> | null = null;
+let memoryCacheTimestamp = 0;
+
 // Helper functions for sessionStorage cache
 function getCache(): Record<string, ImageEntry> {
+  const now = Date.now();
+  if (memoryCache && (now - memoryCacheTimestamp) < CACHE_DURATION_MS) {
+    return memoryCache;
+  }
+
   try {
     const cached = sessionStorage.getItem(CACHE_KEY);
     const timestamp = sessionStorage.getItem(CACHE_TIMESTAMP_KEY);
 
     if (cached && timestamp) {
-      const isValid = (Date.now() - parseInt(timestamp)) < CACHE_DURATION_MS;
+      const parsedTimestamp = parseInt(timestamp);
+      const isValid = (now - parsedTimestamp) < CACHE_DURATION_MS;
       if (isValid) {
         const parsed = JSON.parse(cached) as Record<string, unknown>;
         const normalized: Record<string, ImageEntry> = {};
         for (const k of Object.keys(parsed)) {
           normalized[k] = normalizeEntry(parsed[k]);
         }
-        return normalized;
+        memoryCache = normalized;
+        memoryCacheTimestamp = parsedTimestamp;
+        return memoryCache;
       }
     }
   } catch {
     // Ignore parse errors
   }
-  return {};
+
+  memoryCache = {};
+  memoryCacheTimestamp = now;
+  return memoryCache;
 }
 
 function setCache(cache: Record<string, ImageEntry>) {
+  memoryCache = cache;
+  memoryCacheTimestamp = Date.now();
   try {
     sessionStorage.setItem(CACHE_KEY, JSON.stringify(cache));
-    sessionStorage.setItem(CACHE_TIMESTAMP_KEY, Date.now().toString());
+    sessionStorage.setItem(CACHE_TIMESTAMP_KEY, memoryCacheTimestamp.toString());
   } catch {
     // Ignore storage errors (quota exceeded, etc.)
   }

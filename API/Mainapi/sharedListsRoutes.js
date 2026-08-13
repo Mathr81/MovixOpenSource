@@ -29,14 +29,19 @@ function getCachedPool() {
 const SHARED_LIST_CACHE_TTL = 600; // 10 minutes
 const USERS_DIR = path.join(__dirname, 'data', 'users');
 
-// === OpenRouter API Configuration for content moderation (using Gemini 2.5 Flash Lite) ===
+// === ZZAPI API Configuration for content moderation ===
+const ZZAPI_API_KEY = process.env.ZZAPI_API_KEY;
+const ZZAPI_API_URL = 'https://zzapi.cc/v1/chat/completions';
+const ZZAPI_MODEL = 'claude-haiku-4-5-20251001';
+
+// === OpenRouter Fallback Configuration ===
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const OPENROUTER_MODEL = 'google/gemini-2.5-flash-lite';
+const OPENROUTER_MODEL = 'deepseek/deepseek-v4-flash';
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL;
 
-// Fonction de modération des listes partagées avec OpenRouter/Gemini (exécutée en background)
-async function moderateSharedListWithGemini(shareId, listName, items, username) {
+// Fonction de modération des listes partagées avec OpenRouter (exécutée en background)
+async function moderateSharedListWithAI(shareId, listName, items, username) {
   try {
     // Construire un résumé des items de la liste
     const itemsSummary = (items || []).slice(0, 30).map(i => `${i.title || i.name || 'Sans titre'} (${i.type || 'inconnu'})`).join(', ');
@@ -59,26 +64,49 @@ Note: Les films et séries sont des contenus TMDB officiels, donc ils sont gén�
 Réponds UNIQUEMENT avec ce format JSON (sans markdown, sans backticks):
 {"flagged": true/false, "reason": "INSULTES" ou "EROTIQUE" ou "PSEUDO_INAPPROPRIE" ou "NOM_LISTE_INAPPROPRIE" ou "CONTENU_INAPPROPRIE" ou null, "details": "explication courte"}`;
 
-    const response = await axios.post(
-      OPENROUTER_API_URL,
-      {
-        model: OPENROUTER_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 500,
-        temperature: 0.1
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-          'HTTP-Referer': FRONTEND_BASE_URL,
-          'X-Title': 'Movix Shared List Moderation'
+    let responseText = '';
+    try {
+      const response = await axios.post(
+        ZZAPI_API_URL,
+        {
+          model: ZZAPI_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.1
         },
-        timeout: 15000
-      }
-    );
-
-    const responseText = response.data?.choices?.[0]?.message?.content || '';
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${ZZAPI_API_KEY}`,
+            'HTTP-Referer': FRONTEND_BASE_URL,
+            'X-Title': 'Movix Shared List Moderation'
+          },
+          timeout: 15000
+        }
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || '';
+    } catch (primaryError) {
+      console.warn('⚠️ ZZAPI failed for moderation, falling back to OpenRouter:', primaryError.message);
+      const response = await axios.post(
+        OPENROUTER_API_URL,
+        {
+          model: OPENROUTER_MODEL,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 500,
+          temperature: 0.1
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'HTTP-Referer': FRONTEND_BASE_URL,
+            'X-Title': 'Movix Shared List Moderation'
+          },
+          timeout: 15000
+        }
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || '';
+    }
 
     let moderationResult;
     try {
@@ -211,7 +239,13 @@ const requireAuth = async (req, res, next) => {
     req.user = { userId, userType, sessionId };
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Token invalide' });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ error: 'Token invalide' });
+    }
+    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+    // sinon le front déconnecte l'utilisateur.
+    console.error('[sharedLists][requireAuth] Vérif session impossible:', error.message);
+    return res.status(503).json({ error: 'Service temporairement indisponible' });
   }
 };
 
@@ -254,7 +288,13 @@ const requireAdmin = async (req, res, next) => {
     req.admin = { userId, userType, adminId: adminRows[0].id, role: adminRows[0].role || 'admin' };
     next();
   } catch (error) {
-    return res.status(401).json({ error: 'Token invalide' });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ error: 'Token invalide' });
+    }
+    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+    // sinon le front déconnecte l'utilisateur.
+    console.error('[sharedLists][requireAdmin] Vérif session impossible:', error.message);
+    return res.status(503).json({ error: 'Service temporairement indisponible' });
   }
 };
 
@@ -449,7 +489,7 @@ router.post('/share', requireAuth, async (req, res) => {
         [isPublicInCatalog ? 1 : 0, now, userId, userType, profileId, String(listId)]
       );
 
-      // Si on publie au catalogue, reset le flag de modération et lancer modération Gemini en background
+      // Si on publie au catalogue, reset le flag de modération et lancer modération IA en background
       if (isPublicInCatalog) {
         await dbRun(
           'UPDATE shared_lists SET moderation_flagged = 0, moderation_reason = NULL, moderation_details = NULL, moderated_at = NULL WHERE user_id = ? AND user_type = ? AND profile_id = ? AND list_id = ?',
@@ -460,8 +500,8 @@ router.post('/share', requireAuth, async (req, res) => {
           [userId, userType, profileId, String(listId)]
         );
         const profileData = await getUserProfileData(userId, userType, profileId);
-        moderateSharedListWithGemini(existingRecord.id, list.name, list.items || [], profileData.username)
-          .catch(err => console.error('Erreur modération Gemini liste (non bloquant):', err));
+        moderateSharedListWithAI(existingRecord.id, list.name, list.items || [], profileData.username)
+          .catch(err => console.error('Erreur modération IA liste (non bloquant):', err));
       }
 
       // Rafraîchir le cache et retourner le code existant
@@ -494,15 +534,15 @@ router.post('/share', requireAuth, async (req, res) => {
     // Construire et mettre en cache la liste
     await buildAndCacheSharedList(shareCode, userId, userType, profileId, listId, isPublicInCatalog);
 
-    // Si publié au catalogue, lancer modération Gemini en background
+    // Si publié au catalogue, lancer modération IA en background
     if (isPublicInCatalog) {
       const insertedRecord = await dbGet(
         'SELECT id FROM shared_lists WHERE share_code = ?',
         [shareCode]
       );
       const profileData = await getUserProfileData(userId, userType, profileId);
-      moderateSharedListWithGemini(insertedRecord.id, list.name, list.items || [], profileData.username)
-        .catch(err => console.error('Erreur modération Gemini liste (non bloquant):', err));
+      moderateSharedListWithAI(insertedRecord.id, list.name, list.items || [], profileData.username)
+        .catch(err => console.error('Erreur modération IA liste (non bloquant):', err));
     }
 
     res.json({ shareCode, isPublicInCatalog });
@@ -802,7 +842,7 @@ router.delete('/admin/public/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /admin/moderated — Lister les listes flaggées par Gemini (admin uniquement)
+// GET /admin/moderated — Lister les listes flaggées par l'IA (admin uniquement)
 router.get('/admin/moderated', requireAdmin, async (req, res) => {
   try {
     const { page = 1, limit = 50 } = req.query;

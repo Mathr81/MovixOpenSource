@@ -128,6 +128,30 @@ async function fetchTmdbSeason(tmdbApiUrl, tmdbApiKey, tvId, seasonNumber, langu
 }
 
 /**
+ * Recupere les titres alternatifs d'un media TMDB avec le TTL des details.
+ * Cle : tmdb:alternative_titles:{mediaType}:{id}
+ */
+async function fetchTmdbAlternativeTitles(tmdbApiUrl, tmdbApiKey, id, mediaType = 'tv') {
+  if (!['tv', 'movie'].includes(mediaType)) throw new TypeError('type media TMDB invalide');
+  const redisKey = `tmdb:alternative_titles:${mediaType}:${id}`;
+  const cached = await redisGet(redisKey);
+  if (cached) return cached;
+
+  try {
+    const response = await axios.get(`${tmdbApiUrl}/${mediaType}/${id}/alternative_titles`, {
+      params: { api_key: tmdbApiKey },
+      timeout: 10000
+    });
+    if (response.data) {
+      await redisSet(redisKey, response.data, TTL_DETAILS);
+    }
+    return response.data;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Récupère l'année de sortie française d'un film via /movie/{id}/release_dates.
  * Clé : tmdb:release_dates:movie:{id}
  */
@@ -194,6 +218,7 @@ module.exports = {
   fetchTmdbDetails,
   searchTmdb,
   fetchTmdbSeason,
+  fetchTmdbAlternativeTitles,
   fetchTmdbFrenchReleaseYear,
   fetchTmdbImages,
   TTL_DETAILS,

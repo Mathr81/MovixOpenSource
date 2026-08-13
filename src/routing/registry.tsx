@@ -88,6 +88,7 @@ export const ROUTES: RouteEntry[] = [
   { path: '/wrapped',                 loader: lz(() => import('../pages/WrappedPage')) },
   { path: '/wrapped/:year',           loader: lz(() => import('../pages/WrappedPage')) },
   { path: '/dmca',                    loader: lz(() => import('../pages/DMCA')) },
+  { path: '/frais',                   loader: lz(() => import('../pages/CostsPage')) },
   { path: '/admin',                   loader: lz(() => import('../pages/AdminPage')) },
   { path: '/download/:type/:id',      loader: lz(() => import('../pages/DownloadPage')) },
   { path: '/debrid',                  loader: lz(() => import('../pages/DebridPage')) },

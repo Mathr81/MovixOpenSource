@@ -21,13 +21,8 @@ const EMPTY_RESULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 // ---------------------------------------------------------------------------
 let DARKINO_MAINTENANCE;
 let DARKINOS_CACHE_DIR;
-let darkiworld_premium = false;
-let darkiHeaders;
-let axiosDarkinoRequest;
 let getFromCacheNoExpiration;
 let saveToCache;
-let shouldUpdateCache;
-let refreshDarkinoSessionIfNeeded;
 
 /**
  * Inject runtime dependencies that still live in app.js.
@@ -35,13 +30,8 @@ let refreshDarkinoSessionIfNeeded;
 function configure(deps) {
   if (deps.DARKINO_MAINTENANCE !== undefined) DARKINO_MAINTENANCE = deps.DARKINO_MAINTENANCE;
   if (deps.DARKINOS_CACHE_DIR) DARKINOS_CACHE_DIR = deps.DARKINOS_CACHE_DIR;
-  if (deps.darkiworld_premium !== undefined) darkiworld_premium = deps.darkiworld_premium;
-  if (deps.darkiHeaders) darkiHeaders = deps.darkiHeaders;
-  if (deps.axiosDarkinoRequest) axiosDarkinoRequest = deps.axiosDarkinoRequest;
   if (deps.getFromCacheNoExpiration) getFromCacheNoExpiration = deps.getFromCacheNoExpiration;
   if (deps.saveToCache) saveToCache = deps.saveToCache;
-  if (deps.shouldUpdateCache) shouldUpdateCache = deps.shouldUpdateCache;
-  if (deps.refreshDarkinoSessionIfNeeded) refreshDarkinoSessionIfNeeded = deps.refreshDarkinoSessionIfNeeded;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,52 +199,6 @@ const deduplicateSourcesWithPreference = (sources = []) => {
   return [...byKey.values()];
 };
 
-// ---------------------------------------------------------------------------
-// findDarkiboxEntriesForEpisode  -- paginate Darkibox API to find entries
-// ---------------------------------------------------------------------------
-async function findDarkiboxEntriesForEpisode({ titleId, seasonId, episodeId, perPage = 100, maxPages = 10 }) {
-  // Rafraichir les cookies avant de commencer la pagination
-  try {
-    await refreshDarkinoSessionIfNeeded();
-  } catch (e) {
-    console.warn('Erreur lors du rafraichissement des cookies Darkino:', e.message);
-  }
-  let page = 1;
-  let foundEntries = [];
-  let shouldContinue = true;
-  while (shouldContinue && page <= maxPages) {
-    const url = `/api/v1/liens?perPage=${perPage}&page=${page}&title_id=${titleId}&loader=linksdl&season=${seasonId}&filters=&paginate=preferLengthAware`;
-    try {
-      const resp = await axiosDarkinoRequest({
-        method: 'get',
-        url: url,
-        headers: darkiHeaders
-      });
-      const data = resp.data?.pagination?.data || [];
-      // Cherche les entrees correspondant a l'episode
-      const matching = data.filter(entry =>
-        entry.host && entry.host.id_host === 2 && entry.host.name === 'darkibox' &&
-        (entry.episode_id == episodeId || entry.episode == episodeId || entry.episode_number == episodeId)
-      );
-      if (matching.length > 0) {
-        foundEntries = matching;
-        break;
-      }
-      // Pagination intelligente
-      const nextPage = resp.data?.pagination?.next_page;
-      if (!nextPage) {
-        shouldContinue = false;
-      } else {
-        page = nextPage;
-      }
-    } catch (error) {
-      console.error(`[DARKIBOX] Erreur lors de la recherche des liens (page ${page}) ${buildLogContext({ titleId, seasonId, episodeId })}`, summarizeErrorForLog(error));
-      shouldContinue = false;
-    }
-  }
-  return foundEntries;
-}
-
 // ===========================================================================
 // ROUTES  (mounted at /api, so paths are relative)
 // ===========================================================================
@@ -272,7 +216,6 @@ router.get('/films/download/:id', async (req, res) => {
     const cachedData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey);
     const M3U8_CACHE_EXPIRY = 8 * 60 * 60 * 1000; // 8 hours in milliseconds
 
-    let dataReturned = false;
     if (cachedData && cachedData.sources !== undefined) {
       const now = Date.now();
       // Short-circuit: empty result cached recently -- skip ~20s re-extraction
@@ -342,126 +285,16 @@ router.get('/films/download/:id', async (req, res) => {
       const filteredSources = dedupedSources.filter(source => source.m3u8);
       // Retourner les sources dedupliquees et filtrees
       res.status(200).json({ sources: filteredSources });
-      dataReturned = true;
-      (async () => {
-        try {
-          const shouldUpdate_ = await shouldUpdateCache(DARKINOS_CACHE_DIR, cacheKey);
-          if (!shouldUpdate_) {
-            return;
-          }
-
-          await refreshDarkinoSessionIfNeeded();
-          const response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${id}/download` });
-          let freshSources = response.data.alternative_videos || [];
-          if (response.data.video) {
-            freshSources.unshift(response.data.video);
-          }
-          if (freshSources.length > 0) {
-            const basicSources = freshSources.map(source => ({
-              src: source.src,
-              language: source.language,
-              quality: source.quality,
-              sub: source.sub
-            }));
-            const currentCacheData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey) || {};
-            if (JSON.stringify(basicSources) !== JSON.stringify(currentCacheData.sources)) {
-              await saveToCache(DARKINOS_CACHE_DIR, cacheKey, { sources: basicSources });
-            }
-          }
-        } catch (refreshError) {
-        }
-      })();
       return;
     }
-    // Si pas de cache valide, comportement normal (requete Darkino)
-    const maxRetries = 3;
-    let retryCount = 0;
-    let response;
-    let success = false;
-    await refreshDarkinoSessionIfNeeded();
-    while (!success && retryCount < maxRetries) {
-      try {
-        response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${id}/download` });
-        success = true;
-      } catch (error) {
-        if (error.response?.data?.message === "Il y a eu un probleme. Veuillez reessayer plus tard.") {
-          throw error;
-        }
-
-        // Arreter immediatement sur les erreurs 500/403
-        if (error.response && (error.response.status === 500 || error.response.status === 403)) {
-          throw error;
-        }
-
-        retryCount++;
-        if (retryCount >= maxRetries) {
-          throw error;
-        }
-        if (!error.response) {
-          const delay = Math.min(2000 * Math.pow(1.5, retryCount), 5000) + (Math.random() * 500);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          throw error;
-        }
-      }
-    }
-    let sources = response.data.alternative_videos || [];
-    if (response.data.video) {
-      sources.unshift(response.data.video);
-    }
+    // Hydracker freeze: no upstream fallback. Cache-only.
+    const sources = [];
     const basicSources = sources.map(source => ({
       src: source.src,
       language: source.language,
       quality: source.quality,
       sub: source.sub
     }));
-
-    // --- DARKIBOX ENHANCEMENT START ---
-    if (darkiworld_premium) {
-      try {
-        // 1. Fetch all links for the film
-        const darkiboxLiensResp = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/liens?perPage=100&title_id=${id}&loader=linksdl&season=1&filters=&paginate=preferLengthAware` });
-        const darkiboxEntries = (darkiboxLiensResp.data?.pagination?.data || []).filter(
-          entry => entry.host && entry.host.id_host === 2 && entry.host.name === 'darkibox'
-        );
-        const darkiboxIds = darkiboxEntries.map(entry => entry.id);
-        if (darkiboxIds.length > 0) {
-          // 2. POST to download-premium with all darkibox IDs
-          const darkiboxDownloadResp = await axiosDarkinoRequest({ method: 'post', url: `/api/v1/download-premium/${darkiboxIds.join(',')}` });
-          const darkiboxLinks = (darkiboxDownloadResp.data?.liens || []).filter(l => l.lien && l.lien.includes('darkibox.com'));
-          // 3. For each link, extract m3u8
-          const darkiboxSources = await Promise.all(darkiboxLinks.map(async (lienObj) => {
-            let idMatch = lienObj.lien.match(/(?:\/d\/|\/)([a-z0-9]{12,})/i);
-            let darkiboxId = idMatch ? idMatch[1] : null;
-            let m3u8Url = null;
-            let embedUrl = null;
-            if (darkiboxId) {
-              embedUrl = `https://darkibox.com/embed-${darkiboxId}.html`;
-              const m3u8Result = await extractM3u8Url(embedUrl);
-              m3u8Url = m3u8Result?.url || null;
-            }
-            const meta = darkiboxEntries.find(e => e.id === lienObj.id);
-            return m3u8Url ? {
-              src: embedUrl,
-              m3u8: m3u8Url,
-              language: (meta?.langues_compact && meta.langues_compact.length > 0) ? meta.langues_compact.map(l => l.name).join(', ') : undefined,
-              quality: meta?.qual?.qual,
-              sub: (meta?.subs_compact && meta.subs_compact.length > 0) ? meta.subs_compact.map(s => s.name).join(', ') : undefined,
-              provider: 'darkibox'
-            } : null;
-          }));
-          const validDarkiboxSources = darkiboxSources.filter(Boolean);
-          for (const src of validDarkiboxSources) {
-            if (!basicSources.some(s => s.src === src.src)) {
-              basicSources.push(src);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('[DARKIBOX] Error enhancing darkibox links:', err.message);
-      }
-    }
-    // --- DARKIBOX ENHANCEMENT END ---
 
     // Extract and cache m3u8 URLs
     let sourcesWithM3u8 = await Promise.all(
@@ -563,7 +396,6 @@ router.get('/series/download/:titleId/season/:seasonId/episode/:episodeId', asyn
     const cachedData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey);
     const M3U8_CACHE_EXPIRY = 8 * 60 * 60 * 1000;
 
-    let dataReturned = false;
     if (cachedData && cachedData.sources !== undefined) {
       const now = Date.now();
       // Short-circuit: empty result cached recently -- skip ~20s re-extraction
@@ -627,126 +459,17 @@ router.get('/series/download/:titleId/season/:seasonId/episode/:episodeId', asyn
       const shouldForceLiveRefetch = false;
       if (!shouldForceLiveRefetch) {
         res.status(200).json({ sources: filteredSources });
-        dataReturned = true;
-
-        (async () => {
-          try {
-            if (!shouldRefreshCacheNow) {
-              return;
-            }
-
-            await refreshDarkinoSessionIfNeeded();
-            const response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${titleId}/season/${seasonId}/episode/${episodeId}/download`, headers: darkiHeaders });
-            let freshSources = response.data.alternative_videos || [];
-            if (response.data.video) {
-              freshSources.unshift(response.data.video);
-            }
-            // Filtrer les sources pour l'episode demande
-            freshSources = freshSources.filter(source => {
-              return !source.episode || source.episode.toString() === episodeId.toString();
-            });
-            if (freshSources.length > 0) {
-              const basicSources = freshSources.map(source => ({
-                src: source.src,
-                language: source.language,
-                quality: source.quality,
-                sub: source.sub
-              }));
-
-              const currentCacheData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey) || {};
-              if (JSON.stringify(basicSources) !== JSON.stringify(currentCacheData.sources)) {
-                await saveToCache(DARKINOS_CACHE_DIR, cacheKey, { sources: basicSources });
-              }
-            }
-          } catch (_refreshError) {
-          }
-        })();
         return;
       }
     }
-    // Si pas de cache valide, comportement normal (requete Darkino)
-    const maxRetries = 3;
-    let retryCount = 0;
-    let response;
-    let success = false;
-    await refreshDarkinoSessionIfNeeded();
-    while (!success && retryCount < maxRetries) {
-      try {
-        response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${titleId}/season/${seasonId}/episode/${episodeId}/download`, headers: darkiHeaders });
-        success = true;
-      } catch (error) {
-        if (error.response?.data?.message === "Il y a eu un probleme. Veuillez reessayer plus tard.") {
-          throw error;
-        }
-
-        // Arreter immediatement sur les erreurs 500/403
-        if (error.response && (error.response.status === 500 || error.response.status === 403)) {
-          throw error;
-        }
-
-        retryCount++;
-        if (retryCount >= maxRetries) {
-          throw error;
-        }
-        const delay = Math.min(2000 * Math.pow(2, retryCount), 30000) + (Math.random() * 1000);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-    let sources = response.data.alternative_videos || [];
-    if (response.data.video) {
-      sources.unshift(response.data.video);
-    }
-    // Filtrer les sources pour l'episode demande
-    sources = sources.filter(source => {
-      return !source.episode || source.episode.toString() === episodeId.toString();
-    });
+    // Hydracker freeze: no upstream fallback. Cache-only.
+    const sources = [];
     const basicSources = sources.map(source => ({
       src: source.src,
       language: source.language,
       quality: source.quality,
       sub: source.sub
     }));
-    // --- DARKIBOX ENHANCEMENT START ---
-    if (darkiworld_premium) {
-      try {
-        const darkiboxEntries = await findDarkiboxEntriesForEpisode({ titleId, seasonId, episodeId, perPage: 100, maxPages: 10 });
-        const darkiboxIds = darkiboxEntries.map(entry => entry.id);
-        if (darkiboxIds.length > 0) {
-          const darkiboxDownloadResp = await axiosDarkinoRequest({ method: 'post', url: `/api/v1/download-premium/${darkiboxIds.join(',')}` });
-          const darkiboxLinks = (darkiboxDownloadResp.data?.liens || []).filter(l => l.lien && l.lien.includes('darkibox.com'));
-          const darkiboxSources = await Promise.all(darkiboxLinks.map(async (lienObj) => {
-            let idMatch = lienObj.lien.match(/(?:\/d\/|\/)([a-z0-9]{12,})/i);
-            let darkiboxId = idMatch ? idMatch[1] : null;
-            let m3u8Url = null;
-            let embedUrl = null;
-            if (darkiboxId) {
-              embedUrl = `https://darkibox.com/embed-${darkiboxId}.html`;
-              const m3u8Result = await extractM3u8Url(embedUrl);
-              m3u8Url = m3u8Result?.url || null;
-            }
-            const meta = darkiboxEntries.find(e => e.id === lienObj.id);
-            return m3u8Url ? {
-              src: embedUrl,
-              m3u8: m3u8Url,
-              language: (meta?.langues_compact && meta.langues_compact.length > 0) ? meta.langues_compact.map(l => l.name).join(', ') : undefined,
-              quality: meta?.qual?.qual,
-              sub: (meta?.subs_compact && meta.subs_compact.length > 0) ? meta.subs_compact.map(s => s.name).join(', ') : undefined,
-              provider: 'darkibox'
-            } : null;
-          }));
-          const validDarkiboxSources = darkiboxSources.filter(Boolean);
-          for (const src of validDarkiboxSources) {
-            if (!basicSources.some(s => s.src === src.src)) {
-              basicSources.push(src);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('[DARKIBOX] Error enhancing darkibox links (series):', err.message);
-      }
-    }
-    // --- DARKIBOX ENHANCEMENT END ---
-
     // Extract and cache m3u8 URLs
     let sourcesWithM3u8 = await Promise.all(
       basicSources.map(async (source, sourceIndex) => {
@@ -865,155 +588,24 @@ router.get('/series/download/:titleId/season/:seasonId/episode/:episodeId', asyn
 // ---------------------------------------------------------------------------
 // GET /darkino/download-premium/:id
 // ---------------------------------------------------------------------------
-router.get('/darkino/download-premium/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const response = await axiosDarkinoRequest({ method: 'post', url: `/api/v1/download-premium/${id}` });
-    res.status(response.status).json(response.data);
-  } catch (error) {
-    console.error('Erreur lors de la requete download-premium:', error.response?.status || error.message);
-    if (error.response) {
-      res.status(error.response.status).json({ error: error.response.data || 'Erreur lors de la requete download-premium' });
-    } else {
-      res.status(500).json({ error: 'Erreur lors de la requete download-premium' });
-    }
-  }
+router.get('/darkino/download-premium/:id', async (_req, res) => {
+  // Hydracker freeze (2026-05-15): upstream decode is disabled.
+  res.status(410).json({
+    success: false,
+    error: 'gone',
+    message: 'Decode upstream désactivé. Utilise /api/darkiworld/decode/:id.'
+  });
 });
 
 // ---------------------------------------------------------------------------
-// GET /titles/:id/download  -- download links via title ID
+// GET /titles/:id/download  -- FROZEN: returns 410 Gone
 // ---------------------------------------------------------------------------
-router.get('/titles/:id/download', async (req, res) => {
-  if (DARKINO_MAINTENANCE) {
-    return res.status(200).json({ error: 'Service Darkino temporairement indisponible (maintenance)' });
-  }
-  try {
-    const { id } = req.params;
-
-    // Generate cache key
-    const cacheKey = generateCacheKey(`titles_download_${id}`);
-
-    // Check if results are in cache
-    const cachedData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey);
-    const M3U8_CACHE_EXPIRY = 8 * 60 * 60 * 1000;
-
-    let dataReturned = false;
-    if (cachedData && cachedData.sources !== undefined) {
-      const now = Date.now();
-      const needM3u8Refresh = !cachedData.m3u8Timestamp || (now - cachedData.m3u8Timestamp > M3U8_CACHE_EXPIRY);
-      let sourcesWithM3u8 = cachedData.sourcesWithM3u8 || [];
-
-      if (needM3u8Refresh) {
-        sourcesWithM3u8 = await Promise.all(
-          cachedData.sources.map(async (source) => {
-            const m3u8Result = await extractM3u8Url(source.src);
-            if (m3u8Result) {
-              return {
-                ...source,
-                m3u8: m3u8Result.url,
-                quality: m3u8Result.quality || source.quality
-              };
-            }
-            return { ...source, m3u8: null };
-          })
-        );
-        // Mise a jour du cache avec les URLs m3u8 rafraichies
-        await saveToCache(DARKINOS_CACHE_DIR, cacheKey, {
-          sources: cachedData.sources,
-          sourcesWithM3u8: sourcesWithM3u8,
-          m3u8Timestamp: now
-        });
-      }
-
-      // Deduplication des sources par m3u8
-      const seenM3u8 = new Set();
-      const seenSrc = new Set();
-      const dedupedSources = [];
-      for (const source of sourcesWithM3u8) {
-        const key = source.m3u8 || source.src;
-        if (!key) continue;
-        if (!seenM3u8.has(key)) {
-          seenM3u8.add(key);
-          dedupedSources.push(source);
-        }
-      }
-      const finalSources = [];
-      for (const source of dedupedSources) {
-        if (!seenSrc.has(source.src)) {
-          seenSrc.add(source.src);
-          finalSources.push(source);
-        }
-      }
-      const filteredSources = finalSources.filter(source => source.m3u8 !== null);
-      res.status(200).json({ sources: filteredSources });
-      dataReturned = true;
-      (async () => {
-        try {
-          const shouldUpdate_ = await shouldUpdateCache(DARKINOS_CACHE_DIR, cacheKey);
-          if (!shouldUpdate_) {
-            return;
-          }
-
-          await refreshDarkinoSessionIfNeeded();
-          const response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${id}/download` });
-          let freshSources = response.data.alternative_videos || [];
-          if (response.data.video) {
-            freshSources.unshift(response.data.video);
-          }
-          if (freshSources.length > 0) {
-            const basicSources = freshSources.map(source => ({
-              src: source.src,
-              language: source.language,
-              quality: source.quality,
-              sub: source.sub
-            }));
-            const currentCacheData = await getFromCacheNoExpiration(DARKINOS_CACHE_DIR, cacheKey) || {};
-            if (JSON.stringify(basicSources) !== JSON.stringify(currentCacheData.sources)) {
-              await saveToCache(DARKINOS_CACHE_DIR, cacheKey, { sources: basicSources });
-            }
-          }
-        } catch (refreshError) {
-        }
-      })();
-      return;
-    }
-    // Si pas de cache valide, comportement normal (requete Darkino)
-    const maxRetries = 3;
-    let retryCount = 0;
-    let response;
-    let success = false;
-    await refreshDarkinoSessionIfNeeded();
-    while (!success && retryCount < maxRetries) {
-      try {
-        response = await axiosDarkinoRequest({ method: 'get', url: `/api/v1/titles/${id}/download` });
-        success = true;
-      } catch (error) {
-        if (error.response?.data?.message === "Il y a eu un probleme. Veuillez reessayer plus tard.") {
-          throw error;
-        }
-
-        if (error.response && (error.response.status === 500 || error.response.status === 403)) {
-          throw error;
-        }
-
-        retryCount++;
-        if (retryCount >= maxRetries) {
-          throw error;
-        }
-        if (!error.response) {
-          const delay = Math.min(2000 * Math.pow(1.5, retryCount), 5000) + (Math.random() * 500);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          throw error;
-        }
-      }
-    }
-    // ... existing code (process response.data) ...
-
-  } catch (error) {
-    console.error(`Erreur lors de la recuperation des liens de telechargement:`, error);
-    res.status(500).json({ error: 'Erreur lors de la recuperation des liens de telechargement' });
-  }
+router.get('/titles/:id/download', async (_req, res) => {
+  res.status(410).json({
+    success: false,
+    error: 'gone',
+    message: 'Hydracker /titles/{id}/download désactivé. Utilise /api/darkiworld/download/:type/:id.'
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1059,4 +651,3 @@ router.delete('/series/download/:titleId/season/:seasonId/episode/:episodeId/cac
 // ---------------------------------------------------------------------------
 module.exports = router;
 module.exports.configure = configure;
-module.exports.findDarkiboxEntriesForEpisode = findDarkiboxEntriesForEpisode;

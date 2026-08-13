@@ -45,8 +45,21 @@ const fstreamCookies = {
   'dle_skin': 'VFV25',
   'dle_newpm': '0',
   '__cf_logged_in': '1',
-  'CF_VERIFIED_DEVICE_ae9bb95a6761c08a92f916b7ed7d2c4a985eb220591d1410240412c516f37b0c': '1756239054'
+  'CF_VERIFIED_DEVICE_ae9bb95a6761c08a92f916b7ed7d2c4a985eb220591d1410240412c516f37b0c': '1756239054',
+  // Anti-bot "fsschal": le challenge JS de FStream pose juste ce cookie statique puis recharge.
+  // Sans lui, search.php / episodes_p.php / film_api.php renvoient la page "Verification..." (1466b)
+  // au lieu des donnees. Les fichiers /static/ en sont exempts. Valeur overridable si elle tourne.
+  'fsschal': process.env.FSTREAM_FSSCHAL || '1'
 };
+
+// Construit le header Cookie complet depuis fstreamCookies, pour les requetes axios
+// directes (episodes_p, film_api, static) qui ne passent pas par withOptionalFStreamCookies.
+function buildFStreamCookieHeader() {
+  return Object.entries(fstreamCookies)
+    .filter(([, v]) => v !== '' && v != null)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
 
 let fstreamRequestCounter = 0;
 const MAX_REQUESTS_PER_SESSION = 5;
@@ -231,6 +244,46 @@ function calculateTitleSimilarity(title1, title2) {
   return union === 0 ? 0 : intersection / union;
 }
 
+function normalizeFStreamBaseTitle(value) {
+  return (value || '')
+    .replace(/\s*\(\d{4}\)\s*/g, ' ')
+    .replace(/\s*-\s*Saison\s+\d+.*$/i, '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isFStreamCachedSelectionValid(cachedData, requestedSeason) {
+  const tmdbTitle = cachedData?.tmdb?.title;
+  const bestMatch = cachedData?.search?.bestMatch;
+  if (!tmdbTitle || !bestMatch) return true;
+
+  const requestedSeasonNumber = parseInt(requestedSeason, 10);
+  const cachedSeasonNumber = parseInt(bestMatch.seasonNumber, 10);
+  if (
+    !Number.isNaN(requestedSeasonNumber) &&
+    !Number.isNaN(cachedSeasonNumber) &&
+    cachedSeasonNumber !== requestedSeasonNumber
+  ) {
+    return false;
+  }
+
+  const normalizedTmdbTitle = normalizeFStreamBaseTitle(tmdbTitle);
+  const normalizedMatchTitle = normalizeFStreamBaseTitle(
+    bestMatch.originalTitle || bestMatch.title,
+  );
+  const tmdbTokens = normalizedTmdbTitle.split(' ').filter(Boolean);
+
+  if (tmdbTokens.length === 1) {
+    return normalizedMatchTitle === normalizedTmdbTitle;
+  }
+
+  return true;
+}
+
 // === Search Functions ===
 async function searchFStream(query, page = 1) {
   try {
@@ -312,6 +365,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
     if (!normalizedSerie) return [];
 
     const results = [];
+    const exactResults = [];
+    const normalizedSerieTokens = normalizedSerie.split(' ').filter(Boolean);
     $('div.search-item').each((_, element) => {
       const $el = $(element);
       const rawTitle = $el.find('.search-title').text().trim();
@@ -328,6 +383,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
       const baseTitle = rawTitle.replace(/\s*-\s*Saison\s+\d+.*$/i, '').replace(/\s*\(\d{4}\)\s*$/, '').trim();
       const normalizedBase = normalize(baseTitle);
       if (!normalizedBase) return;
+      const isExactTitle = normalizedBase === normalizedSerie;
+      if (normalizedSerieTokens.length === 1 && !isExactTitle) return;
       if (!normalizedBase.includes(normalizedSerie) && !normalizedSerie.includes(normalizedBase)) return;
 
       const titleYearMatch = rawTitle.match(/\((\d{4})\)/);
@@ -340,7 +397,8 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
         ? link
         : `${FSTREAM_BASE_URL}${link.startsWith('/') ? '' : '/'}${link}`;
 
-      results.push({
+      const target = isExactTitle ? exactResults : results;
+      target.push({
         title: cleanTitle,
         originalTitle: rawTitle,
         link: normalizedLink,
@@ -349,11 +407,67 @@ async function fetchFStreamSeasonSearchResults(tmdbId, serieTitle) {
       });
     });
 
-    return results;
+    return exactResults.length > 0 ? exactResults : results;
   } catch (error) {
     console.error(`[FSTREAM TV] Erreur lors de la recuperation des saisons pour ${tmdbId}: ${error.message}`);
     return [];
   }
+}
+
+// get_seasons.php (ajax related-seasons de DLE) est toujours vivant cote upstream,
+// contrairement a l'hypothese de fetchFStreamSeasonSearchResults. serie_tag = s-<tmdbId>
+// (l'id TMDB brut), news_id = page id d'une saison deja trouvee via search. Retourne
+// TOUTES les saisons de la serie (id, title, full_url), y compris celles que search.php
+// ne liste pas (ex: Mayans MC -> search ne voit que S4/S5, get_seasons rend S1/S2/S3/S5).
+// Fallback quand la saison demandee est absente des resultats search mais existe cote FStream.
+async function fetchFStreamSeasonsAjax(tmdbId, newsId, baseUrl) {
+  if (!tmdbId || !newsId) return [];
+  const apiUrl = `${baseUrl}/engine/ajax/get_seasons.php?serie_tag=s-${tmdbId}&news_id=${newsId}`;
+
+  const proxies = getShuffledAllProxies();
+  const maxAttempts = Math.min(proxies.length, 3);
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const entry = proxies[i];
+    const agents = getAgentForProxy(entry);
+    try {
+      const response = await axios({
+        method: 'get',
+        url: apiUrl,
+        timeout: 8000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Referer': `${baseUrl}/`,
+          'Accept': 'application/json, text/javascript, */*',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Cookie': buildFStreamCookieHeader()
+        },
+        ...(agents ? { httpAgent: agents.httpAgent || agents, httpsAgent: agents.httpsAgent || agents, proxy: false } : {})
+      });
+
+      if (response.status === 429) continue;
+      if (response.status !== 200 || !response.data) return [];
+
+      const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+      if (!Array.isArray(data)) return [];
+
+      return data.map(item => {
+        const seasonMatch = (item.title || '').match(/Saison\s+(\d+)/i);
+        const seasonNumber = seasonMatch ? parseInt(seasonMatch[1], 10) : null;
+        const rawUrl = item.full_url || '';
+        const link = !rawUrl ? null
+          : rawUrl.startsWith('http') ? rawUrl
+          : `${baseUrl}/${rawUrl.replace(/^\//, '')}`;
+        return { title: item.title || `Saison ${seasonNumber}`, originalTitle: item.title || '', link, seasonNumber, year: null };
+      }).filter(r => r.link && r.seasonNumber);
+    } catch (error) {
+      if (error.response?.status === 429) continue;
+      console.error(`[FStream] Erreur get_seasons.php (proxy ${entry.type} #${i}): ${error.message}`);
+      continue;
+    }
+  }
+
+  return [];
 }
 
 // === Scraping Functions ===
@@ -653,6 +767,116 @@ function getAgentForProxy(entry) {
   return getDarkinoHttpProxyAgent(entry.proxy);
 }
 
+// Parse le payload episodes FStream (shape commune {vf,vostfr,vo,info}) en map normalisee.
+// Partage entre la source statique (<base>/static/series) et l'API dynamique (episodes_p.php).
+function parseEpisodesPayload(data) {
+  if (!data || typeof data !== 'object') return null;
+
+  const episodes = {};
+  const langMap = { vf: 'VF', vostfr: 'VOSTFR', vo: 'VOENG' };
+
+  for (const [langKey, langLabel] of Object.entries(langMap)) {
+    const langData = data[langKey];
+    if (!langData || typeof langData !== 'object') continue;
+
+    for (const [epNum, providers] of Object.entries(langData)) {
+      const epNumber = parseInt(epNum);
+      if (isNaN(epNumber) || epNumber === 0) continue;
+
+      if (!episodes[epNumber]) {
+        episodes[epNumber] = {
+          number: epNumber,
+          title: `Episode ${epNumber}`,
+          languages: { VF: [], VOSTFR: [], VOENG: [], Default: [] }
+        };
+      }
+
+      for (const [provider, url] of Object.entries(providers)) {
+        if (!url || typeof url !== 'string' || !url.startsWith('http')) continue;
+        let displayName = provider;
+        if (provider === 'premium') displayName = 'Premium';
+        else if (provider === 'vidzy') displayName = 'Vidzy';
+        else if (provider === 'uqload') displayName = 'Uqload';
+        else if (provider === 'netu') displayName = 'Netu';
+        else if (provider === 'voe') displayName = 'Voe';
+        else displayName = provider.charAt(0).toUpperCase() + provider.slice(1);
+
+        const exists = episodes[epNumber].languages[langLabel].some(p => p.url === url);
+        if (!exists) {
+          episodes[epNumber].languages[langLabel].push({ url, type: 'embed', quality: 'HD', player: displayName });
+        }
+      }
+    }
+  }
+
+  // Enrichir avec les infos (titres, synopsis) si disponibles
+  if (data.info && typeof data.info === 'object') {
+    for (const [epNum, info] of Object.entries(data.info)) {
+      const epNumber = parseInt(epNum);
+      if (episodes[epNumber] && info.title) {
+        episodes[epNumber].title = info.title;
+      }
+    }
+  }
+
+  if (Object.keys(episodes).length > 0) return episodes;
+  return null;
+}
+
+// Source statique prioritaire: <base>/static/series/<id>.js (JSON fige, frais, inclut premium).
+// Meme domaine que le lien de recherche (base url), pas un host distinct.
+async function fetchEpisodesFromStaticJs(pageUrl) {
+  const pageId = extractPageIdFromUrl(pageUrl);
+  if (!pageId) return null;
+
+  const baseUrl = extractBaseUrlFromLink(pageUrl);
+  const apiUrl = `${baseUrl}/static/series/${pageId}.js?v=${Date.now()}`;
+
+  const proxies = getShuffledAllProxies();
+  const maxAttempts = Math.min(proxies.length, 3);
+  let lastError = null;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const entry = proxies[i];
+    const agents = getAgentForProxy(entry);
+
+    try {
+      const response = await axios({
+        method: 'get',
+        url: apiUrl,
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Referer': pageUrl,
+          'Accept': 'application/json, text/javascript, */*',
+          'Cookie': buildFStreamCookieHeader()
+        },
+        ...(agents ? { httpAgent: agents.httpAgent || agents, httpsAgent: agents.httpsAgent || agents, proxy: false } : {})
+      });
+
+      if (response.status === 429) {
+        console.log(`[FStream] static series.js: 429 avec proxy ${entry.type} #${i}, retry...`);
+        continue;
+      }
+      if (response.status !== 200 || !response.data) return null;
+
+      const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+      return parseEpisodesPayload(data);
+    } catch (error) {
+      lastError = error;
+      if (error.response?.status === 429) {
+        console.log(`[FStream] static series.js: 429 avec proxy ${entry.type} #${i}, retry...`);
+        continue;
+      }
+      console.error(`[FStream] Erreur static series.js (proxy ${entry.type} #${i}): ${error.message}`);
+      continue;
+    }
+  }
+
+  if (lastError) console.error(`[FStream] static series.js: tous les proxies ont echoue. Derniere erreur: ${lastError.message}`);
+  return null;
+}
+
 async function fetchEpisodesFromApi(pageUrl) {
   const pageId = extractPageIdFromUrl(pageUrl);
   if (!pageId) return null;
@@ -676,7 +900,8 @@ async function fetchEpisodesFromApi(pageUrl) {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
           'Referer': pageUrl,
-          'Accept': 'application/json, text/plain, */*'
+          'Accept': 'application/json, text/plain, */*',
+          'Cookie': buildFStreamCookieHeader()
         },
         ...(agents ? { httpAgent: agents.httpAgent || agents, httpsAgent: agents.httpsAgent || agents, proxy: false } : {})
       });
@@ -688,59 +913,7 @@ async function fetchEpisodesFromApi(pageUrl) {
       if (response.status !== 200 || !response.data) return null;
 
       const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-      if (!data || typeof data !== 'object') return null;
-
-    const episodes = {};
-    const langMap = { vf: 'VF', vostfr: 'VOSTFR', vo: 'VOENG' };
-
-    for (const [langKey, langLabel] of Object.entries(langMap)) {
-      const langData = data[langKey];
-      if (!langData || typeof langData !== 'object') continue;
-
-      for (const [epNum, providers] of Object.entries(langData)) {
-        const epNumber = parseInt(epNum);
-        if (isNaN(epNumber) || epNumber === 0) continue;
-
-        if (!episodes[epNumber]) {
-          episodes[epNumber] = {
-            number: epNumber,
-            title: `Episode ${epNumber}`,
-            languages: { VF: [], VOSTFR: [], VOENG: [], Default: [] }
-          };
-        }
-
-        for (const [provider, url] of Object.entries(providers)) {
-          if (!url || typeof url !== 'string' || !url.startsWith('http')) continue;
-          let displayName = provider;
-          if (provider === 'premium') displayName = 'Premium';
-          else if (provider === 'vidzy') displayName = 'Vidzy';
-          else if (provider === 'uqload') displayName = 'Uqload';
-          else if (provider === 'netu') displayName = 'Netu';
-          else if (provider === 'voe') displayName = 'Voe';
-          else displayName = provider.charAt(0).toUpperCase() + provider.slice(1);
-
-          const exists = episodes[epNumber].languages[langLabel].some(p => p.url === url);
-          if (!exists) {
-            episodes[epNumber].languages[langLabel].push({ url, type: 'embed', quality: 'HD', player: displayName });
-          }
-        }
-      }
-    }
-
-    // Enrichir avec les infos (titres, synopsis) si disponibles
-    if (data.info && typeof data.info === 'object') {
-      for (const [epNum, info] of Object.entries(data.info)) {
-        const epNumber = parseInt(epNum);
-        if (episodes[epNumber] && info.title) {
-          episodes[epNumber].title = info.title;
-        }
-      }
-    }
-
-      if (Object.keys(episodes).length > 0) {
-        return episodes;
-      }
-      return null;
+      return parseEpisodesPayload(data);
     } catch (error) {
       lastError = error;
       if (error.response?.status === 429) {
@@ -779,7 +952,8 @@ async function fetchMoviePlayersFromApi(pageUrl) {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
           'Referer': pageUrl,
-          'Accept': 'application/json, text/plain, */*'
+          'Accept': 'application/json, text/plain, */*',
+          'Cookie': buildFStreamCookieHeader()
         },
         ...(agents ? { httpAgent: agents.httpAgent || agents, httpsAgent: agents.httpsAgent || agents, proxy: false } : {})
       });
@@ -844,8 +1018,14 @@ async function fetchMoviePlayersFromApi(pageUrl) {
 // === High-level wrappers: API-first, HTML fallback ===
 // Bypass le fetch HTML (souvent 429) en appelant l'API directe d'abord
 async function getSeriesPlayersForUrl(pageUrl) {
-  // 1. API directe (pas de login, pool proxy combine)
-  const apiEpisodes = await fetchEpisodesFromApi(pageUrl);
+  // 1. Source statique <base>/static/series/<id>.js (prioritaire: fraiche, premium, inclut tous les eps)
+  let apiEpisodes = await fetchEpisodesFromStaticJs(pageUrl);
+
+  // 2. Fallback: API dynamique episodes_p.php (si la statique 404/echoue ou host a tourne)
+  if (!apiEpisodes || Object.keys(apiEpisodes).length === 0) {
+    apiEpisodes = await fetchEpisodesFromApi(pageUrl);
+  }
+
   if (apiEpisodes && Object.keys(apiEpisodes).length > 0) {
     const organizedPlayers = { VF: [], VOSTFR: [], VOENG: [], Default: [] };
     let totalPlayers = 0;
@@ -860,8 +1040,8 @@ async function getSeriesPlayersForUrl(pageUrl) {
     return { organized: organizedPlayers, episodes: apiEpisodes, total: totalPlayers, fstreamReleaseDate: null, fromApi: true };
   }
 
-  // 2. Fallback: fetch HTML
-  console.log(`[FStream] getSeriesPlayersForUrl: API echouee, fallback HTML pour ${pageUrl}`);
+  // 3. Fallback: fetch HTML (scrape direct de la page french-stream.one)
+  console.log(`[FStream] getSeriesPlayersForUrl: sources JSON echouees, fallback HTML pour ${pageUrl}`);
   const contentResponse = await axiosFStreamRequest({ method: 'get', url: pageUrl });
   if (contentResponse.status !== 200) return { organized: { VF: [], VOSTFR: [], VOENG: [], Default: [] }, episodes: {}, total: 0, fstreamReleaseDate: null };
   return await extractFStreamPlayers(contentResponse.data, true, pageUrl);
@@ -1561,7 +1741,8 @@ router.get('/tv/:id/season/:season', async (req, res) => {
 
   try {
     const cachedData = await getFStreamFromCache(cacheKey);
-    if (cachedData) {
+    const cachedSelectionIsValid = isFStreamCachedSelectionValid(cachedData, season);
+    if (cachedData && cachedSelectionIsValid) {
       res.status(200).json(cachedData);
 
       // Background update
@@ -1693,6 +1874,16 @@ router.get('/tv/:id/season/:season', async (req, res) => {
               }
             }
 
+            // Fallback get_seasons.php: search ne liste pas toujours toutes les saisons.
+            if (!bestResult) {
+              const newsIdSource = filteredResults.find(r => extractPageIdFromUrl(r.link));
+              if (newsIdSource) {
+                const ajaxSeasons = await fetchFStreamSeasonsAjax(id, extractPageIdFromUrl(newsIdSource.link), extractBaseUrlFromLink(newsIdSource.link));
+                const ajaxMatch = ajaxSeasons.find(r => r.seasonNumber === requestedSeason);
+                if (ajaxMatch) bestResult = ajaxMatch;
+              }
+            }
+
             if (!bestResult) {
               // Background update: ne pas écraser le cache avec une erreur
               return;
@@ -1728,6 +1919,9 @@ router.get('/tv/:id/season/:season', async (req, res) => {
       });
 
       return;
+    }
+    if (cachedData && !cachedSelectionIsValid) {
+      console.warn(`[FSTREAM TV] Cache ignore: fiche incompatible avec le titre TMDB pour ${id} S${season}`);
     }
 
     // No cache
@@ -1821,6 +2015,20 @@ router.get('/tv/:id/season/:season', async (req, res) => {
           }
         } catch (e) {
           console.log(`[FSTREAM TV] Erreur fallback sans numero de saison: ${e.message}`);
+        }
+      }
+
+      // Fallback get_seasons.php: search.php ne liste pas toujours toutes les saisons.
+      // On a au moins une saison trouvee -> son page id sert de news_id, serie_tag = s-<tmdbId>.
+      if (!bestResult) {
+        const newsIdSource = filteredResults.find(r => extractPageIdFromUrl(r.link));
+        if (newsIdSource) {
+          const ajaxSeasons = await fetchFStreamSeasonsAjax(id, extractPageIdFromUrl(newsIdSource.link), extractBaseUrlFromLink(newsIdSource.link));
+          const ajaxMatch = ajaxSeasons.find(r => r.seasonNumber === requestedSeason);
+          if (ajaxMatch) {
+            bestResult = ajaxMatch;
+            console.log(`[FSTREAM TV] Fallback get_seasons.php reussi: saison ${requestedSeason} pour "${tmdbDetails.title}"`);
+          }
         }
       }
 

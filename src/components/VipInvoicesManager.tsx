@@ -271,7 +271,7 @@ const VipInvoicesManager: React.FC = () => {
 
           <div className="grid gap-4 xl:grid-cols-[1fr_auto]">
             <div className="flex items-center gap-3 rounded-2xl border border-white/8 bg-black/20 px-4 py-3">
-              <Search className="h-4 w-4 text-white/35" />
+          <Search className="h-4 w-4 text-white opacity-[0.35]" />
               <input
                 type="text"
                 value={search}

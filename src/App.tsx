@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, lazy } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigationType, useNavigate, matchPath } from 'react-router-dom';
 import { Toaster } from './components/ui/sonner';
 import { TooltipProvider } from './components/ui/tooltip';
@@ -15,20 +15,19 @@ import { TurnstileProvider } from './context/TurnstileContext';
 import { LightModeProvider, useLightMode } from './context/LightModeContext';
 
 import NotFound from './pages/NotFound';
-import 'video.js/dist/video-js.css';
-import './styles/videojs-custom.css';
+// NOTE perf : les imports globaux de video.js/dist/video-js.css et videojs-custom.css
+// ont été supprimés — VideoJS/VideoJSPlayer ne sont montés nulle part et ces composants
+// importent déjà leur propre CSS s'ils sont réactivés un jour.
 import axios from 'axios';
 import Footer from './components/Footer';
-import CreateAccount from './pages/CreateAccount';
-import LoginBip39 from './pages/LoginBip39';
 import { AlertService } from './services/alertService';
 import NotificationToast from './components/NotificationToast';
 import { NotificationData } from './types/alerts';
 import RedirectPopup from './components/RedirectPopup';
+import { SITE_URL } from './config/runtime';
+import RequireUsernameChange from './components/RequireUsernameChange';
 import { TopProgressBar } from './components/TopProgressBar';
 import SmoothScroll from './components/SmoothScroll';
-import AprilFoolsAdminPage from './pages/AprilFoolsAdminPage';
-import ProfileSelection from './pages/ProfileSelection';
 import { ROUTES, type RouteEntry } from './routing/registry';
 import { DelayedSuspense } from './components/DelayedSuspense';
 import { RouteProgressBar } from './components/RouteProgressBar';
@@ -40,7 +39,6 @@ import { isSyncableStorageKey, SYNC_OUTBOX_STORAGE_KEY } from './utils/syncStora
 import i18n, { detectInitialLanguage } from './i18n';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
-import IntroAnimation from './components/IntroAnimation';
 import { IntroProvider, useIntro } from './context/IntroContext';
 import { APRIL_FOOLS_ADMIN_PATH, isAprilFoolsAdminEnabled } from './utils/aprilFools';
 import {
@@ -250,16 +248,22 @@ const syncHistoryScrollRestoration = () => {
   };
 };
 
-const resetNestedScrollableContainers = () => {
+// Retourne le nombre d'éléments effectivement remis à zéro : permet aux appelants
+// de sauter les passes suivantes quand rien n'était scrollé (perf — évite jusqu'à
+// 3 scans complets du DOM par navigation)
+const resetNestedScrollableContainers = (): number => {
   const scrollableElements = document.querySelectorAll<HTMLElement>(
     '[data-scroll="true"], [data-radix-scroll-area-viewport], .overflow-y-auto, .overflow-y-scroll, .overflow-auto, .overflow-scroll'
   );
 
+  let resetCount = 0;
   scrollableElements.forEach((element) => {
     if (element.scrollTop !== 0) {
       element.scrollTop = 0;
+      resetCount++;
     }
   });
+  return resetCount;
 };
 
 const forceViewportTop = () => {
@@ -358,15 +362,6 @@ const ScrollToTop = () => {
       }
     };
 
-    const scrollToTop = (mode: 'smooth' | 'instant') => {
-      try {
-        scrollViewportToTop(mode);
-        resetNestedScrollableContainers();
-      } catch (error) {
-        console.warn('ScrollToTop: Error during scroll operation', error);
-      }
-    };
-
     const shouldAnimate = shouldAnimateScrollToTop();
 
     window.addEventListener('wheel', handleUserInteraction, { passive: true });
@@ -378,18 +373,34 @@ const ScrollToTop = () => {
     frameId = requestAnimationFrame(() => {
       if (cancelled) return;
 
-      scrollToTop(shouldAnimate ? 'smooth' : 'instant');
+      // Perf : on ne répète les scans DOM que si la 1ère passe a trouvé des
+      // conteneurs réellement scrollés (un conteneur fraîchement monté est à 0)
+      let needsFollowUpReset = false;
+
+      const scrollToTopTracked = (mode: 'smooth' | 'instant') => {
+        try {
+          scrollViewportToTop(mode);
+          needsFollowUpReset = resetNestedScrollableContainers() > 0;
+        } catch (error) {
+          console.warn('ScrollToTop: Error during scroll operation', error);
+        }
+      };
+
+      scrollToTopTracked(shouldAnimate ? 'smooth' : 'instant');
 
       nestedFrameId = requestAnimationFrame(() => {
-        if (cancelled || userInteracted) return;
+        if (cancelled || userInteracted || !needsFollowUpReset) return;
         resetNestedScrollableContainers();
       });
 
       if (!shouldAnimate) {
         settleTimeout = window.setTimeout(() => {
           if (cancelled || userInteracted) return;
-          scrollToTop('instant');
-          resetNestedScrollableContainers();
+          if (needsFollowUpReset) {
+            scrollToTopTracked('instant');
+          } else {
+            scrollViewportToTop('instant');
+          }
         }, 120);
       }
     });
@@ -467,6 +478,16 @@ const PrivateRoute = ({ children }: { children: React.ReactNode }) => {
   const isAuthenticated = isDiscordAuth || isGoogleAuth || isBip39Auth || isVipAuth || isVipUser;
   return isAuthenticated ? children : <Navigate to="/login" />;
 };
+
+// Pages secondaires lazy-ifiées (perf) : elles étaient importées eagerly et ajoutaient
+// ~80 Ko de source au chunk d'entrée payé par tous les visiteurs. Déclarées au niveau
+// module pour garder une identité stable entre les renders.
+const CreateAccountLazy = lazy(() => import('./pages/CreateAccount'));
+const LoginBip39Lazy = lazy(() => import('./pages/LoginBip39'));
+const ProfileSelectionLazy = lazy(() => import('./pages/ProfileSelection'));
+const AprilFoolsAdminPageLazy = lazy(() => import('./pages/AprilFoolsAdminPage'));
+// IntroAnimation (~38 Ko) est opt-in et off par défaut : chunk séparé (perf)
+const IntroAnimationLazy = lazy(() => import('./components/IntroAnimation'));
 
 // Cache module-level des composants Lazy par path. Sans ça, chaque appel à
 // renderRouteEntry (ROUTES.map à chaque render d'App) créerait une nouvelle
@@ -602,7 +623,16 @@ const PersistenceManager = () => {
       }
     };
 
-    const handleAuthChanged = () => handleStorageChange(null);
+    const handleAuthChanged = () => {
+      // Re-arm the sync gate while ProfileContext.loadProfiles reloads the new
+      // account's profiles + data. Without this, the ~100-500ms window before
+      // the delayed loadProfiles fires lets setItem writes leak to the new
+      // backend with the previous account's stale selected_profile_id → the
+      // backend returns 404 PROFILE_NOT_FOUND or, worse, writes against the
+      // wrong profile if the id collides.
+      isProfileDataLoadingRef.current = true;
+      handleStorageChange(null);
+    };
 
     // Initialize current user info
     currentUserInfo.current = getUserInfo();
@@ -617,7 +647,9 @@ const PersistenceManager = () => {
       window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('auth_changed', handleAuthChanged);
     };
-  }, [isWatchRoute]); // Add isWatchRoute as dependency
+    // Perf : ce corps n'utilise pas isWatchRoute — l'ancienne dépendance [isWatchRoute]
+    // désabonnait/réabonnait les listeners à chaque transition watch <-> reste du site
+  }, []);
 
   // Delta-sync: capture and buffer granular localStorage changes
   useEffect(() => {
@@ -986,8 +1018,22 @@ const PersistenceManager = () => {
         const delta = computeObjectPatch(oldVal, newVal);
         if (delta) {
           const existing = progressOpsMapRef.current.get(key) || { delta: { set: {}, remove: [] as string[] } };
-          existing.delta.set = { ...existing.delta.set, ...delta.set };
-          existing.delta.remove = Array.from(new Set([...(existing.delta.remove || []), ...delta.remove]));
+          const newSet = delta.set || {};
+          const newRemove = Array.isArray(delta.remove) ? delta.remove : [];
+          // Newer ops in this delta win over earlier merged ops queued for
+          // the same key. Without this reconciliation, a remove followed by
+          // a set (or vice versa) within the 10s flush window produced a
+          // merged objPatch with BOTH `set.X` and `remove[X]`; the backend
+          // applies sets first then removes, so `remove` always won and the
+          // user's most recent intent (re-set) was silently dropped.
+          existing.delta.set = { ...existing.delta.set, ...newSet };
+          existing.delta.remove = (existing.delta.remove || []).filter(
+            (entryKey: string) => !Object.prototype.hasOwnProperty.call(newSet, entryKey)
+          );
+          for (const entryKey of newRemove) {
+            delete existing.delta.set[entryKey];
+          }
+          existing.delta.remove = Array.from(new Set([...existing.delta.remove, ...newRemove]));
           progressOpsMapRef.current.set(key, existing);
         } else {
           // If cannot diff, fallback to set
@@ -1310,6 +1356,16 @@ const PersistenceManager = () => {
       // older un-replayed ops every cycle. A hard cap on op count prevents
       // unbounded growth across many failed cycles; oldest ops are dropped
       // first since newer ops reflect later state and ops are idempotent.
+      // Drop ops whose keys are no longer in the syncable allowlist. Legacy
+      // outboxes may carry keys removed for security (e.g. `is_vip` per audit
+      // P0); leaving them in causes the next replay to 400 → permanent drop
+      // of the entire outbox, including the legitimate ops we just merged.
+      const isValidSyncOp = (op: unknown): op is Record<string, unknown> & { key: string } => {
+        if (!op || typeof op !== 'object') return false;
+        const candidateKey = (op as { key?: unknown }).key;
+        return typeof candidateKey === 'string' && isSyncableStorageKey(candidateKey);
+      };
+
       try {
         const MAX_OUTBOX_OPS = 10000;
         let mergedOps: Array<Record<string, unknown>> = pending;
@@ -1326,16 +1382,24 @@ const PersistenceManager = () => {
                 && parsed.profileId === userInfo.profileId
                 && Array.isArray(parsed.ops)
                 && parsed.ops.length > 0) {
+              const existingOps = (parsed.ops as unknown[]).filter(isValidSyncOp);
               mergedOps = [
-                ...(parsed.ops as Array<Record<string, unknown>>),
+                ...existingOps,
                 ...pending
               ];
             }
           }
         } catch { /* noop */ }
 
+        mergedOps = mergedOps.filter(isValidSyncOp);
+
         if (mergedOps.length > MAX_OUTBOX_OPS) {
           mergedOps = mergedOps.slice(mergedOps.length - MAX_OUTBOX_OPS);
+        }
+
+        if (mergedOps.length === 0) {
+          try { localStorage.removeItem(SYNC_OUTBOX_STORAGE_KEY); } catch { /* noop */ }
+          return;
         }
 
         const outboxPayload = {
@@ -1398,7 +1462,11 @@ const PersistenceManager = () => {
       Storage.prototype.removeItem = originalRemoveItem;
       Storage.prototype.clear = originalClear;
     };
-  }, [isWatchRoute]); // Add isWatchRoute as dependency
+    // Perf : ce corps n'utilise pas isWatchRoute — l'ancienne dépendance [isWatchRoute]
+    // refaisait à CHAQUE transition watch <-> reste du site : scan complet du localStorage,
+    // re-patch de Storage.prototype, recréation du BroadcastChannel et des intervals.
+    // Monté une seule fois désormais.
+  }, []);
 
   // Determine user type, ID, and profile ID (only oauth and bip39 users can sync)
   const getUserInfo = () => {
@@ -1628,7 +1696,11 @@ const ProfileGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   // If no profiles exist or no profile is selected, show profile selection
   if (profiles.length === 0 || !currentProfile) {
-    return <ProfileSelection />;
+    return (
+      <Suspense fallback={null}>
+        <ProfileSelectionLazy />
+      </Suspense>
+    );
   }
 
   // User has selected a profile, show the app
@@ -1742,24 +1814,45 @@ const AppWithIntro: React.FC = () => {
     });
   }, []);
 
-  // Idle prefetch (Milestone 6): preload high-traffic route chunks shortly
-  // after mount via requestIdleCallback (setTimeout fallback for Safari/FF).
+  // Idle prefetch (Milestone 6): preload high-traffic route chunks.
+  // Perf : attend window.load + un VRAI idle (pas de { timeout } forcé — l'ancien
+  // timeout de 3s tirait en plein burst de chargement de la Home sur machines lentes),
+  // et respecte Data Saver.
   useEffect(() => {
     const IDLE_PREFETCH = ['/movies', '/tv-shows', '/anime', '/search'];
-    // @ts-expect-error - requestIdleCallback not in all TS DOM lib versions
-    const ric = window.requestIdleCallback || ((cb: () => void) => setTimeout(cb, 1500));
-    ric(() => {
-      for (const path of IDLE_PREFETCH) {
-        const entry = ROUTES.find(r => matchPath(r.path, path));
-        entry?.loader({ silent: true }).catch(() => {/* swallow — best-effort prefetch */});
-      }
-    }, { timeout: 3000 });
+    if ((navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData === true) {
+      return;
+    }
+
+    const prefetch = () => {
+      const ric: (cb: () => void) => void =
+        (window as Window & { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+          ? (cb) => (window as unknown as { requestIdleCallback: (cb: () => void) => number }).requestIdleCallback(cb)
+          : (cb) => { setTimeout(cb, 8000); };
+      ric(() => {
+        for (const path of IDLE_PREFETCH) {
+          const entry = ROUTES.find(r => matchPath(r.path, path));
+          entry?.loader({ silent: true }).catch(() => {/* swallow — best-effort prefetch */});
+        }
+      });
+    };
+
+    if (document.readyState === 'complete') {
+      prefetch();
+      return;
+    }
+    window.addEventListener('load', prefetch, { once: true });
+    return () => window.removeEventListener('load', prefetch);
   }, []);
 
   return (
     <div className="min-h-screen bg-black text-white relative overflow-hidden">
       {/* Intro overlay — le site charge derrière */}
-      {showIntro && <IntroAnimation onAnimationComplete={completeIntro} />}
+      {showIntro && (
+        <Suspense fallback={null}>
+          <IntroAnimationLazy onAnimationComplete={completeIntro} />
+        </Suspense>
+      )}
       {/* Global styles for profile pages */}
       <style>
         {`
@@ -1790,17 +1883,17 @@ const AppWithIntro: React.FC = () => {
             {/* Eager — landing page, kept in main bundle */}
             <Route path="/" element={<Home />} />
 
-            {/* Routes spéciales avec props ou logique conditionnelle */}
-            <Route path="/login-bip39" element={<LoginBip39 />} />
-            <Route path="/create-account" element={<CreateAccount />} />
-            <Route path="/link-bip39" element={<LoginBip39 mode="link" />} />
-            <Route path="/link-bip39/create" element={<CreateAccount mode="link" />} />
+            {/* Routes spéciales avec props ou logique conditionnelle — lazy (perf) */}
+            <Route path="/login-bip39" element={<DelayedSuspense fallback={<RouteProgressBar />}><LoginBip39Lazy /></DelayedSuspense>} />
+            <Route path="/create-account" element={<DelayedSuspense fallback={<RouteProgressBar />}><CreateAccountLazy /></DelayedSuspense>} />
+            <Route path="/link-bip39" element={<DelayedSuspense fallback={<RouteProgressBar />}><LoginBip39Lazy mode="link" /></DelayedSuspense>} />
+            <Route path="/link-bip39/create" element={<DelayedSuspense fallback={<RouteProgressBar />}><CreateAccountLazy mode="link" /></DelayedSuspense>} />
             <Route path="/terms" element={<Navigate to="/terms-of-service" replace />} />
-            <Route path="/profile-selection" element={<ProfileSelection />} />
+            <Route path="/profile-selection" element={<DelayedSuspense fallback={<RouteProgressBar />}><ProfileSelectionLazy /></DelayedSuspense>} />
             <Route
               path={APRIL_FOOLS_ADMIN_PATH}
               element={isAprilFoolsAdminRouteEnabled
-                ? <AprilFoolsAdminPage />
+                ? <DelayedSuspense fallback={<RouteProgressBar />}><AprilFoolsAdminPageLazy /></DelayedSuspense>
                 : <Navigate to="/" replace />}
             />
 
@@ -1838,7 +1931,7 @@ const EmbedBlockPage = () => (
         {i18n.t('embed.message')}
       </p>
       <a
-        href="https://movix.tax"
+        href={SITE_URL}
         target="_blank"
         rel="noopener noreferrer"
         className="mt-2 inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition sm:py-3 sm:px-6 lg:py-4 lg:px-8"
@@ -1920,6 +2013,7 @@ function App() {
                       <TopProgressBar />
                       <Toaster position="bottom-right" richColors />
                       <DnsBlockBanner />
+                      <RequireUsernameChange />
                     </IntroProvider>
                   </TurnstileProvider>
                 </ProfileProvider>

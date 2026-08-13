@@ -18,9 +18,27 @@ const CHANGE_EVENT = 'movix-source-priority-changed';
  * "append aux built-ins" à une sémantique "replace les built-ins". Le
  * migrator préfixe les built-ins à la liste utilisateur pour préserver
  * le comportement effectif des users qui avaient des patterns perso.
+ *
+ * **v2 → v3** (2026-05-25) : ordre par défaut des hosters Films/Séries
+ * passe `vidzy` avant `uqload` (fstream auto-sélection prio vidzy/VF
+ * au lieu de uqload/VOSTFR). Migration n'écrase l'ordre stocké QUE si
+ * l'ordre des built-ins matche l'ancien default (= user n'a pas reordré).
+ * Les `custom_*` sont préservés à leur position relative.
  */
-const SCHEMA_VERSION = 2 as const;
-type SchemaVersion = 1 | 2;
+const SCHEMA_VERSION = 3 as const;
+type LegacySourcePriorityPrefs<V extends 1 | 2> = Omit<SourcePriorityPrefs, 'version'> & {
+  version: V;
+};
+type PersistedSourcePriorityPrefs = SourcePriorityPrefs
+  | LegacySourcePriorityPrefs<1>
+  | LegacySourcePriorityPrefs<2>;
+
+/** Ancien ordre built-in (pré-v3). Sert au comparateur du migrator v2→v3. */
+const V2_DEFAULT_BUILTIN_HOSTER_ORDER: readonly string[] = [
+  'voe', 'vidmoly', 'uqload', 'sibnet', 'doodstream',
+  'seekstreaming', 'smoothpre', 'minochinos', 'vidzy', 'darkibox',
+  'supervideo', 'dropload', 'oneupload', 'fsvid',
+];
 
 /**
  * Ordre par défaut des sources top-level pour Films/Séries, reflétant la priorité
@@ -39,15 +57,15 @@ type SchemaVersion = 1 | 2;
  * Les utilisateurs qui préfèrent l'ancien ordre TV peuvent le recomposer
  * manuellement via Settings → Priorité des sources.
  *
- * Les ids `viper`, `vox`, `rivestream_hls`, `bravo` sont présents mais
+ * Les ids `viper`, `vox`, `kisskh`, `rivestream_hls`, `bravo` sont présents mais
  * n'ont de sens que pour certaines pages (film vs série vs anime) — ils
  * resteront simplement indisponibles (hasData=false) sur les pages qui ne
  * les fournissent pas.
  */
 const DEFAULT_MOVIES_TV_ORDER: readonly TopLevelSourceId[] = [
   'nexus_hls', 'bravo', 'mp4', 'darkino',
-  'fstream', 'omega', 'wiflix', 'viper', 'coflix',
-  'custom', 'frembed', 'vox', 'vostfr',
+  'fstream', 'omega', 'wiflix', 'j1f', 'swiftflow', 'viper', 'coflix',
+  'custom', 'frembed', 'vox', 'kisskh', 'vostfr',
 ];
 
 /**
@@ -100,10 +118,10 @@ export function buildDefaults(): SourcePriorityPrefs {
 
 export const DEFAULT_SOURCE_PRIORITY_PREFS: SourcePriorityPrefs = buildDefaults();
 
-function isValidPrefs(obj: unknown): obj is SourcePriorityPrefs & { version: SchemaVersion } {
+function isValidPrefs(obj: unknown): obj is PersistedSourcePriorityPrefs {
   if (!obj || typeof obj !== 'object') return false;
-  const p = obj as Partial<SourcePriorityPrefs>;
-  const versionOk = p.version === 1 || p.version === 2;
+  const p = obj as Partial<Omit<SourcePriorityPrefs, 'version'>> & { version?: unknown };
+  const versionOk = p.version === 1 || p.version === 2 || p.version === 3;
   return versionOk
     && !!p.categories
     && !!p.categories.moviesTv
@@ -123,8 +141,8 @@ function isValidPrefs(obj: unknown): obj is SourcePriorityPrefs & { version: Sch
  * indirectement via les getters).
  */
 function migrateV1toV2(
-  parsed: SourcePriorityPrefs & { version: 1 },
-): SourcePriorityPrefs & { version: 2 } {
+  parsed: LegacySourcePriorityPrefs<1>,
+): LegacySourcePriorityPrefs<2> {
   // Import dynamique synchrone : le module est déjà chargé côté runtime.
   // (Le cycle d'imports théorique est rompu en pratique car hosterRegistry
   // n'appelle JAMAIS getSourcePriorityPrefs au import-time.)
@@ -154,8 +172,43 @@ function migrateV1toV2(
   };
 }
 
+/**
+ * Migration v2 → v3 : nouvel ordre default pour moviesTv hosters (vidzy avant
+ * uqload). Si l'utilisateur n'a JAMAIS reordré ses built-ins (sa liste de
+ * built-ins, dans l'ordre, == V2_DEFAULT_BUILTIN_HOSTER_ORDER), on remplace
+ * par le nouveau default — les `custom_*` sont préservés et rappendés. Sinon
+ * on garde son ordre tel quel.
+ */
+function migrateV2toV3(
+  parsed: LegacySourcePriorityPrefs<2>,
+): SourcePriorityPrefs {
+  const userOrder = parsed.categories.moviesTv.hosterOrder;
+  const builtinsSet = new Set<string>(V2_DEFAULT_BUILTIN_HOSTER_ORDER);
+  const builtinsInUserOrder = userOrder.filter((id) => builtinsSet.has(id));
+  const customsInUserOrder = userOrder.filter((id) => !builtinsSet.has(id));
+
+  const isUntouched = builtinsInUserOrder.length === V2_DEFAULT_BUILTIN_HOSTER_ORDER.length
+    && builtinsInUserOrder.every((id, i) => id === V2_DEFAULT_BUILTIN_HOSTER_ORDER[i]);
+
+  if (!isUntouched) {
+    return { ...parsed, version: 3 };
+  }
+
+  return {
+    ...parsed,
+    version: 3,
+    categories: {
+      ...parsed.categories,
+      moviesTv: {
+        ...parsed.categories.moviesTv,
+        hosterOrder: [...BUILTIN_HOSTER_IDS, ...customsInUserOrder],
+      },
+    },
+  };
+}
+
 /** Merge parsed prefs with defaults (forward-compat pour nouveaux ids + purge deprecated). */
-function mergeWithDefaults(parsed: SourcePriorityPrefs): SourcePriorityPrefs {
+function mergeWithDefaults(parsed: PersistedSourcePriorityPrefs): SourcePriorityPrefs {
   const defaults = buildDefaults();
 
   const deprecatedSources = new Set<string>(DEPRECATED_SOURCE_IDS);
@@ -263,8 +316,14 @@ export function getSourcePriorityPrefs(): SourcePriorityPrefs {
     const parsed = JSON.parse(raw);
     if (!isValidPrefs(parsed)) return buildDefaults();
     // Migration v1 → v2 (patternOverrides : append → replace)
-    const migrated = parsed.version === 1 ? migrateV1toV2(parsed as SourcePriorityPrefs & { version: 1 }) : parsed;
-    return mergeWithDefaults(migrated);
+    const v2 = parsed.version === 1
+      ? migrateV1toV2(parsed)
+      : parsed;
+    // Migration v2 → v3 (default hoster order : vidzy avant uqload)
+    const v3 = v2.version === 2
+      ? migrateV2toV3(v2)
+      : v2;
+    return mergeWithDefaults(v3);
   } catch {
     return buildDefaults();
   }

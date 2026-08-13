@@ -27,6 +27,11 @@ const {
 
 const router = express.Router();
 
+const setNoStore = (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  return next();
+};
+
 const canAccessInvoice = (invoice, auth) => {
   if (!invoice) {
     return false;
@@ -93,7 +98,7 @@ const giftUnsealRateLimit = rateLimit({
   }
 });
 
-router.post('/vip/invoices', createInvoiceRateLimit, async (req, res) => {
+router.post('/vip/invoices', setNoStore, createInvoiceRateLimit, async (req, res) => {
   try {
     const pool = getPool();
     const turnstileResult = await verifyTurnstileFromRequest(req, req.body?.turnstileToken);
@@ -134,25 +139,26 @@ router.post('/vip/invoices', createInvoiceRateLimit, async (req, res) => {
   }
 });
 
-router.get('/vip/paygate/callback', async (req, res) => {
+router.get('/vip/paygate/callback', setNoStore, async (req, res) => {
   try {
     const pool = getPool();
-    const invoice = await handlePaygateCallback(pool, req.query);
-
-    return res.json({
-      success: true,
-      invoice: serializePublicInvoice(invoice)
-    });
+    await handlePaygateCallback(pool, req.query);
+    return res.status(200).type('text/plain').send('ok');
   } catch (error) {
-    console.error('VIP PayGate callback error:', error);
-    return res.status(error.statusCode || 400).json({
-      success: false,
-      error: error.message || 'Callback PayGate invalide'
+    const statusCode = Number(error?.statusCode);
+    const safeStatus = statusCode >= 400 && statusCode <= 599 ? statusCode : 500;
+    console.error('VIP PayGate callback rejected', {
+      code: error?.code || 'PAYGATE_CALLBACK_ERROR',
+      statusCode: safeStatus
     });
+    return res
+      .status(safeStatus)
+      .type('text/plain')
+      .send(safeStatus >= 500 ? 'temporary failure' : 'invalid callback');
   }
 });
 
-router.get('/vip/invoices/mine', async (req, res) => {
+router.get('/vip/invoices/mine', setNoStore, async (req, res) => {
   try {
     const auth = await getAuthIfValid(req);
     if (!auth) {
@@ -180,7 +186,7 @@ router.get('/vip/invoices/mine', async (req, res) => {
   }
 });
 
-router.get('/vip/invoices/:publicId', async (req, res) => {
+router.get('/vip/invoices/:publicId', setNoStore, async (req, res) => {
   try {
     const pool = getPool();
     const auth = await getAuthIfValid(req);
@@ -205,7 +211,7 @@ router.get('/vip/invoices/:publicId', async (req, res) => {
   }
 });
 
-router.post('/vip/invoices/:publicId/check', invoiceCheckRateLimit, async (req, res) => {
+router.post('/vip/invoices/:publicId/check', setNoStore, invoiceCheckRateLimit, async (req, res) => {
   try {
     const pool = getPool();
     const auth = await getAuthIfValid(req);
@@ -328,7 +334,7 @@ router.get('/admin/vip-invoices', isAdmin, async (req, res) => {
   }
 });
 
-router.get('/admin/vip-invoices/:id', isAdmin, async (req, res) => {
+router.get('/admin/vip-invoices/:id', setNoStore, isAdmin, async (req, res) => {
   try {
     const pool = getPool();
     const details = await getVipInvoiceDetails(pool, req.params.id);
@@ -352,11 +358,12 @@ router.get('/admin/vip-invoices/:id', isAdmin, async (req, res) => {
   }
 });
 
-router.post('/admin/vip-invoices/:id/check', isAdmin, async (req, res) => {
+router.post('/admin/vip-invoices/:id/check', setNoStore, isAdmin, async (req, res) => {
   try {
     const pool = getPool();
     const refreshedInvoice = await refreshInvoiceStatus(pool, req.params.id, {
       force: true,
+      allowPaygateReconciliation: true,
       actorType: 'admin',
       actorId: req.admin?.userId || null
     });

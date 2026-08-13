@@ -17,6 +17,10 @@ if linkage != nil
   use_frameworks! :linkage => linkage.to_sym
 end
 
+# Le target Xcode de ce dépôt s'appelle `MovixApp` (cf. MovixApp.xcodeproj),
+# même si ses sources vivent dans le répertoire `Movix/`. L'amont a renommé ce
+# target en `Movix` côté repo privé : ne pas reprendre ce renommage ici, sinon
+# `pod install` échoue avec « Unable to find a target named `Movix` ».
 target 'MovixApp' do
   config = use_native_modules!
 

@@ -7,7 +7,7 @@ import AdFreePlayerAds from '../components/AdFreePlayerAds';
 import { toast } from 'sonner';
 import { getTmdbLanguage } from '../i18n';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { findDarkiWorldTitleId } from '@/utils/darkiWorldResultMatch';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -514,38 +514,15 @@ const EpisodeDropdown: React.FC<{
   );
 };
 
-const RateLimitInfoButton: React.FC<{ error: string | null }> = ({ error }) => {
+const SourceBanner: React.FC = () => {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-
-  const ratelimitedTemplate = t('download.rateLimited', { retryAt: '__X__' });
-  const ratelimitedPrefix = ratelimitedTemplate.split('__X__')[0];
-  const isRateLimited = !!error && error.startsWith(ratelimitedPrefix);
-
-  if (!isRateLimited) return null;
-
   return (
-    <>
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="self-start text-xs sm:text-sm text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors mt-1"
-      >
-        {t('download.rateLimitedLearnMore')}
-      </button>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{t('download.rateLimitInfoTitle')}</DialogTitle>
-            <DialogDescription className="text-sm sm:text-base text-gray-300 leading-relaxed pt-2">
-              {t('download.rateLimitInfoBody')}
-            </DialogDescription>
-          </DialogHeader>
-        </DialogContent>
-      </Dialog>
-    </>
+    <div className="self-stretch mt-2 mb-1 border-l-2 border-gray-500/40 pl-3 text-xs sm:text-sm italic text-gray-400 leading-relaxed">
+      {t('download.sourceBannerBody')}
+    </div>
   );
 };
+
 
 // Popup de sélection de liens (similaire à AvatarSelector)
 const LinkSelector: React.FC<{
@@ -683,12 +660,11 @@ const LinkSelector: React.FC<{
                       )}
                     </div>
                   ) : error ? (
-                    <div className="flex flex-col text-red-400 text-sm sm:text-base">
+                    <div className="flex items-center text-red-400 text-sm sm:text-base">
                       <div className="flex items-center">
                         <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 mr-2 flex-shrink-0" />
                         <span className="break-words">{error}</span>
                       </div>
-                      <RateLimitInfoButton error={error} />
                     </div>
                   ) : decodedLink ? (
                     <div className="space-y-3 sm:space-y-4">
@@ -796,6 +772,8 @@ const LinkSelector: React.FC<{
                       )}
                     </div>
                   ) : null}
+
+                  <SourceBanner />
                 </div>
               )}
             </div>
@@ -1191,41 +1169,19 @@ const DownloadPage: React.FC = () => {
         return null;
       }
 
-      const normalizeName = (s: string) => s.toLowerCase().trim();
-      const targetName = normalizeName(tmdbDetails.name || tmdbDetails.title || '');
+      const releaseDate = type === 'movie'
+        ? tmdbDetails.release_date
+        : tmdbDetails.first_air_date;
+      const parsedYear = releaseDate ? Number.parseInt(releaseDate.slice(0, 4), 10) : null;
+      const matchingId = findDarkiWorldTitleId({
+        results: searchResponse.data.results,
+        targetTmdbId: id,
+        targetTitle: tmdbDetails.name || tmdbDetails.title || '',
+        targetType: type === 'movie' ? 'movie' : 'tv',
+        targetYear: parsedYear != null && Number.isFinite(parsedYear) ? parsedYear : null,
+      });
 
-      if (type === 'movie') {
-        // Pour les films, chercher par tmdb_id exact
-        let matchingMovie = searchResponse.data.results.find((result: any) => {
-          return (result.have_streaming === 1 || result.have_streaming === 0) &&
-                 result.type !== 'series' &&
-                 result.tmdb_id &&
-                 String(result.tmdb_id) === String(id);
-        });
-        // Fallback: matcher par nom si aucun tmdb_id ne correspond
-        if (!matchingMovie && targetName) {
-          matchingMovie = searchResponse.data.results.find((result: any) => {
-            return result.name && normalizeName(result.name) === targetName &&
-                   result.type !== 'series' && result.type !== 'animes' && result.type !== 'doc';
-          });
-        }
-        return matchingMovie ? matchingMovie.id : null;
-      } else {
-        // Pour les séries, chercher par tmdb_id exact
-        let matchingShow = searchResponse.data.results.find((result: any) => {
-          return (result.type === 'series' || result.type === 'animes' || result.type === 'doc') &&
-                 result.tmdb_id &&
-                 String(result.tmdb_id) === String(id);
-        });
-        // Fallback: matcher par nom si aucun tmdb_id ne correspond
-        if (!matchingShow && targetName) {
-          matchingShow = searchResponse.data.results.find((result: any) => {
-            return result.name && normalizeName(result.name) === targetName &&
-                   result.type !== 'movie';
-          });
-        }
-        return matchingShow ? matchingShow.id : null;
-      }
+      return matchingId == null ? null : String(matchingId);
     } catch (err) {
       console.error('Erreur lors de la recherche sur notre source de téléchargement:', err);
       return null;
@@ -1672,6 +1628,26 @@ const DownloadPage: React.FC = () => {
                   </div>
                 ) : null}
 
+                {/* Loadix.fun DDL ad */}
+                <a
+                  href="https://loadix.fun"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-4 sm:mt-6 flex items-center gap-3 sm:gap-4 p-3 sm:p-4 bg-gray-800/50 rounded-xl border border-gray-700/50 hover:border-red-500/50 transition-colors cursor-pointer group"
+                >
+                  <div className="flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-lg bg-red-600/10 border border-red-500/20 shrink-0">
+                    <Download className="w-5 h-5 sm:w-6 sm:h-6 text-red-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span className="text-sm sm:text-base font-semibold text-white group-hover:text-red-400 transition-colors">{t('download.adTitle')}</span>
+                      <span className="px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider rounded bg-red-500/10 text-red-400 border border-red-500/20">{t('download.adTag')}</span>
+                    </div>
+                    <p className="text-xs sm:text-sm text-gray-400 leading-relaxed truncate">{t('download.adDescription')}</p>
+                  </div>
+                  <ExternalLink className="w-4 h-4 text-gray-500 group-hover:text-red-400 transition-colors shrink-0" />
+                </a>
+
                 {/* Bouton pour récupérer les liens */}
                 <div className="mt-4 sm:mt-6">
                   <button
@@ -1691,18 +1667,7 @@ const DownloadPage: React.FC = () => {
                   </button>
                 </div>
 
-                {/* Note de désengagement */}
-                <div className="mt-4 sm:mt-6 p-3 sm:p-4 bg-yellow-900/20 border border-yellow-500/50 rounded-xl">
-                  <div className="flex items-start gap-2 sm:gap-3">
-                    <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 text-yellow-400 mt-0.5 flex-shrink-0" />
-                    <div className="text-xs sm:text-sm text-yellow-200">
-                      <p className="font-medium mb-1">{t('download.betaWarning')}</p>
-                      <p className="leading-relaxed">
-                        {t('download.betaWarningText')}
-                      </p>
-                    </div>
-                  </div>
-                </div>
+                <SourceBanner />
 
                 {/* Affichage des liens */}
                 {downloadLinks.length > 0 && (
@@ -1792,7 +1757,7 @@ const DownloadPage: React.FC = () => {
                         <AlertCircle className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />
                         <span className="break-words">{error}</span>
                       </div>
-                      <RateLimitInfoButton error={error} />
+                      <SourceBanner />
                     </div>
                   </div>
                 )}

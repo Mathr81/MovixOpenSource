@@ -44,6 +44,9 @@ export function scoreAnimeSignals(
   const origin = detail.origin_country || [];
   const lang = detail.original_language || '';
   const isJpLike = origin.includes('JP') || lang === 'ja';
+  // Donghua = animation chinoise (CN/TW/HK, langue zh). anime-sama en héberge une partie.
+  const isCnLike =
+    origin.includes('CN') || origin.includes('TW') || origin.includes('HK') || lang === 'zh';
 
   if (origin.includes('JP')) {
     score += 40;
@@ -84,7 +87,22 @@ export function scoreAnimeSignals(
   }
 
   const genreNames = (detail.genres || []).map((g) => g?.name || '');
-  if (genreNames.includes('Animation') || genreNames.includes('Animation & SF')) {
+  const hasAnimationGenre =
+    genreNames.includes('Animation') || genreNames.includes('Animation & SF');
+
+  // Donghua : origine/langue chinoise + contexte animation = signal fort (+40).
+  // On exige le genre Animation (ou le keyword donghua) pour ne PAS classer les
+  // dramas live-action chinois (énorme catalogue) en anime.
+  if (isCnLike && hasAnimationGenre) {
+    score += 40;
+    reasons.push('donghua=CN+animation');
+  }
+  if (keywordSet.has('donghua')) {
+    score += 30;
+    reasons.push('kw=donghua');
+  }
+
+  if (hasAnimationGenre) {
     score += 10;
     reasons.push('genre=Animation');
   }
@@ -93,8 +111,8 @@ export function scoreAnimeSignals(
 }
 
 /**
- * Seuil par défaut = 40 : il faut au moins un signal fort (JP, ja, studio JP, kw+JP).
- * Le genre "Animation" seul (+10) ne suffit plus.
+ * Seuil par défaut = 40 : il faut au moins un signal fort (JP, ja, studio JP, kw+JP,
+ * donghua CN+animation, kw donghua). Le genre "Animation" seul (+10) ne suffit plus.
  */
 export function isLikelyAnime(
   detail: TmdbTvDetail | null | undefined,

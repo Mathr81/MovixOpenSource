@@ -22,6 +22,9 @@ let deps = {
     throw new Error("coflix not configured");
   },
   coflixHeaders: {},
+  COFLIX_BASE_URL: (
+    process.env.COFLIX_BASE_URL || "https://coflix.esq"
+  ).replace(/\/$/, ""),
   getFromCacheNoExpiration: async () => null,
   saveToCache: async () => false,
   formatCoflixError: (error) =>
@@ -31,6 +34,13 @@ let deps = {
 function configure(injected) {
   Object.assign(deps, injected);
 }
+
+// Kill switch — utile quand le domaine Coflix tombe / redirige vers leur Telegram.
+// COFLIX_ENABLED=false coupe recherches, fetchs et refresh background ;
+// le cache disque existant reste servi tel quel.
+const COFLIX_ENABLED = !["false", "0"].includes(
+  String(process.env.COFLIX_ENABLED ?? "true").toLowerCase(),
+);
 
 // ---- Functions ----
 
@@ -107,37 +117,69 @@ function normalizeCoflixQuery(query) {
   return normalized;
 }
 
-// Fonction pour rechercher un contenu sur Coflix par titre
+// Deduit le post_type Coflix a partir du segment d'URL de la fiche.
+// Le nouveau theme range les contenus sous /film|serie|animes|drames/.
+function coflixPostTypeFromUrl(url) {
+  if (!url) return null;
+  if (/\/film\//i.test(url)) return "movies";
+  if (/\/serie\//i.test(url)) return "series";
+  if (/\/animes\//i.test(url)) return "animes";
+  if (/\/drames\//i.test(url)) return "doramas";
+  return null; // collections, genres, tutos... -> ignore
+}
+
+// Fonction pour rechercher un contenu sur Coflix par titre.
+// Le nouveau theme n'a plus /suggest.php : on scrape la page de recherche
+// WordPress /?s=<query> et sa grille .md-manga-card.
 async function searchCoflixByTitle(title, mediaType, releaseYear) {
+  if (!COFLIX_ENABLED) return [];
   try {
     const normalizedTitle = normalizeCoflixQuery(title);
 
     const response = await deps.axiosCoflixRequest({
       method: "get",
-      url: `/suggest.php?query=${encodeURIComponent(normalizedTitle)}`,
+      url: `/?s=${encodeURIComponent(normalizedTitle)}`,
     });
 
-    if (!Array.isArray(response.data)) {
+    if (typeof response.data !== "string") {
       console.error(
-        `La reponse de l'API Coflix n'est pas un tableau: ${deps.formatCoflixError(response.data)}`,
+        `La reponse de recherche Coflix n'est pas du HTML: ${deps.formatCoflixError(response.data)}`,
       );
       return [];
     }
 
-    const results = response.data.map((item) => {
-      const similarity = calculateTitleSimilarity(title, item.title);
-      const resultYear = item.year ? parseInt(item.year) : null;
+    const $ = cheerio.load(response.data);
 
-      return {
-        title: item.title,
-        url: item.url,
-        similarity: similarity,
-        year: resultYear,
-        id: item.ID,
-        excerpt: item.excerpt,
-        post_type: item.post_type,
-        rating: item.rating,
-      };
+    const results = [];
+    $(".md-manga-card").each((i, el) => {
+      const $card = $(el);
+
+      const cardTitle = $card.find(".md-manga-card-name").first().text().trim();
+
+      // URL de la fiche : on privilegie un lien /film|serie|animes|drames/.
+      let href = $card
+        .find("a[href]")
+        .filter((j, a) => !!coflixPostTypeFromUrl($(a).attr("href")))
+        .first()
+        .attr("href");
+      if (!href) href = $card.find("a[href]").first().attr("href");
+
+      const postType = coflixPostTypeFromUrl(href);
+      if (!cardTitle || !href || !postType) return; // skip collections & bruit
+
+      const yearText = $card.find(".md-card-badge.year").first().text().trim();
+      const resultYear = yearText ? parseInt(yearText, 10) : null;
+
+      results.push({
+        title: cardTitle,
+        url: href,
+        similarity: calculateTitleSimilarity(title, cardTitle),
+        year: Number.isNaN(resultYear) ? null : resultYear,
+        id: null,
+        excerpt: "",
+        post_type: postType,
+        rating: null,
+      });
     });
 
     let coflixTypes = [];
@@ -159,9 +201,13 @@ async function searchCoflixByTitle(title, mediaType, releaseYear) {
     filteredResults.sort((a, b) => b.similarity - a.similarity);
 
     if (releaseYear) {
-      const yearMatchedResults = filteredResults.filter(
-        (r) => r.year === releaseYear,
-      );
+      const strictYear = filteredResults.filter((r) => r.year === releaseYear);
+      // Les fiches series du nouveau theme n'affichent pas d'annee (seuls les
+      // films ont un badge annee). Sans match strict, on retombe sur les fiches
+      // sans annee connue et on tranche a la similarite du titre.
+      const yearMatchedResults = strictYear.length
+        ? strictYear
+        : filteredResults.filter((r) => r.year == null);
 
       if (mediaType === "movie") {
         if (
@@ -201,9 +247,12 @@ async function searchCoflixByTitle(title, mediaType, releaseYear) {
 
     return filteredResults;
   } catch (error) {
-    console.error(
-      `Erreur lors de la recherche sur Coflix pour ${title}: ${deps.formatCoflixError(error)}`,
-    );
+    // Global Coflix-site 429 is announced once by makeCoflixRequest's cooldown — don't spam per title.
+    if (!error?.coflixSiteRateLimited) {
+      console.error(
+        `Erreur lors de la recherche sur Coflix pour ${title}: ${deps.formatCoflixError(error)}`,
+      );
+    }
     throw error;
   }
 }
@@ -390,6 +439,132 @@ function filterEmmmmbedReaders(data) {
   return filterObject(data);
 }
 
+// Extrait la liste des embeds lecteurvideo + le token JWT d'une page Coflix
+// (film ou episode). Le nouveau theme embarque, dans un <script> inline :
+//   var cfPlayerToken = "<jwt>";
+//   var cfServers = [{"nombre":"...","embed_url":"https://lecteurvideo.com/embed.php?id=..","idioma":".."}];
+// Le token (lie au post, ~30 min) doit etre passe a l'embed via ?t=<token>.
+function parseCoflixPlayers(html) {
+  const tokenMatch = html.match(/var\s+cfPlayerToken\s*=\s*["']([^"']*)["']/);
+  const token = tokenMatch ? tokenMatch[1] : "";
+
+  let servers = [];
+  const serversMatch = html.match(/var\s+cfServers\s*=\s*(\[[\s\S]*?\])\s*;/);
+  if (serversMatch) {
+    try {
+      servers = JSON.parse(serversMatch[1]);
+    } catch (e) {
+      servers = [];
+    }
+  }
+
+  const embeds = [];
+  for (const s of Array.isArray(servers) ? servers : []) {
+    if (!s || !s.embed_url) continue;
+    let embed = String(s.embed_url).trim();
+    if (token) {
+      embed +=
+        (embed.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(token);
+    }
+    embeds.push({ embed_url: embed, idioma: s.idioma || "", nombre: s.nombre || "" });
+  }
+
+  return { token, embeds };
+}
+
+// Recupere les player_links (uqload/voe/lecteur6/...) depuis une page embed
+// lecteurvideo.com. La page liste les hosts via `li[onclick="showVideo('<base64>')"]`.
+async function scrapeLecteurVideoEmbed(embedUrl, tag) {
+  const playerLinks = [];
+  try {
+    const iframePageResponse = await deps.axiosLecteurVideoRequest({
+      method: "get",
+      url: embedUrl,
+    });
+    const iframePage$ = cheerio.load(iframePageResponse.data);
+
+    let playerItems = iframePage$('li[onclick*="showVideo"]');
+    if (!playerItems.length) {
+      playerItems = iframePage$("div li[onclick]");
+    }
+
+    if (playerItems.length === 0) {
+      const bodyHtml = iframePage$("body").html() || "";
+      console.warn(
+        `[COFLIX ${tag}] ⚠️ Aucun playerItem — iframe: ${embedUrl}, status: ${iframePageResponse.status}, taille: ${(iframePageResponse.data || "").length} chars, aperçu HTML: ${bodyHtml.substring(0, 500)}`,
+      );
+    }
+
+    playerItems.each((i, element) => {
+      try {
+        const $element = iframePage$(element);
+        const onClickAttr = $element.attr("onclick") || "";
+
+        const base64Match = onClickAttr.match(/showVideo\(['"]([^'\"]+)['"]/);
+
+        if (base64Match && base64Match[1]) {
+          let decodedUrl;
+          try {
+            decodedUrl = Buffer.from(base64Match[1], "base64").toString(
+              "utf-8",
+            );
+          } catch (decodeError) {
+            decodedUrl = null;
+          }
+
+          const quality = $element.find("span").text().trim();
+
+          let language = "Unknown";
+          const info = $element.find("p").text().trim();
+          if (info.toLowerCase().includes("french")) {
+            language = "French";
+          } else if (info.toLowerCase().includes("english")) {
+            language = "English";
+          } else if (info.toLowerCase().includes("vostfr")) {
+            language = "VOSTFR";
+          }
+
+          playerLinks.push({
+            decoded_url: decodedUrl,
+            quality: quality,
+            language: language,
+          });
+        }
+      } catch (playerError) {
+        const errorCode =
+          playerError.response?.status || playerError.code || "unknown";
+        console.error(
+          `[COFLIX ${tag}] ❌ Erreur extraction player: ${errorCode}`,
+        );
+      }
+    });
+  } catch (iframePageError) {
+    const errorCode =
+      iframePageError.response?.status || iframePageError.code || "unknown";
+    console.error(
+      `[COFLIX ${tag}] ❌ Erreur requête iframe ${embedUrl} — code: ${errorCode}, message: ${iframePageError.message}`,
+    );
+  }
+  return playerLinks;
+}
+
+// Extrait la liste des embeds jouables d'une page Coflix deja chargee (cheerio $
+// + html brut). Priorite au bloc `cfServers`, fallback sur l'iframe live
+// #cfPlayerFrame (deja tokenise) puis toute iframe non-coflix.
+function extractCoflixEmbeds($, html) {
+  const { embeds } = parseCoflixPlayers(html);
+  if (embeds.length) return embeds;
+
+  const iframeSrc =
+    $("#cfPlayerFrame").attr("src") ||
+    $("iframe.cf-player-frame").attr("src") ||
+    $("iframe").attr("src");
+  if (iframeSrc && !/coflix\./i.test(iframeSrc)) {
+    return [{ embed_url: iframeSrc, idioma: "", nombre: "" }];
+  }
+  return [];
+}
+
 // Fonction pour extraire les donnees des films depuis Coflix
 async function getMovieDataFromCoflix(url) {
   let cachedData = null;
@@ -413,6 +588,10 @@ async function getMovieDataFromCoflix(url) {
       }
     }
 
+    if (!COFLIX_ENABLED) {
+      return cachedData || { iframe_src: null, player_links: [] };
+    }
+
     const relativePath = url.replace(
       /^https?:\/\/(?:www\.)?coflix\.[^/]+/i,
       "",
@@ -423,105 +602,21 @@ async function getMovieDataFromCoflix(url) {
     });
     const $ = cheerio.load(response.data);
 
-    let iframe = $(
-      "main div div div article div:nth-child(2) div:nth-child(1) aside div div iframe",
-    );
-    if (!iframe.length) {
-      iframe = $("article iframe");
-    }
-    if (!iframe.length) {
-      iframe = $("iframe");
+    const embeds = extractCoflixEmbeds($, response.data);
+    if (embeds.length === 0) {
+      console.log(`Aucun serveur (cfServers/iframe) trouve pour l'URL ${url}`);
     }
 
-    let iframeSrc = null;
-    let playerLinks = [];
-
-    if (iframe.length > 0) {
-      iframeSrc = iframe.attr("src");
-
-      if (iframeSrc) {
-        try {
-          const iframePageResponse = await deps.axiosLecteurVideoRequest({
-            method: "get",
-            url: iframeSrc,
-          });
-          const iframePage$ = cheerio.load(iframePageResponse.data);
-
-          let playerItems = iframePage$('li[onclick*="showVideo"]');
-          if (!playerItems.length) {
-            playerItems = iframePage$("div li[onclick]");
-          }
-
-          if (playerItems.length === 0) {
-            const bodyHtml = iframePage$("body").html() || "";
-            console.warn(
-              `[COFLIX MOVIE] ⚠️ Aucun playerItem — iframe: ${iframeSrc}, status: ${iframePageResponse.status}, taille: ${(iframePageResponse.data || "").length} chars, aperçu HTML: ${bodyHtml.substring(0, 500)}`,
-            );
-          }
-
-          playerItems.each((i, element) => {
-            try {
-              const $element = iframePage$(element);
-              const onClickAttr = $element.attr("onclick") || "";
-
-              const base64Match = onClickAttr.match(
-                /showVideo\(['"]([^'\"]+)['"]/,
-              );
-
-              if (base64Match && base64Match[1]) {
-                const base64Url = base64Match[1];
-
-                let decodedUrl;
-                try {
-                  decodedUrl = Buffer.from(base64Url, "base64").toString(
-                    "utf-8",
-                  );
-                } catch (decodeError) {
-                  decodedUrl = null;
-                }
-
-                const quality = $element.find("span").text().trim();
-
-                let language = "Unknown";
-                const info = $element.find("p").text().trim();
-                if (info.toLowerCase().includes("french")) {
-                  language = "French";
-                } else if (info.toLowerCase().includes("english")) {
-                  language = "English";
-                } else if (info.toLowerCase().includes("vostfr")) {
-                  language = "VOSTFR";
-                }
-
-                playerLinks.push({
-                  decoded_url: decodedUrl,
-                  quality: quality,
-                  language: language,
-                });
-              }
-            } catch (playerError) {
-              const errorCode =
-                playerError.response?.status || playerError.code || "unknown";
-              console.error(
-                `[COFLIX MOVIE] ❌ Erreur extraction player: ${errorCode}`,
-              );
-            }
-          });
-        } catch (iframePageError) {
-          const errorCode =
-            iframePageError.response?.status ||
-            iframePageError.code ||
-            "unknown";
-          console.error(
-            `[COFLIX MOVIE] ❌ Erreur requête iframe ${iframeSrc} — code: ${errorCode}, message: ${iframePageError.message}`,
-          );
-        }
-      }
-    } else {
-      console.log(`Aucun iframe trouve pour l'URL ${url}`);
+    const iframeSrc = embeds.length ? embeds[0].embed_url : null;
+    const playerLinks = [];
+    for (const embed of embeds) {
+      const links = await scrapeLecteurVideoEmbed(embed.embed_url, "MOVIE");
+      playerLinks.push(...links);
     }
 
     const result = {
-      iframe_src: iframeSrc && !iframeSrc.includes("coflix") ? iframeSrc : null,
+      iframe_src:
+        iframeSrc && !/coflix\./i.test(iframeSrc) ? iframeSrc : null,
       player_links: playerLinks,
     };
 
@@ -555,25 +650,6 @@ async function getMovieDataFromCoflix(url) {
   }
 }
 
-// Nouvelle fonction pour recuperer les episodes via l'API Coflix
-async function fetchCoflixSeriesEpisodes(postId, seasonNumber) {
-  try {
-    const response = await deps.axiosCoflixRequest({
-      method: "get",
-      url: `/wp-json/apiflix/v1/series/${postId}/${seasonNumber}`,
-    });
-    if (response.data && Array.isArray(response.data.episodes)) {
-      return response.data;
-    }
-    return null;
-  } catch (error) {
-    console.error(
-      `Erreur lors de la recuperation des episodes Coflix: ${deps.formatCoflixError(error)}`,
-    );
-    return null;
-  }
-}
-
 // Fonction pour extraire les donnees des series depuis Coflix
 async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
   let cachedData = null;
@@ -595,236 +671,83 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
       return cachedData;
     }
 
-    const relativePath = url.replace(
-      /^https?:\/\/(?:www\.)?coflix\.[^/]+/i,
+    if (!COFLIX_ENABLED) {
+      return { seasons: [], current_episode: null };
+    }
+
+    // Le nouveau theme n'expose plus la liste des saisons/episodes de facon
+    // scrappable (et le front recupere les saisons via TMDB, pas via Coflix).
+    // On construit directement le permalien d'episode /episode/<slug>-<S>x<E>/
+    // (confirme par ex. /episode/franky-2x1/ pour la serie /serie/franky/).
+    const slugMatch = url.match(/\/(?:serie|animes|drames)\/([^/]+)/i);
+    const seriesSlug = slugMatch ? slugMatch[1] : "";
+
+    if (!seriesSlug || !episodeNumber) {
+      return { seasons: [], current_episode: null };
+    }
+
+    const base = (deps.COFLIX_BASE_URL || "https://coflix.esq").replace(
+      /\/$/,
       "",
     );
-    const response = await deps.axiosCoflixRequest({
-      method: "get",
-      url: relativePath,
-    });
-    const $ = cheerio.load(response.data);
+    const episodeUrl = `${base}/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
 
-    const seasonItems = $("article section div aside div ul li");
+    let episodeTitle = "";
+    let episodeIframeSrc = null;
+    const episodePlayerLinks = [];
 
-    if (!seasonItems.length) {
-      console.log(`[ERROR] Aucune saison trouvee pour ${url}`);
+    try {
+      const episodePageResponse = await deps.axiosCoflixRequest({
+        method: "get",
+        url: episodeUrl,
+      });
+      const episodePage$ = cheerio.load(episodePageResponse.data);
 
-      const altSelectors = [
-        "ul li",
-        ".seasons li",
-        ".season-list li",
-        "[data-season]",
-        "input[data-season]",
-      ];
+      episodeTitle =
+        episodePage$("h1.cf-movie-title").first().text().trim() ||
+        episodePage$("article header h1").first().text().trim();
 
-      for (const selector of altSelectors) {
-        const altItems = $(selector);
-        if (altItems.length > 0) {
-          // found items with alternative selector
-        }
+      const embeds = extractCoflixEmbeds(episodePage$, episodePageResponse.data);
+      episodeIframeSrc = embeds.length ? embeds[0].embed_url : null;
+      for (const embed of embeds) {
+        const links = await scrapeLecteurVideoEmbed(embed.embed_url, "TV");
+        episodePlayerLinks.push(...links);
       }
-
-      return {
-        seasons: [],
-        current_episode: null,
-      };
+    } catch (episodeError) {
+      console.error(
+        `Erreur lors de la recuperation des donnees de l'episode: ${deps.formatCoflixError(episodeError)}`,
+      );
+      return { seasons: [], current_episode: null };
     }
 
-    const seasons = [];
-    let targetSeason = null;
-    let postId = null;
-
-    for (let i = 0; i < seasonItems.length; i++) {
-      const $seasonElement = $(seasonItems[i]);
-      const $label = $seasonElement.find("label");
-      const $input = $label.find("input");
-
-      const sNumber = $input.attr("data-season");
-      const seriesId = $input.attr("data-id");
-      const currentPostId = $input.attr("post-id");
-      const seasonName = $label.find("span").text().trim();
-
-      const season = {
-        season_number: parseInt(sNumber),
-        name: seasonName,
-        data_id: seriesId,
-        post_id: currentPostId,
-        episodes: [],
-      };
-
-      seasons.push(season);
-
-      if (parseInt(sNumber) === seasonNumber) {
-        targetSeason = season;
-        postId = currentPostId;
-      }
-    }
-
-    const slugMatch = url.match(/\/serie\/([^/]+)/);
-    const animeMatch = url.match(/\/animes\/([^/]+)/);
-    const seriesSlug = slugMatch
-      ? slugMatch[1]
-      : animeMatch
-        ? animeMatch[1]
-        : "";
-
-    if (targetSeason && episodeNumber) {
-      let episodeApiData = null;
-      let episodeUrl = null;
-
-      if (postId) {
-        const apiData = await fetchCoflixSeriesEpisodes(postId, seasonNumber);
-        if (apiData && apiData.episodes) {
-          const episode = apiData.episodes.find(
-            (ep) => parseInt(ep.number) === parseInt(episodeNumber),
-          );
-          if (episode && episode.links) {
-            episodeUrl = episode.links.startsWith("https://coflix.date")
-              ? `${episode.links}`
-              : episode.links;
-          }
-        }
-      }
-
-      if (!episodeUrl) {
-        episodeUrl = `https://coflix.date/episode/${seriesSlug}-${seasonNumber}x${episodeNumber}/`;
-      }
-
-      try {
-        const episodePageResponse = await deps.makeCoflixRequest(episodeUrl, {
-          headers: deps.coflixHeaders,
-          timeout: 15000,
-        });
-        const episodePage$ = cheerio.load(episodePageResponse.data);
-
-        const episodeTitle = episodePage$("article header h1").text().trim();
-        const episodePlayerLinks = [];
-
-        let episodeIframe = episodePage$("main div div div article div iframe");
-        if (!episodeIframe.length) {
-          episodeIframe = episodePage$("article iframe");
-        }
-        if (!episodeIframe.length) {
-          episodeIframe = episodePage$("iframe");
-        }
-
-        let episodeIframeSrc = null;
-
-        if (episodeIframe.length > 0) {
-          episodeIframeSrc = episodeIframe.attr("src");
-
-          if (episodeIframeSrc) {
-            try {
-              const iframePageResponse = await deps.axiosLecteurVideoRequest({
-                method: "get",
-                url: episodeIframeSrc,
-              });
-              const iframePage$ = cheerio.load(iframePageResponse.data);
-
-              let playerItems = iframePage$('li[onclick*="showVideo"]');
-              if (!playerItems.length) {
-                playerItems = iframePage$("div li[onclick]");
-              }
-
-              if (playerItems.length === 0) {
-                const bodyHtml = iframePage$("body").html() || "";
-                console.warn(
-                  `[COFLIX TV] ⚠️ Aucun playerItem — iframe: ${episodeIframeSrc}, status: ${iframePageResponse.status}, taille: ${(iframePageResponse.data || "").length} chars, aperçu HTML: ${bodyHtml.substring(0, 500)}`,
-                );
-              }
-
-              playerItems.each((i, element) => {
-                try {
-                  const $element = iframePage$(element);
-                  const onClickAttr = $element.attr("onclick") || "";
-
-                  const base64Match = onClickAttr.match(
-                    /showVideo\(['"]([^'\"]+)['"]/,
-                  );
-
-                  if (base64Match && base64Match[1]) {
-                    const base64Url = base64Match[1];
-
-                    let decodedUrl;
-                    try {
-                      decodedUrl = Buffer.from(base64Url, "base64").toString(
-                        "utf-8",
-                      );
-                    } catch (decodeError) {
-                      decodedUrl = null;
-                    }
-
-                    const quality = $element.find("span").text().trim();
-
-                    let language = "Unknown";
-                    const info = $element.find("p").text().trim();
-                    if (info.toLowerCase().includes("french")) {
-                      language = "French";
-                    } else if (info.toLowerCase().includes("english")) {
-                      language = "English";
-                    } else if (info.toLowerCase().includes("vostfr")) {
-                      language = "VOSTFR";
-                    }
-
-                    episodePlayerLinks.push({
-                      decoded_url: decodedUrl,
-                      quality: quality,
-                      language: language,
-                    });
-                  }
-                } catch (playerError) {
-                  const errorCode =
-                    playerError.response?.status ||
-                    playerError.code ||
-                    "unknown";
-                  console.error(
-                    `[COFLIX TV] ❌ Erreur extraction player: ${errorCode}`,
-                  );
-                }
-              });
-            } catch (iframePageError) {
-              const errorCode =
-                iframePageError.response?.status ||
-                iframePageError.code ||
-                "unknown";
-              console.error(
-                `[COFLIX TV] ❌ Erreur requête iframe ${episodeIframeSrc} — code: ${errorCode}, message: ${iframePageError.message}`,
-              );
-            }
-          }
-        }
-
-        return {
-          seasons: seasons,
-          current_episode: {
+    // `seasons` n'est utilise cote back que comme garde-fou "resultat non vide"
+    // (isEmptyResult dans tmdb.js) : on ne le remplit que si l'episode a des liens.
+    const hasPlayers = episodePlayerLinks.length > 0;
+    const seasons = hasPlayers
+      ? [
+          {
             season_number: seasonNumber,
-            episode_number: episodeNumber,
-            title: episodeTitle,
-            iframe_src:
-              episodeIframeSrc && !episodeIframeSrc.includes("coflix")
-                ? episodeIframeSrc
-                : null,
-            player_links: episodePlayerLinks,
+            name: `Saison ${seasonNumber}`,
+            episodes: [],
           },
-        };
-      } catch (episodeError) {
-        console.error(
-          `Erreur lors de la recuperation des donnees de l'episode: ${deps.formatCoflixError(episodeError)}`,
-        );
-        return {
-          seasons: seasons,
-          current_episode: null,
-        };
-      }
-    }
+        ]
+      : [];
 
     const result = {
       seasons: seasons,
-      current_episode: null,
+      current_episode: {
+        season_number: seasonNumber,
+        episode_number: episodeNumber,
+        title: episodeTitle,
+        iframe_src:
+          episodeIframeSrc && !/coflix\./i.test(episodeIframeSrc)
+            ? episodeIframeSrc
+            : null,
+        player_links: episodePlayerLinks,
+      },
     };
 
-    if (seasons.length > 0) {
+    if (hasPlayers) {
       await deps.saveToCache(CACHE_DIR.COFLIX, cacheKey, result);
     }
 
@@ -856,11 +779,11 @@ async function getTvDataFromCoflix(url, seasonNumber, episodeNumber) {
 
 module.exports = {
   configure,
+  COFLIX_ENABLED,
   normalizeCoflixQuery,
   searchCoflixByTitle,
   calculateTitleSimilarity,
   filterEmmmmbedReaders,
   getMovieDataFromCoflix,
-  fetchCoflixSeriesEpisodes,
   getTvDataFromCoflix,
 };

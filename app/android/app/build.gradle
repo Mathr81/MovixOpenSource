@@ -4,6 +4,7 @@ apply plugin: "com.facebook.react"
 
 react {
     autolinkLibrariesWithApp()
+    extraPackagerArgs = ["--max-workers", "2"]
 }
 
 def keystorePropertiesFile = rootProject.file("app/keystore.properties")
@@ -20,8 +21,8 @@ android {
         applicationId "com.movix.app"
         minSdk rootProject.ext.minSdkVersion
         targetSdk rootProject.ext.targetSdkVersion
-        versionCode 12
-        versionName "2.5.3"
+        versionCode 21
+        versionName "2.5.12"
 
         buildConfigField "int", "VERSION_CODE_INT", "${versionCode}"
         buildConfigField "String", "VERSION_NAME_STR", "\"${versionName}\""
@@ -61,21 +62,21 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
+
 }
 
 dependencies {
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:hermes-android")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
 
     // Google Cast (Chromecast) — see app/src/main/java/com/movix/app/cast/
     implementation("com.google.android.gms:play-services-cast-framework:21.5.0")
     implementation("androidx.mediarouter:mediarouter:1.7.0")
-}
-
-// androidx.legacy:legacy-support-core-utils:1.0.0 (tiré transitivement par
-// mediarouter → palette) embarque ses propres classes androidx.autofill.R$attr
-// qui entrent en collision avec le module androidx.autofill:autofill:1.1.0
-// utilisé par appcompat → "duplicate class" au mergeDexRelease.
-configurations.all {
-    exclude group: 'androidx.legacy', module: 'legacy-support-core-utils'
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }

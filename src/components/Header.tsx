@@ -130,7 +130,7 @@ const Header: React.FC = () => {
         { name: t('nav.settings'), path: '/settings', icon: <Settings size={20} />, color: 'gray', desc: t('nav.settingsDesc') },
         { name: t('nav.helpHub'), path: '/help', icon: <HelpCircle size={20} />, color: 'indigo', desc: t('nav.helpHubDesc') },
         { name: t('nav.github'), path: 'https://github.com/movixcorp/MovixOpenSource', icon: <Github size={20} />, color: 'gray', desc: t('nav.githubDesc'), external: true },
-        { name: t('footer.ourUrls'), path: 'https://movix.health', icon: <ExternalLink size={20} />, color: 'gray', desc: t('nav.officialLinksDesc'), external: true },
+        { name: t('footer.ourUrls'), path: 'https://movix.online', icon: <ExternalLink size={20} />, color: 'gray', desc: t('nav.officialLinksDesc'), external: true },
       ]
     },
   ].filter(g => g.items.length > 0), [t, isVip]);
@@ -427,7 +427,7 @@ const Header: React.FC = () => {
                   }`}
                 >
                   <LayoutGrid size={15} />
-                  <span>{t('nav.collections') === 'Collections' ? 'Explorer' : 'Explorer'}</span>
+                  <span>{t('nav.explore')}</span>
                   <ChevronDown size={14} className={`transition-transform duration-200 ${isExploreOpen ? 'rotate-180' : ''}`} />
                 </button>
               </nav>
@@ -617,9 +617,17 @@ const Header: React.FC = () => {
               <div className="absolute bottom-0 left-0 right-0 h-[200px] bg-gradient-to-t from-red-950/15 to-transparent pointer-events-none" />
 
               {/* Contenu scrollable */}
+              {/* max-h borne la hauteur du scroller au viewport. h-full seul =
+                  chaîne de height:100% sur 4 niveaux depuis fixed inset-0 :
+                  Safari/WebKit résout un maillon en `auto` → le scroller prend
+                  la hauteur du contenu, scrollHeight==clientHeight, plus rien à
+                  scroller (overflow clippé par le overflow-hidden de
+                  SquareBackground). 100dvh gère aussi la barre d'outils iOS ;
+                  max-h-screen (100vh) = fallback WebKit sans dvh. */}
               <div
-                className="relative h-full overflow-y-auto"
-                style={{ WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain' }}
+                data-lenis-prevent
+                className="relative h-full max-h-screen overflow-y-auto"
+                style={{ maxHeight: '100dvh', WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain' }}
               >
                 {/* Spacer pour le header */}
                 <div className="h-20" />

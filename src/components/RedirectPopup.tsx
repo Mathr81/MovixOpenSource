@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, MessageCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { DEFAULT_PUBLIC_DOMAIN } from '../i18n/currentDomain';
 
 interface RedirectPopupProps {
   isOpen: boolean;
@@ -83,7 +84,7 @@ const RedirectPopup: React.FC<RedirectPopupProps> = ({
                   {t('redirect.ourNewAddress')}
                 </h2>
                 <div className="bg-red-600/20 border-2 border-red-500 rounded-lg p-4 mb-4">
-                  <p className="text-3xl font-bold text-white">movix.tax</p>
+                  <p className="text-3xl font-bold text-white">{DEFAULT_PUBLIC_DOMAIN}</p>
                 </div>
                 <p className="text-gray-300 text-sm">
                   {t('redirect.joinTelegramNews')}

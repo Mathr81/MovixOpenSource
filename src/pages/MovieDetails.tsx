@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { getFrembedBase } from '../utils/frembedConfig';
 import { useParams, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
@@ -1370,7 +1371,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
       // =========== PROCESS FREMBED RESULTS ===========
       const isFrembedAvailable = frembedResult.isFrembedAvailable;
       setFrembedAvailable(isFrembedAvailable);
-      setVideoSource(`https://frembed.click/api/film.php?id=${movieId}`);
+      setVideoSource(`${getFrembedBase()}/api/film.php?id=${movieId}`);
 
       // =========== PROCESS COFLIX RESULTS ===========
       if (coflixResult) {
@@ -1387,7 +1388,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
     } catch (error) {
       console.error('Error fetching video sources:', error);
       setFrembedAvailable(false);
-      setVideoSource(`https://frembed.click/api/film.php?id=${movieId}`);
+      setVideoSource(`${getFrembedBase()}/api/film.php?id=${movieId}`);
       setLoadingAdFree(false);
       setLoadingCoflix(false);
       setLoadingOmega(false);
@@ -1913,7 +1914,7 @@ const VideoPlayer = ({ movieId, backdropPath }: { movieId: string; backdropPath?
                 : undefined // No sandbox for other players
             }
             src={
-              selectedSource === 'primary' ? `https://frembed.click/api/film.php?id=${movieId}` :
+              selectedSource === 'primary' ? `${getFrembedBase()}/api/film.php?id=${movieId}` :
                 selectedSource === 'peachify' ? `https://peachify.top/embed/movie/${movieId}?sub=French&accent=dc2626` :
                 selectedSource === 'vostfr' ? `https://vidsrc.wtf/api/3/movie/?id=${movieId}` :
                   selectedSource === 'videasy' ? `https://vidlink.pro/movie/${movieId}?primaryColor=0278fd&secondaryColor=a2a2a2&iconColor=eefdec&icons=default&player=default&title=true&poster=true&autoplay=true&nextbutton=false` :
@@ -2935,6 +2936,8 @@ const MovieDetails = (): JSX.Element => {
           backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})`,
           backgroundSize: 'cover',
           backgroundPosition: 'center',
+          willChange: 'transform',
+          transform: 'translateZ(0)',
         } : undefined}
       />
       <motion.div
@@ -3239,7 +3242,7 @@ const MovieDetails = (): JSX.Element => {
                       <h3 className="text-lg font-semibold mb-2">{t('details.ratingLabel')}</h3>
                       <div className="flex items-center gap-2">
                         <Star className="w-5 h-5 text-yellow-500 fill-yellow-500" />
-                        <p className="text-gray-300 text-lg font-bold">{movie.vote_average.toFixed(1)}<span className="text-sm font-normal text-gray-400">/10</span></p>
+                        <p className="text-gray-300 text-lg font-bold">{movie.vote_average != null ? movie.vote_average.toFixed(1) : 'N/A'}<span className="text-sm font-normal text-gray-400">/10</span></p>
                       </div>
                     </div>
 

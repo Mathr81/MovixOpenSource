@@ -6,7 +6,9 @@
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 
 export interface WrappedSlide {
-    type: 'intro' | 'top1' | 'top5' | 'top2-focus' | 'top3-focus' | 'persona' | 'peak-month' | 'top-genres' | 'listening-clock' | 'streak' | 'fun-fact' | 'closing' | 'detailed-stats' | 'session-summary' | 'watch-bookends';
+    // 'peak-month' n'est plus émis par le backend (remplacé par 'timeline') mais reste
+    // renderable pour les payloads encore en cache Redis (TTL 10 min) — ne pas supprimer.
+    type: 'intro' | 'top1' | 'top5' | 'top2-focus' | 'top3-focus' | 'persona' | 'peak-month' | 'top-genres' | 'listening-clock' | 'streak' | 'fun-fact' | 'closing' | 'detailed-stats' | 'session-summary' | 'watch-bookends' | 'timeline' | 'record-day' | 'rewatch' | 'watch-age' | 'pages-time' | 'quiz';
     title: string;
     subtitle?: string;
     text: string;
@@ -32,6 +34,9 @@ export interface WrappedTopContent {
     durationLabel?: string;
     tmdbId?: number;
     poster_path?: string;
+    backdrop_path?: string | null;
+    year?: number | null;
+    vote_average?: number | null;
     genres?: string[];
 }
 
@@ -93,6 +98,10 @@ export interface WrappedData {
     firstWatch?: WrappedFirstLastWatch | null;
     lastWatch?: WrappedFirstLastWatch | null;
     topPages: { page: string; minutes: number }[];
+    recordDay?: { date: string; minutes: number } | null;
+    weekday?: { dow: number; minutes: number }[];
+    rewatch?: { title: string; type: string; count: number } | null;
+    watchAgeYear?: number | null;
 }
 
 export interface WrappedProgress {

@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronDown, Check } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import i18n from '../i18n';
+import { useLightMode } from '../context/LightModeContext';
 
 interface DropdownOption {
   value: string;
@@ -33,6 +34,8 @@ const CustomDropdown: React.FC<CustomDropdownProps> = ({
   searchable = true
 }) => {
   const { t } = useTranslation();
+  const lightModeContext = useLightMode();
+  const animationsDisabled = !lightModeContext?.effectivePrefs?.transitions;
   const [isOpen, setIsOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -180,7 +183,63 @@ const CustomDropdown: React.FC<CustomDropdownProps> = ({
     }
   };
 
-  const menuContent = (
+  const innerMenu = (
+    <div
+      ref={contentRef}
+      style={menuStyle}
+      className="bg-gray-800 border border-gray-600 rounded-lg shadow-xl overflow-hidden"
+      data-lenis-prevent
+      onWheel={handleContentWheel}
+    >
+      {searchable && (
+        <div className="p-2 border-b border-gray-600">
+          <input
+            ref={searchRef}
+            type="text"
+            placeholder={t('common.searchPlaceholder')}
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            onKeyDown={handleKeyDown}
+          />
+        </div>
+      )}
+
+      <div
+        ref={listRef}
+        className={`max-h-48 overflow-y-auto overscroll-contain ${searchable ? 'rounded-b-lg' : 'rounded-lg'}`}
+        data-lenis-prevent
+        onWheel={handleContentWheel}
+      >
+        {filteredOptions.length > 0 ? (
+          filteredOptions.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => handleSelect(option.value)}
+              className={`w-full flex items-center justify-between px-3 py-2 text-left hover:bg-gray-700 transition-colors ${value === option.value ? 'bg-blue-600/20 text-blue-300' : 'text-white'}`}
+            >
+              <div className="flex items-center gap-2 flex-1 min-w-0">
+                {option.icon}
+                <span className="truncate">{option.label}</span>
+              </div>
+              {value === option.value && (
+                <Check className="w-4 h-4 text-blue-400 flex-shrink-0" />
+              )}
+            </button>
+          ))
+        ) : (
+          <div className="px-3 py-2 text-gray-400 text-sm text-center">
+            {t('common.noResults')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const menuContent = animationsDisabled ? (
+    isOpen ? innerMenu : null
+  ) : (
     <AnimatePresence>
       {isOpen && (
         <motion.div

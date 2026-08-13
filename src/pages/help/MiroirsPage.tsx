@@ -34,7 +34,7 @@ const MiroirsPage: React.FC = () => {
       components: {
         1: (
           <a
-            href="https://movix.health"
+            href="https://movix.online"
             target="_blank"
             rel="noopener noreferrer"
             className="font-medium text-indigo-400 hover:text-indigo-300 underline underline-offset-2 decoration-indigo-500/40 hover:decoration-indigo-400"

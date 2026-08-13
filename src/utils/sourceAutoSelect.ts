@@ -95,10 +95,18 @@ export function sortHostersByPriority<
   const langOrderEnabled = cat.languageOrder
     .filter((e) => e.enabled)
     .map((e) => String(e.id).toLowerCase());
+  // Fstream renvoie les catégories françaises sous forme `VFF` (Vraie VF) et
+  // `VFQ` (VF Québécoise) — variantes de `vf`. Sans normalisation, ces items
+  // tombent à MAX_SAFE_INTEGER et VOSTFR gagne par défaut.
+  const normalizeLang = (raw: string) => {
+    const v = raw.toLowerCase();
+    if (v === 'vff' || v === 'vfq') return 'vf';
+    return v;
+  };
   const langRank = (item: T) => {
     const raw = item.language ?? item.category;
     if (!raw) return Number.MAX_SAFE_INTEGER - 1; // sans langue explicite = juste après toutes les activées
-    const normalized = String(raw).toLowerCase();
+    const normalized = normalizeLang(String(raw));
     const idx = langOrderEnabled.indexOf(normalized);
     return idx === -1 ? Number.MAX_SAFE_INTEGER : idx;
   };

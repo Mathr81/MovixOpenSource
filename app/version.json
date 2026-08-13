@@ -1,13 +1,13 @@
 {
-  "version": "2.5.3",
-  "buildNumber": 12,
+  "version": "2.5.12",
+  "buildNumber": 21,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72023883,
-  "apkSha256": "6e63593a1c47cee9cf60414219e4e05ef11c7a72e77256ebaffb65af1cc8e977",
+  "apkSizeBytes": 72228150,
+  "apkSha256": "4f37a2bbb1c12c5842e9b1f65d45788ef2c920da6932e9010fe34236c961f291",
   "mandatory": false,
-  "releasedAt": "2026-05-10T09:47:30.589Z",
+  "releasedAt": "2026-08-11T15:56:00.472Z",
   "releaseNotes": {
-    "fr": "Correction extraction du lecteur Uqload\nL'écran se s'etteint plus lors de l'utilisation de l'app",
-    "en": ""
+    "fr": "Correction de la lecture Android avec un User-Agent compatible pour tous les flux proxifiés.",
+    "en": "Fixed Android playback with a compatible user agent for every proxied stream."
   }
 }

@@ -1,4 +1,5 @@
 import React, { CSSProperties, memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { useLightMode } from '../../context/LightModeContext';
 
 interface AnimatedBorderCardProps extends React.HTMLAttributes<HTMLDivElement> {
     children: React.ReactNode;
@@ -186,7 +187,9 @@ const AnimatedBorderCardComponent = ({
     ...props
 }: AnimatedBorderCardProps) => {
     const containerRef = useRef<HTMLDivElement>(null);
-    const shouldAnimate = animated && animationSpeed > 0;
+    const lightModeContext = useLightMode();
+    const animationsDisabled = !lightModeContext?.effectivePrefs?.transitions;
+    const shouldAnimate = animated && animationSpeed > 0 && !animationsDisabled;
     const animationDuration = `${Math.max(0.25, 6 / Math.max(animationSpeed, 0.01))}s`;
     const solidHighlight = useMemo(
         () => normalizeCssColor(highlightColor, 'rgb(251 191 36)'),
@@ -265,6 +268,7 @@ const AnimatedBorderCardComponent = ({
             '--highlight-soft': softHighlight,
             '--border-duration': animationDuration,
             '--border-play-state': shouldAnimate ? 'running' : 'paused',
+            '--border-color': !shouldAnimate ? solidHighlight : undefined,
             ...style,
         } as CSSProperties;
     }, [animationDuration, shouldAnimate, softHighlight, solidHighlight, style, surfaceColor]);

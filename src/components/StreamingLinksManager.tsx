@@ -38,6 +38,20 @@ interface Episode {
   name: string;
 }
 
+// API stores streaming links as either a plain URL string or a VIP-gated object.
+// Links added via the panel also carry an `added_by` owner stamp (used to scope
+// who may delete them).
+type StreamingLink =
+  | string
+  | {
+      url: string;
+      isVip?: boolean;
+      label?: string;
+      language?: string;
+      added_by?: { id: string; auth_type: string };
+      added_at?: string;
+    };
+
 const StreamingLinksManager: React.FC = () => {
   const { t } = useTranslation();
   const [currentMedia, setCurrentMedia] = useState<'movie' | 'tv'>('movie');
@@ -50,11 +64,12 @@ const StreamingLinksManager: React.FC = () => {
   const [selectedSeason, setSelectedSeason] = useState('');
   const [selectedEpisode, setSelectedEpisode] = useState('');
   const [links, setLinks] = useState<string[]>(['']);
-  const [currentLinks, setCurrentLinks] = useState<string[]>([]);
+  const [currentLinks, setCurrentLinks] = useState<StreamingLink[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isMassAddModalOpen, setIsMassAddModalOpen] = useState(false);
   const [massLinksText, setMassLinksText] = useState('');
   const [startEpisode, setStartEpisode] = useState(1);
+  const [rulesOpen, setRulesOpen] = useState(true);
 
   // États pour la pagination
   const [currentPage, setCurrentPage] = useState(1);
@@ -74,6 +89,10 @@ const StreamingLinksManager: React.FC = () => {
   });
   const [customHost, setCustomHost] = useState('');
   const [isFullSeason, setIsFullSeason] = useState(false);
+  // Current admin identity — used to hide the delete button on download links
+  // an uploader didn't add (admins keep it on all). The backend enforces this
+  // regardless; this is just so uploaders don't see buttons that would 403.
+  const [currentAdmin, setCurrentAdmin] = useState<{ userId: string; userType: string; role: string } | null>(null);
 
   const API_URL = import.meta.env.VITE_MAIN_API;
   const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -175,20 +194,25 @@ const StreamingLinksManager: React.FC = () => {
   const loadCurrentLinks = async () => {
     if (!selectedItem) return;
 
+    // Use the authed admin endpoint (not the public /api/links) so the response
+    // includes the `added_by` owner stamp needed to gate the delete buttons.
     try {
-      let url = `${API_URL}/api/links/${currentMedia}/${selectedItem.id}`;
+      let url = `${API_URL}/api/admin/streaming-links/${currentMedia}/${selectedItem.id}`;
 
-      if (currentMedia === 'tv' && selectedSeason && selectedEpisode) {
+      if (currentMedia === 'tv') {
+        if (!selectedSeason || !selectedEpisode) {
+          setCurrentLinks([]);
+          return;
+        }
         url += `?season=${selectedSeason}&episode=${selectedEpisode}`;
       }
 
-      const response = await axios.get(url);
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${getAuthToken()}` },
+      });
 
-      if (response.data.success) {
-        const links = currentMedia === 'movie'
-          ? response.data.data.links
-          : response.data.data[0]?.links || [];
-        setCurrentLinks(Array.isArray(links) ? links : []);
+      if (response.data?.success) {
+        setCurrentLinks(Array.isArray(response.data.links) ? response.data.links : []);
       } else {
         setCurrentLinks([]);
       }
@@ -375,48 +399,30 @@ const StreamingLinksManager: React.FC = () => {
     if (!confirm(t('streamingLinks.confirmDeleteOne'))) return;
     if (!selectedItem) return;
 
+    // Delete the single link by URL. The backend enforces ownership (uploaders
+    // may only remove links they added), so we no longer replace the whole array.
+    const link = currentLinks[index];
+    const linkUrl = typeof link === 'string' ? link : link.url;
+
     try {
-      const updatedLinks = currentLinks.filter((_, i) => i !== index);
+      const body: any = {
+        type: currentMedia,
+        id: selectedItem.id.toString(),
+        url: linkUrl,
+      };
 
-      if (updatedLinks.length === 0) {
-        // Supprimer complètement l'entrée
-        const body: any = {
-          type: currentMedia,
-          id: selectedItem.id.toString()
-        };
-
-        if (currentMedia === 'tv' && selectedSeason && selectedEpisode) {
-          body.season = parseInt(selectedSeason);
-          body.episode = parseInt(selectedEpisode);
-        }
-
-        await axios.delete(`${API_URL}/api/admin/links`, {
-          headers: {
-            'Authorization': `Bearer ${getAuthToken()}`,
-            'Content-Type': 'application/json'
-          },
-          data: body
-        });
-      } else {
-        // Mettre à jour avec les liens restants
-        const body: any = {
-          type: currentMedia,
-          id: selectedItem.id.toString(),
-          links: updatedLinks
-        };
-
-        if (currentMedia === 'tv' && selectedSeason && selectedEpisode) {
-          body.season = parseInt(selectedSeason);
-          body.episode = parseInt(selectedEpisode);
-        }
-
-        await axios.put(`${API_URL}/api/admin/links`, body, {
-          headers: {
-            'Authorization': `Bearer ${getAuthToken()}`,
-            'Content-Type': 'application/json'
-          }
-        });
+      if (currentMedia === 'tv' && selectedSeason && selectedEpisode) {
+        body.season = parseInt(selectedSeason);
+        body.episode = parseInt(selectedEpisode);
       }
+
+      await axios.delete(`${API_URL}/api/admin/links`, {
+        headers: {
+          'Authorization': `Bearer ${getAuthToken()}`,
+          'Content-Type': 'application/json'
+        },
+        data: body
+      });
 
       toast.success(t('streamingLinks.linkDeleted'));
       await loadCurrentLinks();
@@ -532,6 +538,49 @@ const StreamingLinksManager: React.FC = () => {
       loadCurrentDownloadLinks();
     }
   }, [selectedSeason, selectedEpisode, selectedItem, currentMedia, mode, isFullSeason]);
+
+  // Fetch current admin identity once so we can scope download-link deletion.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await axios.get(`${API_URL}/api/admin/check`, {
+          headers: { Authorization: `Bearer ${getAuthToken()}` },
+        });
+        if (res.data?.success && res.data.admin) {
+          setCurrentAdmin({
+            userId: String(res.data.admin.userId),
+            userType: String(res.data.admin.userType),
+            role: String(res.data.admin.role || 'admin'),
+          });
+        }
+      } catch {
+        // Non-blocking: leave identity unknown and defer to backend enforcement.
+      }
+    })();
+  }, [API_URL]);
+
+  // An uploader may only delete the download links they uploaded; admins may
+  // delete any. Mirrors the server check (added_by stamp). Fails open when the
+  // identity is still unknown — the backend is the real authority.
+  const canDeleteDownloadLink = (l: AdminDownloadLink): boolean => {
+    if (!currentAdmin) return true;
+    if (currentAdmin.role === 'admin') return true;
+    const stamp = l.added_by;
+    if (!stamp) return false;
+    const myAuthType = currentAdmin.userType === 'bip39' ? 'bip-39' : 'oauth';
+    return String(stamp.id) === String(currentAdmin.userId) && stamp.auth_type === myAuthType;
+  };
+
+  // Same ownership rule for streaming links. Legacy links (plain strings, or
+  // objects with no `added_by`) have no owner → only admins can delete them.
+  const canDeleteStreamingLink = (l: StreamingLink): boolean => {
+    if (!currentAdmin) return true;
+    if (currentAdmin.role === 'admin') return true;
+    const stamp = typeof l === 'object' ? l.added_by : undefined;
+    if (!stamp) return false;
+    const myAuthType = currentAdmin.userType === 'bip39' ? 'bip-39' : 'oauth';
+    return String(stamp.id) === String(currentAdmin.userId) && stamp.auth_type === myAuthType;
+  };
 
   return (
     <div className="space-y-6">
@@ -696,6 +745,78 @@ const StreamingLinksManager: React.FC = () => {
       >
         {selectedItem && (
           <div className="space-y-6">
+            {/* Uploader guidelines — applies to both streaming & download.
+                Toggle + grid-rows 0fr/1fr trick animates the collapse (native
+                <details> can't tween height). */}
+            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4">
+              <button
+                type="button"
+                onClick={() => setRulesOpen((o) => !o)}
+                className="flex w-full items-center gap-2 font-semibold text-amber-300"
+              >
+                {/* warning triangle */}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.8}
+                  className="h-5 w-5 flex-shrink-0"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
+                  />
+                </svg>
+                <span>Règles avant d'ajouter un lien</span>
+                {/* chevron flips with state */}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  className={`ml-auto h-4 w-4 flex-shrink-0 transition-transform duration-300 ${
+                    rulesOpen ? 'rotate-180' : ''
+                  }`}
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                </svg>
+              </button>
+              <div
+                className={`grid transition-all duration-300 ease-out ${
+                  rulesOpen ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+                }`}
+              >
+              <ul className="list-inside list-disc space-y-2 overflow-hidden pt-3 text-sm text-amber-100/90">
+                <li>
+                  <strong>Pas de doublons :</strong> ne réuploadez pas un lien déjà présent dans la
+                  liste, ni la même version (même hébergeur + même langue + même qualité) deux fois.
+                </li>
+                <li>
+                  <strong>Pas de chevauchement de versions :</strong> si un lien couvre déjà une
+                  langue (ex. MULTI ou VF+VOSTFR), n'ajoutez pas en plus le même hébergeur en VF
+                  seul. Une version par hébergeur / qualité suffit.
+                </li>
+                <li>
+                  <strong>Remplacez les CAM :</strong> dès qu'une meilleure qualité (HD / WEB /
+                  BluRay) est disponible, supprimez vos liens CAM / TS / basse qualité.
+                </li>
+                <li>
+                  <strong>Testez avant de poster :</strong> le lien doit lire le bon film / épisode,
+                  sans lien mort, redirection pub, survey ou .exe.
+                </li>
+                <li>
+                  <strong>Nettoyez :</strong> supprimez vos propres liens morts ou périmés.
+                </li>
+                <li>
+                  <strong>Une question / un doute ?</strong> MP&nbsp;: Discord{' '}
+                  <span className="font-mono text-amber-200">mysticsaba_alt</span> · Telegram{' '}
+                  <span className="font-mono text-amber-200">MysticSaba</span>.
+                </li>
+              </ul>
+              </div>
+            </div>
+
             {/* Season/Episode Selectors for TV */}
             {currentMedia === 'tv' && (
               <div className="space-y-4">
@@ -786,13 +907,15 @@ const StreamingLinksManager: React.FC = () => {
                     <div className="space-y-2">
                       {currentLinks.map((link, index) => (
                         <div key={index} className="flex items-center justify-between bg-gray-800 p-3 rounded-lg">
-                          <span className="text-gray-300 text-sm flex-1 break-all">{link}</span>
-                          <button
-                            onClick={() => deleteSpecificLink(index)}
-                            className="ml-3 px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
-                          >
-                            {t('streamingLinks.deleteLink')}
-                          </button>
+                          <span className="text-gray-300 text-sm flex-1 break-all">{typeof link === 'string' ? link : link.url}</span>
+                          {canDeleteStreamingLink(link) && (
+                            <button
+                              onClick={() => deleteSpecificLink(index)}
+                              className="ml-3 px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
+                            >
+                              {t('streamingLinks.deleteLink')}
+                            </button>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -940,12 +1063,14 @@ const StreamingLinksManager: React.FC = () => {
                             </div>
                           </div>
                         </div>
-                        <button
-                          onClick={() => deleteDownloadLinkFromList(l.url, Boolean(l.full_saison))}
-                          className="px-3 py-1 rounded bg-red-600 text-white text-sm"
-                        >
-                          Supprimer
-                        </button>
+                        {canDeleteDownloadLink(l) && (
+                          <button
+                            onClick={() => deleteDownloadLinkFromList(l.url, Boolean(l.full_saison))}
+                            className="px-3 py-1 rounded bg-red-600 text-white text-sm"
+                          >
+                            Supprimer
+                          </button>
+                        )}
                       </li>
                     ))}
                   </ul>

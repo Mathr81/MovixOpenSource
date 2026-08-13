@@ -104,7 +104,18 @@ const EmblaCarouselPlatforms: React.FC<EmblaCarouselPlatformsProps> = ({ title, 
                       if (!platform.video?.endsWith('.gif')) {
                         const video = document.getElementById(`video-${platform.id}`) as HTMLVideoElement | null;
                         if (video) {
-                          try { video.currentTime = 0; video.play(); } catch (_) {}
+                          try {
+                            // preload="none" : rien n'est téléchargé au mount (~2,4 Mo
+                            // économisés sur la Home). On ne déclenche le chargement
+                            // qu'au tout premier survol, une seule fois (dataset flag
+                            // pour ne pas relancer un fetch réseau aux survols suivants).
+                            if (!video.dataset.loaded) {
+                              video.dataset.loaded = 'true';
+                              video.load();
+                            }
+                            video.currentTime = 0;
+                            video.play().catch(() => {});
+                          } catch (_) {}
                         }
                       }
                     }}
@@ -145,7 +156,7 @@ const EmblaCarouselPlatforms: React.FC<EmblaCarouselPlatformsProps> = ({ title, 
                           loop
                           muted
                           playsInline
-                          preload="auto"
+                          preload="none"
                         >
                           <source src={platform.video} type="video/mp4" />
                         </video>

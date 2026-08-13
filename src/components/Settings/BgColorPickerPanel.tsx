@@ -12,6 +12,8 @@ interface BgColorPickerPanelProps {
    * de 60+ — fix le lag du re-render de SettingsPage (3440 lignes).
    */
   onCommit: (hex: string) => void;
+  /** Permet de forcer un affichage vertical dans les conteneurs étroits. */
+  layout?: 'auto' | 'column';
 }
 
 /**
@@ -24,6 +26,7 @@ export const BgColorPickerPanel = memo(function BgColorPickerPanel({
   committedHex,
   hint,
   onCommit,
+  layout = 'auto',
 }: BgColorPickerPanelProps) {
   const [draft, setDraft] = useState(committedHex);
   const commitTimerRef = useRef<number | null>(null);
@@ -75,7 +78,7 @@ export const BgColorPickerPanel = memo(function BgColorPickerPanel({
   }, [scheduleCommit]);
 
   return (
-    <div className="mt-4 flex flex-col sm:flex-row gap-4 items-start">
+    <div className={`mt-4 flex gap-4 items-start w-full ${layout === 'column' ? 'flex-col' : 'flex-col sm:flex-row'}`}>
       <div className="settings-color-picker">
         <HexColorPicker color={draft} onChange={handlePickerChange} />
       </div>

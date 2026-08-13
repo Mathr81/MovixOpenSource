@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
+import { getFrembedBase } from '../utils/frembedConfig';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import axios from 'axios';
@@ -9,6 +10,7 @@ import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 import AddToListMenu from '../components/AddToListMenu';
 import DetailsSkeleton from '../components/skeletons/DetailsSkeleton';
 
+import CustomDropdown from '../components/CustomDropdown';
 import ShareButtons from '../components/ShareButtons';
 import HLSPlayer, { HLSPlayerRef } from '../components/HLSPlayer';
 import { useAdFreePopup } from '../context/AdFreePopupContext';
@@ -56,6 +58,13 @@ interface TVShow {
   genres: { id: number; name: string }[];
   number_of_seasons?: number;
   number_of_episodes?: number;
+  seasons?: Array<{
+    season_number: number;
+    name: string;
+    poster_path: string | null;
+    air_date: string | null;
+    episode_count: number;
+  }>;
   status?: string;
   type?: string;
   episode_run_time?: number[];
@@ -922,6 +931,28 @@ const groupCrewMembers = (crew: CrewMember[]): GroupedCrewMember[] => {
   return Array.from(groupedMap.values());
 };
 
+// Sur certains réseaux (proxy FAI / cache CloudFront), la réponse fr-FR d'une
+// saison arrive corrompue : le corps n'est ni du JSON ni du gzip valide, donc
+// `episodes` est absent (symptôme : "Pas d'épisodes" sur PC, OK sur mobile).
+// On bascule alors sur l'objet en-US — clé de cache CDN différente, donc
+// généralement saine. Numéros d'épisode et dates sont indépendants de la langue.
+const fetchSeasonDetails = async (
+  showId: string | number | null | undefined,
+  season: number
+): Promise<any | null> => {
+  const base = `https://api.themoviedb.org/3/tv/${showId}/season/${season}?api_key=${TMDB_API_KEY}`;
+  const langs = [...new Set([getTmdbLanguage(), 'en-US'])];
+  for (const lang of langs) {
+    try {
+      const { data } = await axios.get(`${base}&language=${lang}`);
+      if (data && Array.isArray(data.episodes)) return data;
+    } catch {
+      // erreur réseau / décodage : on tente la langue suivante
+    }
+  }
+  return null;
+};
+
 const checkEpisodeAvailability = async (showId: string, seasonNumber: number, episodeNumber: number) => {
   let customLinks: string[] = [];
   let isFrembedAvailable = false;
@@ -1510,7 +1541,7 @@ const VideoPlayer = forwardRef<VideoPlayerRefHandle, VideoPlayerProps>(({ showId
     }
     switch (selectedSource as 'primary' | 'peachify' | 'vostfr' | 'multi' | 'videasy' | 'vidsrccc' | 'vidsrcsu' | 'vidsrcwtf1' | 'vidsrcwtf5' | 'omega' | 'darkino' | 'mp4' | number) {
       case 'primary':
-        newSrc = `https://frembed.click/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
+        newSrc = `${getFrembedBase()}/api/serie.php?id=${showId}&sa=${seasonNumber}&epi=${episodeNumber}`;
         break;
       case 'peachify':
         newSrc = `https://peachify.top/embed/tv/${showId}/${seasonNumber}/${episodeNumber}?sub=French&accent=dc2626`;
@@ -2747,21 +2778,19 @@ const TVDetails: React.FC = () => {
         seasonPromises.push(
           (async () => {
             try {
-              // Fetch season details
-              const seasonResponse = await axios.get(
-                `https://api.themoviedb.org/3/tv/${id}/season/${season}?api_key=${TMDB_API_KEY}&language=${getTmdbLanguage()}`
-              );
-              const seasonData = seasonResponse.data;
-              newSeasonsDetails[season] = seasonData;
-              const episodesData = seasonData.episodes;
-              for (const episodeData of episodesData) {
-                const airDate = episodeData.air_date ? new Date(episodeData.air_date) : null;
-                if (airDate) airDate.setHours(0, 0, 0, 0);
-                if (!airDate || airDate <= today) {
-                  allEpisodes.push({
-                    sa: season,
-                    epi: episodeData.episode_number
-                  });
+              // Fetch season details (bascule sur en-US si la réponse fr-FR est corrompue)
+              const seasonData = await fetchSeasonDetails(id, season);
+              if (seasonData) {
+                newSeasonsDetails[season] = seasonData;
+                for (const episodeData of seasonData.episodes) {
+                  const airDate = episodeData.air_date ? new Date(episodeData.air_date) : null;
+                  if (airDate) airDate.setHours(0, 0, 0, 0);
+                  if (!airDate || airDate <= today) {
+                    allEpisodes.push({
+                      sa: season,
+                      epi: episodeData.episode_number
+                    });
+                  }
                 }
               }
 
@@ -4080,40 +4109,65 @@ const TVDetails: React.FC = () => {
     // Déterminer le mode par défaut basé sur le nombre d'épisodes
     const defaultDropdownMode = nonEmptyEpisodes.length > 15;
 
-    const handleAnimeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-      const episode = nonEmptyEpisodes.find((ep: any) => ep.index === Number(e.target.value));
-      if (episode) {
-        setSelectedEpisode(episode.index);
-        setSelectedAnimeEpisode(episode);
+    const selectableEpisodes = nonEmptyEpisodes.filter((ep: any) => {
+      if (type === 'anime') return true;
+      const today = new Date();
+      const airDate = ep.air_date ? new Date(ep.air_date) : null;
+      const isFuture = airDate && airDate > today;
+      return !isFuture;
+    });
 
-        const hasVf = episode.streaming_links.some((link: any) => link.language === 'vf');
-        const hasVostfr = episode.streaming_links.some((link: any) => link.language === 'vostfr');
-
-        if (hasVf) {
-          setSelectedLanguage('vf');
-        } else if (hasVostfr) {
-          setSelectedLanguage('vostfr');
-        }
-        setSelectedPlayer('0');
-
-        if (cinemaMode && id && selectedSeason) {
-          // Rediriger vers la page de visionnage anime en mode cinéma
-          navigate(`/watch/anime/${encodeId(id)}/season/${selectedSeason}/episode/${episode.index}`);
-          return;
-        }
-
-        // Scroll vers la section des lecteurs immédiatement
-        setTimeout(() => {
-          const playerSection = animeVideoPlayerSectionRef.current;
-          if (playerSection) {
-            playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 0); // Délai mis à 0ms
+    const dropdownOptions = selectableEpisodes.map((ep: any) => {
+      if (type === 'anime') {
+        const allLanguages = ep.streaming_links.map((link: any) => {
+          return getAnimeLanguageLabel(link.language, t);
+        }).join(', ');
+        return {
+          value: ep.index.toString(),
+          label: `${ep.index}. ${ep.name} ${allLanguages ? `(${allLanguages})` : ''}`,
+        };
+      } else {
+        return {
+          value: ep.episode_number.toString(),
+          label: shouldHide('episodeNames') 
+            ? getMaskedContent(ep.name, 'episodeNames', undefined, ep.episode_number) 
+            : `${ep.episode_number}. ${ep.name}`,
+        };
       }
-    };
+    });
 
-    const handleStandardChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-      handleEpisodeChange(Number(e.target.value));
+    const handleDropdownChange = (valueStr: string) => {
+      if (type === 'anime') {
+        const episode = nonEmptyEpisodes.find((ep: any) => ep.index === Number(valueStr));
+        if (episode) {
+          setSelectedEpisode(episode.index);
+          setSelectedAnimeEpisode(episode);
+
+          const hasVf = episode.streaming_links.some((link: any) => link.language === 'vf');
+          const hasVostfr = episode.streaming_links.some((link: any) => link.language === 'vostfr');
+
+          if (hasVf) {
+            setSelectedLanguage('vf');
+          } else if (hasVostfr) {
+            setSelectedLanguage('vostfr');
+          }
+          setSelectedPlayer('0');
+
+          if (cinemaMode && id && selectedSeason) {
+            navigate(`/watch/anime/${encodeId(id)}/season/${selectedSeason}/episode/${episode.index}`);
+            return;
+          }
+
+          setTimeout(() => {
+            const playerSection = animeVideoPlayerSectionRef.current;
+            if (playerSection) {
+              playerSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }, 0);
+        }
+      } else {
+        handleEpisodeChange(Number(valueStr));
+      }
     };
 
     const handleAnimeGridClick = (episode: any) => {
@@ -4158,46 +4212,17 @@ const TVDetails: React.FC = () => {
           >
             <div className="flex justify-start mb-6">  {/* Alignement à gauche */}
               <div className="w-full max-w-md">
-                <label htmlFor={`${type}-episode-select`} className="block text-sm font-medium text-gray-400 mb-2">
+                <label className="block text-sm font-medium text-gray-400 mb-2">
                   {t('details.selectEpisode')}
                 </label>
-                <div className="relative">
-                  <select
-                    id={`${type}-episode-select`}
-                    value={selectedEpisode ? selectedEpisode.toString() : ""}
-                    onChange={isAnime ? handleAnimeChange : handleStandardChange}
-                    className="block w-full bg-gray-800 border border-gray-700 text-white py-3 px-4 pr-8 rounded-lg appearance-none focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-red-500"
-                  >
-                    <option value="" disabled>{t('details.chooseEpisode')}</option>
-                    {nonEmptyEpisodes.map((ep: any) => {
-                      // ... options rendering ...
-                      if (isAnime) {
-                        // Récupérer toutes les langues disponibles pour cet épisode
-                        const allLanguages = ep.streaming_links.map((link: any) => {
-                          return getAnimeLanguageLabel(link.language, t);
-                        }).join(', ');
-
-                        return (
-                          <option key={ep.index} value={ep.index}>
-                            {ep.index}. {ep.name} {allLanguages ? `(${allLanguages})` : ''}
-                          </option>
-                        );
-                      } else {
-                        const today = new Date();
-                        const airDate = ep.air_date ? new Date(ep.air_date) : null;
-                        const isFuture = airDate && airDate > today;
-                        return (
-                          <option key={ep.episode_number} value={ep.episode_number} disabled={!!isFuture}>
-                            {shouldHide('episodeNames') ? getMaskedContent(ep.name, 'episodeNames', undefined, ep.episode_number) : `${ep.episode_number}. ${ep.name}`} {isFuture ? `(${t('details.upcomingBadge')})` : ''}
-                          </option>
-                        );
-                      }
-                    })}
-                  </select>
-                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-white">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                  </div>
-                </div>
+                <CustomDropdown
+                  options={dropdownOptions}
+                  value={selectedEpisode ? selectedEpisode.toString() : ""}
+                  onChange={handleDropdownChange}
+                  placeholder={t('details.chooseEpisode')}
+                  searchable={true}
+                  className="w-full"
+                />
               </div>
             </div>
           </motion.div>
@@ -4337,7 +4362,7 @@ const TVDetails: React.FC = () => {
                                     <span className="text-sm">{t('details.imageMasked')}</span>
                                   </div>
                                 ) : (
-                                  <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-tv h-8 w-8 text-white/20"><rect width="20" height="15" x="2" y="7" rx="2" ry="2"></rect><polyline points="17 2 12 7 7 2"></polyline></svg>
+                                  <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-tv h-8 w-8 text-white opacity-20"><rect width="20" height="15" x="2" y="7" rx="2" ry="2"></rect><polyline points="17 2 12 7 7 2"></polyline></svg>
                                 )}
                               </div>
                             )}
@@ -4401,7 +4426,7 @@ const TVDetails: React.FC = () => {
                                   </div>
                                   {ep.runtime && (
                                     <div className="flex items-center gap-1.5">
-                                      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-clock h-3.5 w-3.5 text-red-400/70"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                                      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-clock h-3.5 w-3.5 text-red-400 opacity-70"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
                                       <span>{Math.floor(ep.runtime / 60)}h {ep.runtime % 60}m</span>
                                     </div>
                                   )}
@@ -4538,6 +4563,8 @@ const TVDetails: React.FC = () => {
           backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.7), rgba(0,0,0,0.9)), url(${backdropImage})`,
           backgroundSize: 'cover',
           backgroundPosition: 'center',
+          willChange: 'transform',
+          transform: 'translateZ(0)',
         } : undefined}
       />
       <div className="relative z-10 min-h-screen">
@@ -5099,8 +5126,12 @@ const TVDetails: React.FC = () => {
                           })
                         ) : (
                           /* Affichage standard des saisons pour les séries non-anime */
-                          availableSeasons.map((season) => {
-                            const details = seasonsDetails[season];
+                          [...(tvShow.seasons ?? [])]
+                            .filter((sm) => !(String(id) === '71446' && sm.season_number === 1))
+                            .sort((a, b) => a.season_number - b.season_number)
+                            .map((seasonMeta) => {
+                            const season = seasonMeta.season_number;
+                            const details = seasonsDetails[season] || seasonMeta;
                             const imageUrl = details?.poster_path ? `https://image.tmdb.org/t/p/original${details.poster_path}` : getSeasonFallbackSvg(t('details.season').toUpperCase());
                             const imageKey = `season-${season}-poster`;
                             const hasFailed = failedImages[imageKey];
@@ -5146,7 +5177,7 @@ const TVDetails: React.FC = () => {
                                     </h3>
                                     <div className="flex items-center gap-2 mt-1">
                                       <span className="text-xs text-gray-300">{details?.air_date ? new Date(details.air_date).getFullYear() : ''}</span>
-                                      <span className="text-xs text-gray-400 ml-auto">{details?.episodes?.length || 0} {t('details.episodes')}</span>
+                                      <span className="text-xs text-gray-400 ml-auto">{details?.episodes?.length ?? details?.episode_count ?? 0} {t('details.episodes')}</span>
                                     </div>
                                   </div>
                                   {selectedSeason === season && (

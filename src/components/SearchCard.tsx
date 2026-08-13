@@ -250,7 +250,7 @@ export const SearchListCard: React.FC<ListCardProps> = React.memo(({ item, index
                                 <span>{item.vote_average?.toFixed(1) || 'N/A'}</span>
                             </div>
                             <div className="flex items-center gap-1">
-                                <Calendar className="w-4 h-4 text-white/30" />
+                                <Calendar className="w-4 h-4 text-white opacity-30" />
                                 <span>{new Date(item.release_date || item.first_air_date || '').getFullYear() || 'N/A'}</span>
                             </div>
                         </div>
@@ -273,7 +273,7 @@ export const SearchListCard: React.FC<ListCardProps> = React.memo(({ item, index
                                         transition={{ type: 'spring', stiffness: 500, damping: 15 }}
                                     >
                                         <Star
-                                            className={`w-4 h-4 transition-colors duration-150 ${starred ? 'text-yellow-400' : 'text-white/60'}`}
+                                            className={`w-4 h-4 transition-colors duration-150 ${starred ? 'text-yellow-400' : 'text-white opacity-60'}`}
                                             fill={starred ? 'currentColor' : 'none'}
                                         />
                                     </motion.div>

@@ -13,6 +13,24 @@ const crypto = require("crypto");
 const cheerio = require("cheerio");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { verifyAccessKey, requireVip } = require("./checkVip");
+const {
+  VAVOO_GROUPS,
+  vavooGroupSlug,
+  buildVavooCatalogs,
+} = require("./utils/vavooCatalogs");
+const {
+  DADDYLIVE_BASE_URL,
+  DADDYLIVE_REFERER,
+  DADDYLIVE_ORIGIN,
+  DADDYLIVE_CHANNELS_PATH,
+  DADDYLIVE_PLACEHOLDER_POSTER,
+  DADDYLIVE_COUNTRIES,
+  parseChannelsHtml: parseDaddyliveChannelsHtml,
+  parsePlayersHtml: parseDaddylivePlayersHtml,
+  buildDeterministicPlayers: buildDaddyliveDeterministicPlayers,
+  extractM3u8FromPlayerHtml: extractDaddyliveM3u8,
+  extractIframeSrc: extractDaddyliveIframeSrc,
+} = require("./utils/daddylive");
 
 // SOCKS5H Proxy configuration pour WITV
 const WITV_PROXY_URL = process.env.WITV_SOCKS5_PROXY_URL || "";
@@ -24,8 +42,6 @@ const router = express.Router();
 
 // === CONFIGURATION ===
 const TVDIRECT_BASE_URL = "https://tvdirect.ddns.net";
-// URL de base pour la source Vavoo (configuration France)
-const VAVOO_BASE_URL = "https://tvvoo.hayd.uk/cfg-fr";
 // URL du serveur proxy local (proxiesembed)
 const PROXY_SERVER_URL = process.env.PROXY_SERVER_URL;
 /*
@@ -80,7 +96,7 @@ const PROXY_SERVER_URL = process.env.PROXY_SERVER_URL;
 const TVMIO_CATEGORIES = {};
 
 // URL de base pour Wiflix (Witv)
-const WITV_BASE_URL = "https://witv.team";
+const WITV_BASE_URL = "https://witv.football";
 // Cloudflare proxy for 403 bypass (livehdtv)
 const CF_PROXY_403 = process.env.CF_PROXY_403_URL;
 
@@ -265,7 +281,7 @@ const BOLALOCA_CHANNELS = [
   },
 ];
 
-const LIVETV_BASE_URL = "https://livetv882.me";
+const LIVETV_BASE_URL = "https://livetv901.me";
 const LIVETV_EMBED_REFERER = `${LIVETV_BASE_URL}/`;
 const LIVETV_ALLUPCOMING_PATHS = ["/frx/allupcoming/", "/frx/ads/"];
 const LIVETV_CATEGORIES = {
@@ -375,14 +391,447 @@ const SOSPLAY_MATCHES_CATEGORIES = {
   },
 };
 
-// Linkzy configuration (FREE source - no extension/VIP required)
-const LINKZY_CATEGORIES = {
-  general: { id: "linkzy_generaliste", name: "Généraliste", emoji: "📺" },
-  sports: { id: "linkzy_sport", name: "Sport", emoji: "⚽" },
-  movies: { id: "linkzy_cinema", name: "Cinéma", emoji: "🎬" },
-  chaines_info: { id: "linkzy_info", name: "Informations", emoji: "📰" },
-  chaines_jeunesse: { id: "linkzy_jeunesse", name: "Jeunesse", emoji: "👶" },
+// FCTV33 / RBTV-style API used for the matches catalog.
+// EU endpoint (defra) is used by default for European users.
+// Fallback API base — normally auto-resolved at runtime (getFctvApiBase); this
+// hardcoded value is used only when the cache is empty / auto-resolve fails.
+const FCTV_API_BASE_URL = "https://apis-data-defra10.tcore131ybdf.ru";
+// Fallback embed player origin — normally auto-resolved (getFctvPlayerBaseUrl).
+// Used for the iframe player + referer when the lookup is unavailable.
+const FCTV_PLAYER_BASE_URL = "https://zac07eo.mpipzni2naturally32kistomach.ru";
+
+// --- Native (HLSPlayer) stream tokenisation -------------------------------
+// /api/stream/detail (unsigned, with continent/country/digit) returns an
+// `rb-session` header + a masked URL that decodes to the proxy m3u8 path.
+// The CDN gate is `/token-<T>/` where T = base64( rbSession XOR keystream ) + "a"
+// (a fixed RC4-style keystream; recovered from a known token↔rb-session pair).
+// The proxy m3u8 + its TS segments are Referer-gated to the player origin, so
+// the native stream must be fetched through PROXY_SERVER_URL with that Referer.
+const FCTV_STREAM_DIGIT = "seth";
+const FCTV_GEO_CONTINENT = "EU";
+const FCTV_GEO_COUNTRY = "FR";
+// Keystream (hex). Edit this value when upstream rotates its key (native breaks
+// with 403/404 → re-capture one token↔rb-session pair and XOR them,
+// scripts/fctv_token_crack.cjs).
+const FCTV_TOKEN_KEYSTREAM = Buffer.from(
+  "15764bab80a419c6abdd5518f3db0ea95bb3b9a2e2b519ce5c159af6917e2000c2d680ae30706a3aba1c9c25786c7c28774eecf20450a3cf414ca17f6472798cfa557c7a8705b7861f06e84f827f8a24676eeab77ce504bfc335b79609b9",
+  "hex",
+);
+const FCTV_LANGUAGE_FR = 6;
+const FCTV_DEFAULT_SITE_TYPE = 2001;
+
+// Image proxy for FCTV logos: derived from the shared bypass403 proxy
+// (${BYPASS403_SERVER_URL}/proxy), with a hardcoded fallback.
+const FCTV_IMAGE_PROXY = process.env.BYPASS403_SERVER_URL
+  ? `${process.env.BYPASS403_SERVER_URL.replace(/\/+$/, "")}/proxy`
+  : "https://proxy.movix.fun/proxy";
+
+function proxifyFctvImage(url) {
+  if (!url) return "";
+  
+  // Replace dead domains with the working one
+  let fixedUrl = url;
+  try {
+    const urlObj = new URL(url);
+    if (urlObj.hostname.startsWith("logos1.")) {
+      urlObj.hostname = "logos1.tcore131ybdf.ru";
+    }
+    fixedUrl = urlObj.toString();
+  } catch (e) {
+    // fallback if it's not a full URL
+    fixedUrl = url.replace(/logos1\.[a-z0-9]+\.(cfd|ru|com)/g, "logos1.tcore131ybdf.ru");
+  }
+
+  const proxy = FCTV_IMAGE_PROXY.endsWith("/") ? FCTV_IMAGE_PROXY : FCTV_IMAGE_PROXY + "/";
+  return `${proxy}${fixedUrl}`;
+}
+
+const FCTV_MATCHES_CATEGORIES = {
+  matches_all: {
+    name: "All Sports",
+    emoji: "🏅",
+    sportKey: "all",
+    sportType: 0,
+  },
+  matches_football: {
+    name: "Football",
+    emoji: "\u26bd",
+    sportKey: "football",
+    sportType: 1,
+  },
 };
+const FCTV_API_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  Accept: "application/x-protobuf,application/json,*/*",
+  Origin: FCTV_PLAYER_BASE_URL,
+  Referer: `${FCTV_PLAYER_BASE_URL}/`,
+};
+
+// V mapping: API endpoint paths -> bs code numbers (from upstream client JS)
+const FCTV_BS_CODE_MAP = {
+  "/api/match/live": 100,
+  "/api/match/schedule": 101,
+  "/api/match/detail": 102,
+  "/api/match/event": 103,
+  "/api/match/statistic": 104,
+  "/api/match/trend": 105,
+  "/api/match/lineup": 106,
+  "/api/match/analysis": 107,
+  "/api/match/count": 190,
+  "/api/league/detail": 200,
+  "/api/league/season/list": 210,
+  "/api/league/match/list": 220,
+  "/api/league/team/total/list": 230,
+  "/api/league/player/total/list": 231,
+  "/api/league/team/standing/list": 240,
+  "/api/odds/list": 300,
+};
+
+// In-memory cache for bs keys (from /api/common/bs)
+let fctvBsKeysCache = null;
+let fctvBsKeysCacheTime = 0;
+const FCTV_BS_KEYS_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Fetch body-signature keys from /api/common/bs.
+ * These keys are used to build the sfver path prefix required by the upstream API.
+ */
+async function fetchFctvBsKeys(sportType = 0) {
+  // Return cached keys if fresh
+  if (fctvBsKeysCache && Date.now() - fctvBsKeysCacheTime < FCTV_BS_KEYS_TTL) {
+    return fctvBsKeysCache;
+  }
+
+  try {
+    const codes = [100, 101, 102, 103, 104, 105, 106, 107];
+    const params = new URLSearchParams();
+    params.set("stream", "true");
+    params.set("sportType", String(sportType));
+    codes.forEach((c) => params.append("code", String(c)));
+
+    const apiBase = await getFctvApiBase();
+    const response = await axios.get(`${apiBase}/api/common/bs`, {
+      params,
+      responseType: "arraybuffer",
+      headers: FCTV_API_HEADERS,
+      timeout: 10000,
+    });
+
+    const { body } = parseFctvBody(response.data);
+    const kvEntries = fctvAll(body, 1);
+    const keys = {};
+
+    for (const entry of kvEntries) {
+      const entryFields = fctvFields(entry);
+      const code = fctvValue(entryFields, 1);
+      const key = fctvString(fctvValue(entryFields, 2));
+      if (code != null && key) {
+        keys[Number(code)] = key;
+      }
+    }
+
+    console.log(`[FCTV-BS] Fetched ${Object.keys(keys).length} bs keys`);
+    fctvBsKeysCache = keys;
+    fctvBsKeysCacheTime = Date.now();
+    return keys;
+  } catch (error) {
+    console.warn(`[FCTV-BS] Error fetching bs keys: ${error.message}`);
+    return fctvBsKeysCache || {};
+  }
+}
+
+/**
+ * Build the sfver path prefix for a given API endpoint and params.
+ * Format: sfver + MD5(JSON.stringify(sortedParams)).slice(0,6) + bsKey
+ */
+function buildFctvSfverPrefix(pathname, params, bsKeys) {
+  const au = { ...params };
+  delete au.usls;
+  delete au.cBsDataTep;
+
+  const ap = ['matchId', 'leagueId', 'seasonId', 'sportType', 'language', 'stream'];
+  
+  const sortedKeys = Object.keys(au).sort((a, b) => ap.indexOf(a) - ap.indexOf(b));
+  
+  const sortedObj = {};
+  for (const key of sortedKeys) {
+    sortedObj[key] = au[key];
+  }
+  
+  const jsonStr = JSON.stringify(sortedObj);
+  const md5Hash = crypto.createHash("md5").update(jsonStr).digest("hex").slice(0, 6);
+  
+  // Try to find the bsCode mapping, but for /api/stream/detail it's missing in some clients so default to bsKeys[102]
+  const bsCode = FCTV_BS_CODE_MAP[pathname];
+  const bsKey = (bsCode && bsKeys[bsCode]) || bsKeys[102] || bsKeys[100] || "";
+  
+  return `sfver${md5Hash}${bsKey}`;
+}
+
+// === NORTHLIVE (FREE source — no extension / no VIP) ===================
+// northlive exposes ~1100 channels, each with a ready-to-embed `player_url`
+// (iframe). The upstream `category` field dumps ~60% of channels in a single
+// generic "IPTV" bucket, so we re-classify by channel name into usable content
+// categories. Scope: France + DOM-TOM only (per product decision). The full
+// list is refreshed hourly (fetchAllNorthlive) and cached to disk.
+const NORTHLIVE_BASE =
+  process.env.NORTHLIVE_BASE_URL || "https://northlive.lol/api/v1/index.php";
+const NORTHLIVE_API_KEY =
+  process.env.SWIFTFLOW_API_KEY || process.env.NORTHLIVE_API_KEY || "";
+const NORTHLIVE_REFRESH_MS = 60 * 60 * 1000; // 1h — user requested hourly refresh
+
+// Supplemental channel logos (slug -> url). northlive ships a logo for only ~40%
+// of channels; this map fills the rest (built from northlive's own logos + an
+// iptv-org name match — see scripts/build_northlive_logos.mjs). Optional: a
+// missing file just means no fallback logo.
+let NORTHLIVE_LOGOS = {};
+try {
+  NORTHLIVE_LOGOS = require("./northlive_logos.json");
+} catch (e) {
+  console.warn(`[NORTHLIVE] logo map not loaded: ${e.message}`);
+}
+
+// UI categories (catalog id -> label). Order = pill/catalog display order.
+const NORTHLIVE_CATEGORIES = {
+  northlive_sport: { name: "Sport", emoji: "⚽" },
+  northlive_cinema: { name: "Cinéma", emoji: "🎬" },
+  northlive_series: { name: "Séries & Films", emoji: "🎞️" },
+  northlive_generaliste: { name: "Généraliste", emoji: "📺" },
+  northlive_info: { name: "Info", emoji: "📰" },
+  northlive_jeunesse: { name: "Jeunesse", emoji: "🧒" },
+  northlive_musique: { name: "Musique", emoji: "🎵" },
+  northlive_docs: { name: "Découverte & Docs", emoji: "🌍" },
+  northlive_divertissement: { name: "Divertissement", emoji: "🎭" },
+  northlive_regional: { name: "Régional & Local", emoji: "🏙️" },
+  northlive_autres: { name: "Autres", emoji: "📦" },
+};
+
+// France métropole + DOM-TOM. The upstream `country` field uses "France",
+// "France Martinique", "France GP", "France Guadeloupe", "France MQ", etc. —
+// every France-family value starts with "france".
+function isNorthliveFrance(country) {
+  return typeof country === "string" && country.trim().toLowerCase().startsWith("france");
+}
+
+// ponytail: name-keyword classifier (heuristic). The upstream "IPTV" bucket has
+// no sub-genre, so we infer it from the channel name. Tune the arrays below if a
+// channel lands in the wrong tab. Checked in priority order (first hit wins).
+const NORTHLIVE_KEYWORDS = [
+  ["northlive_sport", ["SPORT", "BEIN", "RMC SPORT", "DAZN", "EUROSPORT", "LIGUE 1", "LIGUE1", "FOOT", "MULTISPORT", "GOLF", "EQUIDIA", "TENNIS", "KOMBAT", "MOTO GP", "MOTOGP", "ELEVEN", "INFOSPORT", "SKWEEK", "AUTOMOTO", "AUTO MOTO", "AB MOTEURS", "OL TV", "PSG", "MOTOR", "NAUTICAL"]],
+  ["northlive_jeunesse", ["GULLI", "CANAL J", "CANAL+ KIDS", "PIWI", "TIJI", "DISNEY", "NICK", "CARTOON", "BOOMERANG", "BOING", "TELETOON", "MANGAS", "GAME ONE", "OKOO", "TOONAMI", "BEYBLADE", "YU-GI-OH", "BOB LEPONGE", "CAILLOU", "MR. BEAN", "KIDZ", "KIDS", "JUNIOR", "SCHTROUMPF", "SUPERTOONS", "J-ONE", "GONG", "BABY TV", "TOONS", "TV PITCHOUN", "XILAM", "BEYBLADE"]],
+  ["northlive_cinema", ["CINE", "CINÉ", "CINA", "OCS", "TCM", "BOX OFFICE", "BOXOFFICE", "PARAMOUNT", "GRAND ECRAN", "ALTICE STUDIO", "ACTION", "MOVIE", "FILM", "WILDSIDE", "MOVIESPHERE", "CANAL PLAY"]],
+  ["northlive_series", ["SERIE", "SÉRIE", "WARNER", "SUNDANCE", "SYFY", "BBC DRAMA", "BBC SÉRIES", "BBC SERIES", "SONY", "NOVELA", "POLAR", "CRIME", "HOMICIDE", "DRAMA", "SEASON", "DETECTIVE", "COMEDY", "ENQUÊTE", "ENQUETE", "TELENOVELA", "TELE NOVELA"]],
+  ["northlive_info", ["INFO", "BFM", "CNEWS", "C NEWS", "C-NEWS", "LCI", "EURONEWS", "I24", "CGTN", "RT FRANCE", "LCP", "PUBLIC SENAT", "PUBLIC SÉNAT", "MONACO INFO", "TECH & CO", "B SMART", "BUSINESS", "LE FIGARO", "20 MINUTES", "FRANCE 24", "AFRICA 24", "FRANCOPHONIE 24", "LE MÉDIA"]],
+  ["northlive_musique", ["MUSIC", "MUSIQUE", "MTV", "TRACE", "NRJ", "MCM", "MEZZO", "RFM", "MELODY", "VEVO", "SKYROCK", "DJAZZ", "STINGRAY", "ZOUK", "SALSA", "CUMBIA", "K-POP", "METAL", "JAZZ", "DANCE", "QWEST", "FOLK", "SOUL", "HITS", "TVM 3", "TVM3", "MDL", "DBM"]],
+  ["northlive_docs", ["DISCOVERY", "NAT GEO", "NATIONAL GEO", "PLANETE", "PLANÈTE", "USHUAIA", "USHUAÏA", "DECOUVERTE", "DÉCOUVERTE", "HISTOIRE", "SCIENCE", "NATURE", "ANIMAUX", "CHASSE", "PECHE", "PÊCHE", "TREK", "TRAVELXP", "VOYAGE", "TOP GEAR", "INVESTIGATION", "REPORTAGE", "FUTURA", "SORCIER", "IMEARTH", "DESTINATION NATURE", "CAP TERRE", "RMC STORY", "RMC DECOUVERTE", "RMC DÉCOUVERTE", "TOUTE HISTOIRE", "TOUTE L HISTOIRE", "SEASONS", "USHUAIA"]],
+  ["northlive_generaliste", ["TF1", "TF 1", "TFI", "TFX", "FRANCE 2", "FRANCE 3", "FRANCE 4", "FRANCE 5", "FRANCE O", "FRANCE Ô", "M6", "C8", "W9", "TMC", "6TER", "NRJ 12", "ARTE", "RTL", "CHERIE 25", "CHÉRIE 25", "NOVO19", "TIPIK", "LA UNE", "LA TROIS", "TV5", "PARIS PREMIERE", "PARIS PREMIÈRE", "TEVA", "RTS", "RTBF"]],
+];
+
+// Maps the upstream `category` field to a UI category (used when the name gives
+// no signal — mainly the already-tagged non-"IPTV" channels).
+const NORTHLIVE_CAT_MAP = {
+  Musique: "northlive_musique",
+  Info: "northlive_info",
+  Cinéma: "northlive_cinema",
+  "Séries-Films": "northlive_series",
+  Jeunesse: "northlive_jeunesse",
+  Généraliste: "northlive_generaliste",
+  Genéraliste: "northlive_generaliste",
+  Sport: "northlive_sport",
+  Régional: "northlive_regional",
+  Local: "northlive_regional",
+  Documentaires: "northlive_docs",
+  Sciences: "northlive_docs",
+  Nature: "northlive_docs",
+  Reportages: "northlive_docs",
+  Divertissement: "northlive_divertissement",
+  Culture: "northlive_divertissement",
+  "Art de vivre": "northlive_divertissement",
+  Sociétal: "northlive_divertissement",
+  Economie: "northlive_info",
+  Voyage: "northlive_docs",
+};
+
+function classifyNorthlive(name, apiCategory) {
+  const upper = String(name || "").toUpperCase();
+  for (const [cat, words] of NORTHLIVE_KEYWORDS) {
+    if (words.some((w) => upper.includes(w))) return cat;
+  }
+  if (apiCategory && NORTHLIVE_CAT_MAP[apiCategory]) return NORTHLIVE_CAT_MAP[apiCategory];
+  return "northlive_autres";
+}
+
+// Builds the ready-to-embed iframe URL for a channel slug (deterministic — same
+// shape as the upstream `player_url`, so we never need to store it per-channel).
+function northliveEmbedUrl(slug) {
+  return `${NORTHLIVE_BASE}?route=tv/${encodeURIComponent(slug)}/player&api_key=${NORTHLIVE_API_KEY}`;
+}
+
+// === VAVOO (FREE source — direct HLS, no extension / no proxy / no VIP) ======
+// vavoo.to exposes IPTV channels grouped by country/region (MediaHubMX API).
+// The catalog is a POST (mediahubmx-catalog.json, paginated via `nextCursor`);
+// each play URL resolves to a raw .m3u8 (mediahubmx-resolve.json) that the
+// client plays as-is (_directPlay) — no proxy, no headers. Groups double as UI
+// categories. Refreshed hourly, cached to disk.
+const VAVOO_BASE = process.env.VAVOO_BASE_URL || "https://vavoo.to";
+const VAVOO_CATALOG_URL = `${VAVOO_BASE}/mediahubmx-catalog.json`;
+const VAVOO_RESOLVE_URL = `${VAVOO_BASE}/mediahubmx-resolve.json`;
+const VAVOO_HEADERS = {
+  "User-Agent": "MediaHubMX/2",
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+// vavoo.to geoblocks datacenter IPs (HTTP 451), so catalog/resolve calls are
+// routed through the shared SOCKS5 pool, rotating to the next proxy on failure.
+// Playback stays direct — the resolved m3u8 is fetched client-side (in-region).
+const {
+  pickDedicatedSocks5Proxy,
+  getProxyAgent,
+} = require("./utils/proxyManager");
+
+async function vavooPost(url, payload, timeout = 15000) {
+  let lastErr;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    let agent = null;
+    try {
+      const proxy = await pickDedicatedSocks5Proxy();
+      if (proxy) agent = getProxyAgent(proxy);
+    } catch {
+      /* pool empty → fall through to a direct call (will likely 451) */
+    }
+    try {
+      const resp = await axios.post(url, payload, {
+        headers: VAVOO_HEADERS,
+        timeout,
+        ...(agent ? { httpAgent: agent, httpsAgent: agent, proxy: false } : {}),
+      });
+      return resp.data;
+    } catch (e) {
+      lastErr = e;
+      // rotate to the next proxy and retry
+    }
+  }
+  throw lastErr;
+}
+
+const VAVOO_SLUG_TO_GROUP = Object.fromEntries(
+  VAVOO_GROUPS.map((g) => [vavooGroupSlug(g), g]),
+);
+
+// Fetch one group's full channel list (paginated via nextCursor), cache 1h.
+async function fetchVavooGroup(group) {
+  const cacheKey = generateCacheKey(`vavoo_group_${group}_v2`);
+  const disk = await getFromCache(cacheKey, 1); // 1h
+  if (disk && Array.isArray(disk) && disk.length) return disk;
+
+  const channels = [];
+  const seenNameId = new Set();
+  const idCounts = new Map();
+  let cursor = null;
+  for (let page = 0; page < 50; page++) {
+    // hard cap: 50 pages guards against a broken nextCursor loop
+    let data;
+    try {
+      const payload = {
+        language: "fr", region: "FR", catalogId: "iptv", id: "",
+        adult: false, search: "", sort: "name",
+        filter: { group },
+        cursor: cursor ? Number(cursor) : 0
+      };
+
+      data = await vavooPost(VAVOO_CATALOG_URL, payload);
+    } catch (e) {
+      console.warn(`[VAVOO] group ${group} page ${page} error: ${e.message}`);
+      break;
+    }
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for (const it of items) {
+      const baseId = it?.ids?.id;
+      if (!baseId) continue;
+      
+      const name = it.name || baseId;
+      const dedupKey = `${baseId}~${name}`;
+      
+      if (seenNameId.has(dedupKey)) continue;
+      seenNameId.add(dedupKey);
+
+      const count = (idCounts.get(baseId) || 0) + 1;
+      idCounts.set(baseId, count);
+
+      const uniqueId = count === 1 ? baseId : `${baseId}~${count}`;
+
+      channels.push({
+        id: `vavoo_${uniqueId}`,
+        type: "tv",
+        name: name,
+        // poster intentionally null — logos hidden for now (name-only landscape
+        // cards); swap back to `it.logo || null` to restore them later.
+        poster: null,
+      });
+    }
+
+    cursor = data?.nextCursor ?? null;
+    if (!cursor || items.length === 0) break;
+  }
+
+  if (channels.length === 0) {
+    // Upstream hiccup — keep serving the last good cache rather than blanking out.
+    const stale = await getFromCache(cacheKey, 24 * 365);
+    if (stale && Array.isArray(stale) && stale.length) return stale;
+    return [];
+  }
+
+  await saveToCache(cacheKey, channels);
+  return channels;
+}
+
+// Channels for a UI category (vavoo_<slug>).
+async function getVavooChannels(catalogId) {
+  const slug = catalogId.slice("vavoo_".length);
+  const group = VAVOO_SLUG_TO_GROUP[slug];
+  if (!group) return [];
+  return fetchVavooGroup(group);
+}
+
+// Resolve a channel id to its raw .m3u8 (played client-side as-is).
+// Each resolve lands on a random edge: usually https on a rotating domain,
+// sometimes plain http on a bare IP — unplayable from the https site (mixed
+// content). Re-resolve up to 5 times to get an https URL; if none shows up,
+// return the http one as a last resort. Every attempt goes through the SOCKS5
+// pool (vavooPost) since vavoo 451s datacenter IPs.
+async function resolveVavooStream(channelId) {
+  let id = channelId.slice("vavoo_".length);
+  if (id.includes("~")) {
+    id = id.split("~")[0];
+  }
+  const playUrl = `${VAVOO_BASE}/vavoo-iptv/play/${id}`;
+  let httpFallback = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let data;
+    try {
+      data = await vavooPost(
+        VAVOO_RESOLVE_URL,
+        { language: "fr", region: "FR", url: playUrl },
+        10000,
+      );
+    } catch (e) {
+      // vavooPost already rotated through 4 proxies — upstream is down, stop.
+      console.warn(`[VAVOO] resolve ${id} failed: ${e.message}`);
+      break;
+    }
+    const arr = Array.isArray(data) ? data : [];
+    const url = arr[0]?.url || null;
+    if (!url) continue;
+    if (url.startsWith("https://")) return url;
+    if (!httpFallback) httpFallback = url;
+  }
+
+  return httpFallback;
+}
 
 // HTTPS Agent for Sosplay — DNS Cloudflare (1.1.1.1) pour contourner le blocage FAI
 const https = require("https");
@@ -1135,6 +1584,622 @@ async function scrapeSosplayChannels(categoryKey) {
 /**
  * Scrape les matchs disponibles depuis Sosplay (Football, etc.)
  */
+function readFctvVarint(buffer, offset) {
+  let result = 0n;
+  let shift = 0n;
+  let cursor = offset;
+
+  while (cursor < buffer.length) {
+    const byte = buffer[cursor++];
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return { value: result, offset: cursor };
+    }
+    shift += 7n;
+    if (shift > 70n) {
+      throw new Error("Invalid protobuf varint");
+    }
+  }
+
+  throw new Error("Unexpected protobuf EOF");
+}
+
+function fctvNumber(value) {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") {
+    return value <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(value)
+      : value.toString();
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  return value;
+}
+
+function fctvLooksText(value) {
+  if (!value) return false;
+  let printable = 0;
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if ((code >= 32 && code <= 126) || code >= 160) printable++;
+  }
+  return printable / value.length > 0.7;
+}
+
+function decodeFctvProtoMessage(input, depth = 0) {
+  const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input || []);
+  const fields = [];
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    const tag = readFctvVarint(buffer, offset);
+    offset = tag.offset;
+
+    const field = Number(tag.value >> 3n);
+    const wireType = Number(tag.value & 7n);
+    const entry = { field, wireType };
+
+    if (wireType === 0) {
+      const parsed = readFctvVarint(buffer, offset);
+      offset = parsed.offset;
+      entry.value = fctvNumber(parsed.value);
+    } else if (wireType === 1) {
+      entry.value = buffer.subarray(offset, offset + 8).toString("hex");
+      offset += 8;
+    } else if (wireType === 2) {
+      const parsedLength = readFctvVarint(buffer, offset);
+      offset = parsedLength.offset;
+      const length = Number(parsedLength.value);
+      const bytes = buffer.subarray(offset, offset + length);
+      offset += length;
+
+      const text = bytes.toString("utf8");
+      if (fctvLooksText(text)) entry.value = text;
+
+      if (depth < 6 && bytes.length > 0) {
+        try {
+          const children = decodeFctvProtoMessage(bytes, depth + 1);
+          if (children.length > 0) entry.children = children;
+        } catch {
+          // Plain strings are also length-delimited; ignore decode failures.
+        }
+      }
+    } else if (wireType === 5) {
+      entry.value = buffer.subarray(offset, offset + 4).toString("hex");
+      offset += 4;
+    } else {
+      throw new Error(`Unsupported protobuf wire type ${wireType}`);
+    }
+
+    fields.push(entry);
+  }
+
+  return fields;
+}
+
+function fctvFields(input) {
+  return Array.isArray(input) ? input : input?.children || [];
+}
+
+function fctvFirst(input, field) {
+  return fctvFields(input).find((entry) => entry.field === field);
+}
+
+function fctvAll(input, field) {
+  return fctvFields(input).filter((entry) => entry.field === field);
+}
+
+function fctvValue(input, field) {
+  return fctvFirst(input, field)?.value;
+}
+
+function fctvChildren(input, field) {
+  return fctvFirst(input, field)?.children || [];
+}
+
+function fctvString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseFctvBody(data) {
+  const root = decodeFctvProtoMessage(Buffer.from(data || []));
+  return {
+    status: fctvString(fctvValue(root, 3)),
+    body: fctvChildren(root, 10),
+  };
+}
+
+async function fetchFctvApi(pathname, params, options = {}) {
+  // Build sfver prefix if bs keys are available
+  const apiBase = await getFctvApiBase();
+  let url = `${apiBase}${pathname}`;
+  if (!options.skipSfver) {
+    try {
+      const bsKeys = await fetchFctvBsKeys(params?.sportType || 0);
+      const sfver = buildFctvSfverPrefix(pathname, params, bsKeys);
+      if (sfver) {
+        url = `${apiBase}/${sfver}${pathname}`;
+      }
+    } catch (err) {
+      console.warn(`[FCTV] sfver prefix failed, using direct path: ${err.message}`);
+    }
+  }
+
+  return axios.get(url, {
+    params,
+    responseType: "arraybuffer",
+    headers: FCTV_API_HEADERS,
+    timeout: 15000,
+  });
+}
+
+function parseFctvLocalizedName(fields) {
+  const localizedName = fctvString(fctvValue(fctvChildren(fields, 3), 2));
+  if (localizedName) return localizedName;
+  return fctvString(fctvValue(fields, 2));
+}
+
+function parseFctvTeam(teamField) {
+  const team = fctvChildren(teamField, 10);
+  if (team.length === 0) return null;
+
+  return {
+    id: fctvNumber(fctvValue(team, 1)),
+    name: parseFctvLocalizedName(team),
+    logo: proxifyFctvImage(fctvString(fctvValue(team, 4))),
+  };
+}
+
+function slugifyFctv(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function formatFctvTime(timestamp) {
+  if (!timestamp) return "";
+  try {
+    return new Intl.DateTimeFormat("fr-FR", {
+      day: "2-digit",
+      month: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      timeZone: "Europe/Paris",
+    }).format(new Date(timestamp));
+  } catch {
+    return new Date(timestamp).toISOString();
+  }
+}
+
+function buildFctvMatchPageUrl(match) {
+  const leagueSlug = match.leagueSlug || "football";
+  const matchSlug = match.matchSlug || slugifyFctv(match.name);
+  return `${FCTV_PLAYER_BASE_URL}/fr/${match.sportKey || "football"}/${leagueSlug}-${match.matchId}/${matchSlug}.html?icg=RlI&ilang=fr`;
+}
+
+// Embeddable upstream player. Loads the match's own server selector + handles
+// the v3b tokenisation / service-worker / playback internally. This is the
+// robust playback path (the masked stream URLs are token-gated and the token
+// is computed client-side, so we cannot replay them server-side reliably).
+// player.html expects: mdata = base64(`${matchId}_${sportType}`).
+function buildFctvPlayerEmbedUrl(matchId, sportType, playerBase) {
+  const base = playerBase || FCTV_PLAYER_BASE_URL;
+  const mdata = Buffer.from(`${matchId}_${sportType}`, "utf8").toString("base64");
+  return `${base}/fr/player.html?mdata=${encodeURIComponent(mdata)}&ilang=fr`;
+}
+
+// Auto-discover the current FCTV API base. The bio-link page hubu.ru/fctvlink
+// points at the live front domain (rotates: .mom / .motorcycles / …), and that
+// front's /fr page embeds the API base in its Nuxt SSR payload (unicode-escaped
+// `apis-data-defra<N>.<host>`). Cached; on any failure falls back to the last
+// good value / hardcoded default.
+const FCTV_BIOLINK_URL =
+  process.env.FCTV_BIOLINK_URL || "https://hubu.ru/fctvlink";
+let fctvApiBaseCache = null;
+let fctvApiBaseCacheTime = 0;
+const FCTV_API_BASE_TTL = 30 * 60 * 1000; // 30 min
+async function getFctvApiBase() {
+  if (
+    fctvApiBaseCache &&
+    Date.now() - fctvApiBaseCacheTime < FCTV_API_BASE_TTL
+  ) {
+    return fctvApiBaseCache;
+  }
+  const ua =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  try {
+    // 1) bio-link page -> current front domain (the "FCTV33" button).
+    const hub = await axios.get(FCTV_BIOLINK_URL, {
+      headers: { "User-Agent": ua },
+      timeout: 10000,
+      responseType: "text",
+      transformResponse: [(d) => d],
+    });
+    const front = [...String(hub.data).matchAll(/<a[^>]+href="([^"]+)"/gi)]
+      .map((mm) => mm[1])
+      .find((h) => /fctv33hd/i.test(h));
+    if (!front) throw new Error("front domain not found on bio-link page");
+
+    // 2) front /fr -> API base embedded (unicode-escaped) in the SSR payload.
+    const idx = await axios.get(front.replace(/\/+$/, "") + "/fr", {
+      headers: {
+        "User-Agent": ua,
+        Referer: new URL(FCTV_BIOLINK_URL).origin + "/",
+      },
+      timeout: 10000,
+      responseType: "text",
+      transformResponse: [(d) => d],
+    });
+    const html = String(idx.data).replace(/\\u002[fF]/g, "/");
+    const m = html.match(/https?:\/\/apis-data-defra\d+\.[a-z0-9.-]+/i);
+    if (!m) throw new Error("API base not found on front page");
+    fctvApiBaseCache = m[0].replace(/\/+$/, "");
+    fctvApiBaseCacheTime = Date.now();
+    console.log(`[FCTV] Auto API base: ${fctvApiBaseCache} (via ${front})`);
+    return fctvApiBaseCache;
+  } catch (error) {
+    console.warn(`[FCTV] API base auto-fetch failed: ${error.message}`);
+    // Cache the fallback so we don't hammer hubu/front for the next TTL window.
+    fctvApiBaseCache = fctvApiBaseCache || FCTV_API_BASE_URL;
+    fctvApiBaseCacheTime = Date.now();
+    return fctvApiBaseCache;
+  }
+}
+
+// Auto-discover the current player origin (used for the embed iframe AND as the
+// Referer for native streams) — same way the site does, from /api/common/params
+// `iframePlayerDomains`. Cached; rotates upstream.
+let fctvPlayerBaseCache = null;
+let fctvPlayerBaseCacheTime = 0;
+const FCTV_PLAYER_BASE_TTL = 30 * 60 * 1000; // 30 min
+async function getFctvPlayerBaseUrl() {
+  if (fctvPlayerBaseCache && Date.now() - fctvPlayerBaseCacheTime < FCTV_PLAYER_BASE_TTL) {
+    return fctvPlayerBaseCache;
+  }
+  try {
+    const apiBase = await getFctvApiBase();
+    const response = await axios.get(`${apiBase}/api/common/params`, {
+      responseType: "arraybuffer",
+      headers: FCTV_API_HEADERS,
+      timeout: 10000,
+    });
+    // params is rot47'd, and iframePlayerDomains sits inside a nested (escaped)
+    // JSON string — strip backslashes so the list is matchable.
+    const decoded = rot47(Buffer.from(response.data).toString("utf8")).replace(/\\/g, "");
+    const domains = [];
+    const re = /"iframePlayerDomains"\s*:\s*\[([^\]]+)\]/g;
+    let m;
+    while ((m = re.exec(decoded))) {
+      for (const part of m[1].split(",")) {
+        const host = part.replace(/[\\"\s]/g, "");
+        if (host && /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host)) domains.push(host);
+      }
+    }
+    if (domains.length) {
+      fctvPlayerBaseCache = `https://${domains[0]}`;
+      fctvPlayerBaseCacheTime = Date.now();
+      console.log(`[FCTV] Auto player origin: ${fctvPlayerBaseCache} (${domains.length} candidates)`);
+      return fctvPlayerBaseCache;
+    }
+  } catch (error) {
+    console.warn(`[FCTV] Player origin auto-fetch failed: ${error.message}`);
+  }
+  return fctvPlayerBaseCache || FCTV_PLAYER_BASE_URL;
+}
+
+function parseFctvMatch(matchField, categoryConfig, streamCountByMatchId, streamsByMatchId) {
+  const fields = fctvFields(matchField);
+  const matchId = fctvNumber(fctvValue(fields, 1));
+  if (!matchId) return null;
+
+  const sportType = fctvNumber(fctvValue(fields, 2)) || categoryConfig.sportType;
+  const timestamp = fctvNumber(fctvValue(fields, 3)) || 0;
+  const statusCode = fctvNumber(fctvValue(fields, 4));
+  const league = fctvChildren(fields, 10);
+  const country = fctvChildren(league, 80);
+  const matchParts = fctvAll(fields, 30);
+  const matchName =
+    fctvString(fctvValue(fctvFields(matchParts[0]), 2)) ||
+    matchParts.map(parseFctvTeam).filter(Boolean).map((team) => team.name).join(" vs ");
+  const teams = matchParts.map(parseFctvTeam).filter(Boolean);
+  const extra = fctvChildren(fields, 150);
+  const matchSlug = fctvString(fctvValue(extra, 20)) || slugifyFctv(matchName);
+  const leagueSlug = fctvString(fctvValue(extra, 21)) || slugifyFctv(parseFctvLocalizedName(league));
+  const now = Date.now();
+  const recentlyStarted =
+    timestamp > 0 && timestamp <= now && now - timestamp < 4 * 60 * 60 * 1000;
+  const isLive = Number(statusCode) >= 10000 || recentlyStarted;
+  const serverCount = streamCountByMatchId.get(Number(matchId)) || 0;
+  const matchStreams = streamsByMatchId.get(Number(matchId)) || [];
+  const parsedMatch = {
+    matchId,
+    sportKey: categoryConfig.sportKey,
+    name: matchName || `Match ${matchId}`,
+    leagueSlug,
+    matchSlug,
+  };
+
+  return {
+    id: `match_fctv_${matchId}_sport_${sportType}`,
+    type: "tv",
+    name: parsedMatch.name,
+    poster: teams[0]?.logo || teams[1]?.logo || proxifyFctvImage(fctvString(fctvValue(league, 4))) || "",
+    genres: [categoryConfig.name.toLowerCase()],
+    _pageUrl: buildFctvMatchPageUrl(parsedMatch),
+    _timestamp: timestamp || undefined,
+    _timeText: formatFctvTime(timestamp),
+    _competition: parseFctvLocalizedName(league),
+    _leagueLogo: proxifyFctvImage(fctvString(fctvValue(league, 4))),
+    _country: parseFctvLocalizedName(country),
+    _countryLogo: proxifyFctvImage(fctvString(fctvValue(country, 4))),
+    _homeTeam: teams[0]?.name || "",
+    _awayTeam: teams[1]?.name || "",
+    _homeLogo: teams[0]?.logo || "",
+    _awayLogo: teams[1]?.logo || "",
+    _isLive: isLive,
+    _status: isLive ? "live" : "upcoming",
+    _serverCount: serverCount,
+    _servers: matchStreams,
+    _sport: categoryConfig.name,
+    _sportKey: categoryConfig.sportKey,
+    _sportType: sportType,
+    _emoji: categoryConfig.emoji,
+  };
+}
+
+function parseFctvStreamFields(fields) {
+  return {
+    id: fctvNumber(fctvValue(fields, 1)),
+    sportType: fctvNumber(fctvValue(fields, 2)),
+    name: fctvString(fctvValue(fields, 3)),
+    rawUrl: fctvString(fctvValue(fields, 4)),
+    status: fctvNumber(fctvValue(fields, 5)),
+    order: fctvNumber(fctvValue(fields, 8)),
+    siteType: fctvNumber(fctvValue(fields, 9)) || FCTV_DEFAULT_SITE_TYPE,
+    streamStatus: fctvNumber(fctvValue(fields, 11)),
+    flag: fctvNumber(fctvValue(fields, 30)),
+    matchId: fctvNumber(fctvValue(fields, 50)),
+  };
+}
+
+function parseFctvStream(streamField) {
+  return parseFctvStreamFields(fctvFields(streamField));
+}
+
+async function scrapeFctvMatches(categoryKey) {
+  try {
+    const categoryConfig = FCTV_MATCHES_CATEGORIES[categoryKey];
+    if (!categoryConfig) {
+      console.log(`[FCTV-MATCHES] Unknown category: ${categoryKey}`);
+      return [];
+    }
+
+    console.log(`[FCTV-MATCHES] Fetching live matches for ${categoryKey}`);
+    const response = await fetchFctvApi("/api/match/live", {
+      language: FCTV_LANGUAGE_FR,
+      sportType: categoryConfig.sportType,
+      stream: true,
+    });
+    const { body } = parseFctvBody(response.data);
+    const streamCountByMatchId = new Map();
+    const streamsByMatchId = new Map();
+
+    for (const streamRef of fctvAll(body, 2)) {
+      try {
+        const streamObj = parseFctvStreamFields(fctvFields(streamRef));
+        const matchId = Number(streamObj.matchId);
+        if (matchId) {
+          streamCountByMatchId.set(
+            matchId,
+            (streamCountByMatchId.get(matchId) || 0) + 1,
+          );
+
+          if (!streamsByMatchId.has(matchId)) {
+            streamsByMatchId.set(matchId, []);
+          }
+          streamsByMatchId.get(matchId).push({
+            id: streamObj.id || Math.floor(Math.random() * 100000),
+            name: streamObj.name || `Serveur ${streamObj.id || "Auto"}`,
+            siteType: streamObj.siteType,
+            sportType: streamObj.sportType,
+          });
+        }
+      } catch (err) {
+        console.warn("[FCTV-MATCHES] Error parsing stream ref in list:", err.message);
+      }
+    }
+
+    const matches = fctvAll(body, 1)
+      .map((matchField) =>
+        parseFctvMatch(matchField, categoryConfig, streamCountByMatchId, streamsByMatchId),
+      )
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a._isLive && !b._isLive) return -1;
+        if (!a._isLive && b._isLive) return 1;
+        return (a._timestamp || 0) - (b._timestamp || 0);
+      });
+
+    console.log(`[FCTV-MATCHES] Loaded ${matches.length} matches`);
+    return matches;
+  } catch (error) {
+    console.error(`[FCTV-MATCHES] Error fetching ${categoryKey}:`, error.message);
+    return [];
+  }
+}
+
+async function fetchFctvMatchDetail(matchId, sportType = 1) {
+  const response = await fetchFctvApi("/api/match/detail", {
+    language: FCTV_LANGUAGE_FR,
+    matchId,
+    sportType,
+    stream: true,
+  });
+  const { body } = parseFctvBody(response.data);
+
+  return {
+    match: fctvAll(body, 1)[0] || null,
+    streams: fctvAll(body, 2)
+      .map(parseFctvStream)
+      .filter((stream) => stream.id && stream.name),
+  };
+}
+
+function rot47(value) {
+  return String(value || "")
+    .split("")
+    .map((char) => {
+      const code = char.charCodeAt(0);
+      if (code < 33 || code > 126) return char;
+      return String.fromCharCode(33 + ((code - 33 + 47) % 94));
+    })
+    .join("");
+}
+
+// Decode the masked stream URL from /api/stream/detail.
+// Format: <8-char per-request nonce> + rot47(originUrl); slice(8) drops the nonce.
+// The resulting origin URL is referer-ACL / token gated upstream (the token is
+// computed client-side by the player's service-worker), so this is only a
+// best-effort "native" source — the embed player is the reliable path.
+function decodeFctvStreamUrl(maskedUrl) {
+  if (!maskedUrl) return null;
+  try {
+    const decoded = rot47(maskedUrl).slice(8);
+    new URL(decoded); // validate it parsed to a real URL
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+// token = base64( rbSession XOR keystream ) + "a", URL-encoded.
+function makeFctvToken(rbSession) {
+  const pt = Buffer.from(String(rbSession || ""), "utf8");
+  if (!pt.length) return null;
+  const n = Math.min(pt.length, FCTV_TOKEN_KEYSTREAM.length);
+  const ct = Buffer.alloc(n);
+  for (let i = 0; i < n; i++) ct[i] = pt[i] ^ FCTV_TOKEN_KEYSTREAM[i];
+  return encodeURIComponent(`${ct.toString("base64")}a`);
+}
+
+// Resolve the upstream tokenised playlist for a single server (fresh rb-session
+// + token). Cached briefly so HLS live-edge re-fetches don't hammer the API.
+const fctvUpstreamCache = new Map(); // `${matchId}_${streamId}_${siteType}` -> { data, time }
+const FCTV_UPSTREAM_TTL = 20 * 1000;
+async function resolveFctvUpstreamPlaylist(streamId, siteType, matchId, sportType, forceFresh = false) {
+  const key = `${matchId}_${streamId}_${siteType}`;
+  if (forceFresh) {
+    fctvUpstreamCache.delete(key);
+  } else {
+    const cached = fctvUpstreamCache.get(key);
+    if (cached && Date.now() - cached.time < FCTV_UPSTREAM_TTL) return cached.data;
+  }
+
+  // Unsigned call with continent/country/digit => returns the `rb-session`
+  // header and a masked URL that decodes to the proxy m3u8 path. No
+  // `usls`/`language` and no sfver prefix here.
+  const response = await fetchFctvApi(
+    "/api/stream/detail",
+    {
+      streamId,
+      siteType: siteType || FCTV_DEFAULT_SITE_TYPE,
+      continent: FCTV_GEO_CONTINENT,
+      country: FCTV_GEO_COUNTRY,
+      digit: FCTV_STREAM_DIGIT,
+      matchId,
+      sportType,
+    },
+    { skipSfver: true },
+  );
+
+  const { body } = parseFctvBody(response.data);
+  const streamBody = fctvChildren(body, 2).length ? fctvChildren(body, 2) : body;
+  const detail = parseFctvStreamFields(streamBody);
+  const proxyUrl = decodeFctvStreamUrl(detail.rawUrl);
+  const rbSession = response.headers["rb-session"];
+  if (!proxyUrl || !rbSession) return null;
+
+  const token = makeFctvToken(rbSession);
+  const u = new URL(proxyUrl);
+  const data = {
+    origin: u.origin,
+    token,
+    playlistUrl: `${u.origin}/token-${token}${u.pathname}${u.search}`,
+  };
+  fctvUpstreamCache.set(key, { data, time: Date.now() });
+  return data;
+}
+
+function extractFctvMatchAndStreamId(channelId) {
+  const match = String(channelId || "").match(/^match_(?:fctv_)?(\d+)(?:_sport_(\d+))?(?:_stream_([a-zA-Z0-9_]+))?$/);
+  if (!match) return { matchId: null, sportType: 1, streamId: null };
+  return {
+    matchId: Number(match[1]),
+    sportType: match[2] ? Number(match[2]) : 1,
+    streamId: match[3] || null,
+  };
+}
+
+function extractFctvMatchId(channelId) {
+  const { matchId } = extractFctvMatchAndStreamId(channelId);
+  return matchId;
+}
+
+async function resolveFctvMatchStream(channelId) {
+  const { matchId, sportType } = extractFctvMatchAndStreamId(channelId);
+  if (!matchId) {
+    console.warn(`[FCTV-MATCHES] Invalid match id: ${channelId}`);
+    return [];
+  }
+
+  const playerBase = await getFctvPlayerBaseUrl();
+  const streams = [];
+
+  // 1. Native HLS servers (from match/detail). Each plays via the FCTV
+  //    smart-playlist endpoint, which resolves a fresh token and proxies the
+  //    Referer-gated segments. First in the picker => HLSPlayer is the default.
+  try {
+    const detail = await fetchFctvMatchDetail(matchId, sportType);
+    const servers = detail.streams
+      .filter((stream) => stream.id && stream.siteType)
+      .sort((a, b) => {
+        const orderA = Number.isFinite(Number(a.order)) ? Number(a.order) : 9999;
+        const orderB = Number.isFinite(Number(b.order)) ? Number(b.order) : 9999;
+        return orderA - orderB;
+      });
+
+    for (const server of servers) {
+      streams.push({
+        id: server.id,
+        title: server.name || `Serveur ${server.id}`,
+        _fctvNative: {
+          matchId,
+          streamId: server.id,
+          siteType: server.siteType || FCTV_DEFAULT_SITE_TYPE,
+          sportType: server.sportType || sportType,
+        },
+        behaviorHints: { notWebReady: false },
+      });
+    }
+    console.log(`[FCTV-MATCHES] match ${matchId}: ${streams.length} native servers`);
+  } catch (error) {
+    console.warn(`[FCTV-MATCHES] match/detail failed for ${channelId}: ${error.message}`);
+  }
+
+  // 2. Embed player fallback — always works (its own server selector + SW).
+  streams.push({
+    id: "embed",
+    title: "Lecteur intégré ⭐",
+    url: buildFctvPlayerEmbedUrl(matchId, sportType, playerBase),
+    _isEmbed: true,
+    behaviorHints: { notWebReady: false },
+  });
+
+  return streams;
+}
+
 async function scrapeSosplayMatches(categoryKey) {
   try {
     const categoryConfig = SOSPLAY_MATCHES_CATEGORIES[categoryKey];
@@ -1958,7 +3023,7 @@ function shouldIgnoreLiveTvIframeUrl(rawUrl) {
     const combined = `${hostname}${pathname}${search}`;
 
     if (
-      hostname === "ads.livetv882.me" ||
+      hostname === "ads.livetv901.me" ||
       hostname.startsWith("ads.") ||
       hostname.startsWith("ad.")
     ) {
@@ -3251,101 +4316,234 @@ async function getLivetvSources(channelId) {
   }
 }
 
-// === LINKZY CHANNELS (loaded from linkzy.json) ===
-const LINKZY_CHANNELS = require("./linkzy.json");
+// ===== DADDYLIVE (dlhd.pk) =====
 
-/**
- * Returns Linkzy channels from linkzy.json (no API call / decryption needed)
- */
-function fetchLinkzyChannels() {
-  return LINKZY_CHANNELS.filter((ch) => ch.active);
+// Fetch + parse the full 24/7 channel grid once; cache 24h. -> [{rawId,name,country}]
+async function fetchDaddyliveAllChannels() {
+  const cacheKey = generateCacheKey("daddylive_all_channels_v1");
+  const cached = await getFromCache(cacheKey, 24); // 24h
+  if (cached && Array.isArray(cached.rows)) return cached.rows;
+
+  try {
+    const url = `${DADDYLIVE_BASE_URL}${DADDYLIVE_CHANNELS_PATH}`;
+    const resp = await axios.get(url, {
+      headers: buildLivePageHeaders(DADDYLIVE_REFERER),
+      timeout: 15000,
+    });
+    const rows = parseDaddyliveChannelsHtml(resp.data);
+    if (rows.length > 0) {
+      await saveToCache(cacheKey, { rows });
+    }
+    return rows;
+  } catch (error) {
+    console.error("[DADDYLIVE] Error fetching channel list:", error.message);
+    return [];
+  }
 }
 
-/**
- * Get Linkzy channels for a specific category
- */
-function getLinkzyChannelsByCategory(categoryId) {
-  try {
-    // Map catalog ID to API category string
-    const categoryMap = {
-      linkzy_generaliste: "general",
-      linkzy_sport: "sports",
-      linkzy_cinema: "movies",
-      linkzy_info: "chaines_info",
-      linkzy_jeunesse: "chaines_jeunesse",
-    };
-
-    const apiCategory = categoryMap[categoryId];
-    if (!apiCategory) {
-      console.error(`[LINKZY] Unknown category: ${categoryId}`);
-      return [];
-    }
-
-    const allChannels = fetchLinkzyChannels();
-    const filteredChannels = allChannels.filter(
-      (ch) => ch.category === apiCategory,
-    );
-
-    console.log(
-      `[LINKZY] Category ${categoryId} (${apiCategory}): ${filteredChannels.length} channels`,
-    );
-
-    return filteredChannels.map((ch) => ({
-      id: `linkzy_${ch.id}`,
+// Channels for one catalog id (daddylive_<code>). Unknown country -> bucketed into `other`.
+async function scrapeDaddyliveChannels(catalogId) {
+  const code = catalogId.replace("daddylive_", "");
+  if (!DADDYLIVE_COUNTRIES[code]) return [];
+  const rows = await fetchDaddyliveAllChannels();
+  const countryName = DADDYLIVE_COUNTRIES[code].name;
+  return rows
+    .filter(
+      (r) => (DADDYLIVE_COUNTRIES[r.country] ? r.country : "other") === code,
+    )
+    .map((r) => ({
+      id: `daddylive_${r.rawId}`,
       type: "tv",
-      name: ch.name,
-      poster: ch.logo || null,
+      name: r.name,
+      poster: DADDYLIVE_PLACEHOLDER_POSTER,
+      genres: [countryName],
     }));
+}
+
+// Fetch the ordered player list for a channel (cache 10min). Falls back to the
+// 6 deterministic paths if watch.php cannot be parsed.
+async function fetchDaddylivePlayers(rawId) {
+  const cacheKey = generateCacheKey(`daddylive_players_${rawId}_v1`);
+  const cached = await getFromCacheMs(cacheKey, 600000); // 10 min
+  if (cached && Array.isArray(cached.players) && cached.players.length) {
+    return cached.players;
+  }
+  let players = [];
+  try {
+    const url = `${DADDYLIVE_BASE_URL}/watch.php?id=${rawId}`;
+    const resp = await axios.get(url, {
+      headers: buildLivePageHeaders(DADDYLIVE_REFERER),
+      timeout: 15000,
+    });
+    players = parseDaddylivePlayersHtml(resp.data);
   } catch (error) {
     console.error(
-      "[LINKZY] Error getting channels by category:",
+      `[DADDYLIVE] Error fetching players for ${rawId}:`,
+      error.message,
+    );
+  }
+  if (!players.length) players = buildDaddyliveDeterministicPlayers(rawId);
+  await saveToCache(cacheKey, { players });
+  return players;
+}
+
+// Source picker options for mode='sources'.
+async function getDaddyliveSources(channelId) {
+  const rawId = channelId.replace("daddylive_", "");
+  const players = await fetchDaddylivePlayers(rawId);
+  return players.map((p, index) => ({
+    index,
+    title: p.title || `Player ${index + 1}`,
+    hoster: "Daddylive",
+    sourceType: "embed",
+  }));
+}
+
+// GET helper for daddylive pages.
+async function fetchDaddyliveHtml(url, referer) {
+  const resp = await axios.get(url, {
+    headers: buildLivePageHeaders(referer),
+    timeout: 15000,
+  });
+  return resp.data;
+}
+
+// Resolve the chosen player to a raw m3u8 + referer. Returns [] on miss.
+// The player page now embeds an <iframe> whose page holds the Clappr
+// `window.atob('<m3u8>')` source, so follow one iframe hop if the m3u8 is not
+// inlined on the player page itself.
+async function resolveDaddyliveStream(channelId, options = {}) {
+  const rawId = channelId.replace("daddylive_", "");
+  const requested =
+    Number.isInteger(options.sourceIndex) && options.sourceIndex >= 0
+      ? options.sourceIndex
+      : 0;
+  const players = await fetchDaddylivePlayers(rawId);
+  const player = players[requested] || players[0];
+  if (!player) return [];
+  try {
+    // Hop 1: player page (Referer = the watch.php page).
+    const playerHtml = await fetchDaddyliveHtml(
+      player.dataUrl,
+      `${DADDYLIVE_BASE_URL}/watch.php?id=${rawId}`,
+    );
+    let m3u8 = extractDaddyliveM3u8(playerHtml);
+
+    // Hop 2: follow the embedded iframe (Referer = dlhd root) if not inlined.
+    if (!m3u8) {
+      const iframeSrc = extractDaddyliveIframeSrc(playerHtml, player.dataUrl);
+      if (iframeSrc) {
+        const iframeHtml = await fetchDaddyliveHtml(
+          iframeSrc,
+          DADDYLIVE_REFERER,
+        );
+        m3u8 = extractDaddyliveM3u8(iframeHtml);
+      }
+    }
+
+    if (!m3u8) return [];
+    return [
+      {
+        title: player.title || `Player ${requested + 1}`,
+        url: m3u8,
+        referer: DADDYLIVE_REFERER,
+        userAgent: LIVE_PAGE_USER_AGENT,
+        _sourceIndex: requested,
+      },
+    ];
+  } catch (error) {
+    console.error(
+      `[DADDYLIVE] Error resolving stream ${channelId} (player ${requested}):`,
       error.message,
     );
     return [];
   }
 }
 
+// === NORTHLIVE CHANNELS (FREE source, iframe embed) ===
+// In-memory mirror of the disk cache to keep manifest/catalog requests cheap.
+let northliveMemCache = { channels: [], time: 0 };
+
 /**
- * Get stream URLs for a Linkzy channel (returns array of {label, url})
+ * Fetch every northlive page (France + DOM-TOM only), dedup by slug, classify by
+ * content, and cache the result to disk (1h TTL). Called lazily on demand and by
+ * the hourly warmer. Never overwrites a good cache with an empty result.
  */
-function getLinkzyStream(channelId) {
-  try {
-    const numericId = parseInt(channelId.replace("linkzy_", ""));
-    const allChannels = fetchLinkzyChannels();
-    const channel = allChannels.find((ch) => ch.id === numericId);
+async function fetchAllNorthlive(force = false) {
+  const cacheKey = generateCacheKey("northlive_all_v1");
 
-    if (!channel) {
-      console.error(`[LINKZY] Channel ${channelId} not found`);
-      return [];
+  if (!force) {
+    if (northliveMemCache.channels.length && Date.now() - northliveMemCache.time < NORTHLIVE_REFRESH_MS) {
+      return northliveMemCache.channels;
     }
+    const disk = await getFromCache(cacheKey, 1); // 1h
+    if (disk && Array.isArray(disk) && disk.length) {
+      northliveMemCache = { channels: disk, time: Date.now() };
+      return disk;
+    }
+  }
 
-    // streamUrl is a JSON string containing an array of {label, url}
-    let sources = [];
+  const seen = new Set();
+  const channels = [];
+  let totalPages = 25; // refined from the first response; hard cap below as a guard
+
+  for (let page = 1; page <= totalPages && page <= 40; page++) {
     try {
-      sources =
-        typeof channel.streamUrl === "string"
-          ? JSON.parse(channel.streamUrl)
-          : channel.streamUrl;
-    } catch (parseErr) {
-      // Fallback: treat as a plain URL string
-      console.warn(
-        `[LINKZY] Could not parse streamUrl as JSON, using as plain URL`,
-      );
-      sources = [{ label: "Principal", url: channel.streamUrl }];
-    }
+      const response = await axios.get(NORTHLIVE_BASE, {
+        params: { route: "tv", api_key: NORTHLIVE_API_KEY, page },
+        headers: { "User-Agent": LIVE_PAGE_USER_AGENT },
+        timeout: 15000,
+      });
 
-    if (!Array.isArray(sources)) {
-      sources = [{ label: "Principal", url: String(sources) }];
-    }
+      const data = Array.isArray(response.data?.data) ? response.data.data : [];
+      const pag = response.data?.pagination;
+      if (pag?.total && pag?.per_page) {
+        totalPages = Math.ceil(pag.total / pag.per_page);
+      }
+      if (data.length === 0) break;
 
-    console.log(
-      `[LINKZY] Stream for ${channel.name}: ${sources.length} source(s)`,
-    );
-    return sources;
-  } catch (error) {
-    console.error("[LINKZY] Error getting stream:", error.message);
+      for (const ch of data) {
+        if (!ch?.slug || seen.has(ch.slug)) continue;
+        if (ch.active === false) continue;
+        if (!isNorthliveFrance(ch.country)) continue;
+        seen.add(ch.slug);
+        channels.push({
+          id: `northlive_${ch.slug}`,
+          slug: ch.slug,
+          name: ch.name || ch.slug,
+          logo: ch.logo || NORTHLIVE_LOGOS[ch.slug] || null,
+          cat: classifyNorthlive(ch.name, ch.category),
+        });
+      }
+    } catch (error) {
+      console.warn(`[NORTHLIVE] page ${page} error: ${error.message}`);
+      break;
+    }
+  }
+
+  if (channels.length === 0) {
+    // Upstream hiccup — keep serving the last good cache rather than blanking out.
+    const stale = await getFromCache(cacheKey, 24 * 365);
+    if (stale && Array.isArray(stale) && stale.length) return stale;
     return [];
   }
+
+  await saveToCache(cacheKey, channels);
+  northliveMemCache = { channels, time: Date.now() };
+  console.log(`[NORTHLIVE] Cached ${channels.length} FR channels`);
+  return channels;
+}
+
+/**
+ * Get northlive channels for a UI category (catalog id northlive_<cat>).
+ */
+async function getNorthliveChannelsByCategory(catalogId) {
+  const all = await fetchAllNorthlive();
+  // poster intentionally null — the UI renders northlive as name-only landscape
+  // cards (logos hidden for now, per product decision; re-add ch.logo to restore).
+  return all
+    .filter((ch) => ch.cat === catalogId)
+    .map((ch) => ({ id: ch.id, type: "tv", name: ch.name, poster: null }));
 }
 
 // === ROUTES ===
@@ -3449,12 +4647,12 @@ router.get("/resolve-livehdtv", async (req, res) => {
 
 /**
  * GET /api/livetv/manifest
- * Récupère le manifest combiné (TV Direct + Vavoo + Linkzy)
+ * Récupère le manifest combiné (TV Direct + Matches + WITV + LiveTV + Daddylive)
  */
 router.get("/manifest", async (req, res) => {
   try {
-    // Nouvelle clé de cache pour la version fusionnée (v4 = added Linkzy)
-    const cacheKey = generateCacheKey("manifest_combined_v7");
+    // v15 = vavoo listed before northlive (source pill order)
+    const cacheKey = generateCacheKey("manifest_combined_v15");
 
     // Vérifier le cache
     const cached = await getFromCache(cacheKey);
@@ -3462,21 +4660,13 @@ router.get("/manifest", async (req, res) => {
       return res.json(cached);
     }
 
-    // Récupérer les deux manifests en parallèle
-    // On utilise un catch individuel pour ne pas bloquer si l'un échoue
-    const [tvDirectRes, vavooRes] = await Promise.all([
-      axios
-        .get(`${TVDIRECT_BASE_URL}/manifest.json`, {
-          headers: STREMIO_HEADERS,
-          timeout: 5000,
-        })
-        .catch((e) => ({ error: e })),
-      axios
-        .get(`${VAVOO_BASE_URL}/manifest.json`, {
-          timeout: 5000,
-        })
-        .catch((e) => ({ error: e })),
-    ]);
+    // Récupérer le manifest TV Direct (catch pour ne pas bloquer si échec)
+    const tvDirectRes = await axios
+      .get(`${TVDIRECT_BASE_URL}/manifest.json`, {
+        headers: STREMIO_HEADERS,
+        timeout: 5000,
+      })
+      .catch((e) => ({ error: e }));
 
     // Manifeste de base
     const manifest = {
@@ -3484,7 +4674,7 @@ router.get("/manifest", async (req, res) => {
       version: "1.0.0",
       name: "Merged Live TV",
       description:
-        "Merged TV sources (TV Direct, Vavoo, WITV, Bolaloca, LiveTV)",
+        "Merged TV sources (TV Direct, Matches, WITV, Bolaloca, LiveTV)",
       catalogs: [],
       resources: ["catalog", "meta", "stream"],
       types: ["tv"],
@@ -3497,21 +4687,6 @@ router.get("/manifest", async (req, res) => {
       const data = tvDirectRes.data;
       // if (data.catalogs) manifest.catalogs.push(...data.catalogs);
       if (data.idPrefixes) manifest.idPrefixes.push(...data.idPrefixes);
-    }
-
-    // Fusionner Vavoo
-    if (vavooRes && !vavooRes.error && vavooRes.data) {
-      const data = vavooRes.data;
-      if (data.catalogs) {
-        // Ajouter les catalogues Vavoo (TvVoo France)
-        manifest.catalogs.push(...data.catalogs);
-      }
-      if (data.idPrefixes) {
-        manifest.idPrefixes.push(...data.idPrefixes);
-      } else {
-        // Préfixe par défaut pour Vavoo si absent
-        manifest.idPrefixes.push("vavoo_");
-      }
     }
 
     // Ajouter les catalogues WITV (Wiflix)
@@ -3557,10 +4732,18 @@ router.get("/manifest", async (req, res) => {
     }
     manifest.idPrefixes.push("livetv_");
 
-    // Ajouter les catalogues Matches (FIRST in vavoo source - before vavoo_tv_fr)
-    // Insert at the beginning of catalogs array so it appears first
+    for (const [code, cfg] of Object.entries(DADDYLIVE_COUNTRIES)) {
+      manifest.catalogs.push({
+        type: "tv",
+        id: `daddylive_${code}`,
+        name: cfg.name,
+      });
+    }
+    manifest.idPrefixes.push("daddylive_");
+
+    // Ajouter les catalogues Matches (FCTV) en premier dans la liste
     const matchesCatalogs = [];
-    for (const [key, config] of Object.entries(SOSPLAY_MATCHES_CATEGORIES)) {
+    for (const [key, config] of Object.entries(FCTV_MATCHES_CATEGORIES)) {
       matchesCatalogs.push({
         type: "tv",
         id: key,
@@ -3571,16 +4754,39 @@ router.get("/manifest", async (req, res) => {
     manifest.catalogs = [...matchesCatalogs, ...manifest.catalogs];
     manifest.idPrefixes.push("match_");
 
-    // [DÉSACTIVÉ] Linkzy temporairement désactivé
-    // for (const [catId, config] of Object.entries(LINKZY_CATEGORIES)) {
-    //     manifest.catalogs.push({
-    //         type: 'tv',
-    //         id: config.id,
-    //         name: config.name,
-    //         _free: true,
-    //     });
-    // }
-    // manifest.idPrefixes.push('linkzy_');
+    // Northlive (FREE — no extension / no VIP, iframe embed). Prepended so the
+    // free source is the first pill and the default tab for everyone.
+    try {
+      const nlChannels = await fetchAllNorthlive();
+      const present = new Set(nlChannels.map((c) => c.cat));
+      const northliveCatalogs = [];
+      for (const [id, cfg] of Object.entries(NORTHLIVE_CATEGORIES)) {
+        if (!present.has(id)) continue;
+        northliveCatalogs.push({
+          type: "tv",
+          id,
+          name: `${cfg.emoji} ${cfg.name}`,
+          _free: true,
+        });
+      }
+      if (northliveCatalogs.length) {
+        manifest.catalogs = [...northliveCatalogs, ...manifest.catalogs];
+        manifest.idPrefixes.push("northlive_");
+      }
+    } catch (e) {
+      console.warn(`[NORTHLIVE] manifest injection failed: ${e.message}`);
+    }
+
+    // Vavoo (FREE — direct HLS, no extension/VIP). Groups are listed
+    // unconditionally (no upfront fetch); an empty group simply shows no channels.
+    // Prepended so the vavoo pill sits before northlive.
+    try {
+      const vavooCatalogs = buildVavooCatalogs(VAVOO_GROUPS);
+      manifest.catalogs = [...vavooCatalogs, ...manifest.catalogs];
+      manifest.idPrefixes.push("vavoo_");
+    } catch (e) {
+      console.warn(`[VAVOO] manifest injection failed: ${e.message}`);
+    }
 
     // Sauvegarder en cache
     await saveToCache(cacheKey, manifest);
@@ -3600,8 +4806,12 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
   const { type, catalogId } = req.params;
 
   try {
-    const catalogCacheVersion =
-      catalogId.startsWith("sosplay_") || catalogId.startsWith("livetv_")
+    const catalogCacheVersion = catalogId.startsWith("matches_")
+      ? "v2"
+      : catalogId.startsWith("sosplay_") ||
+          catalogId.startsWith("livetv_") ||
+          catalogId.startsWith("northlive_") ||
+          catalogId.startsWith("vavoo_")
         ? "v5"
         : "v1";
     const cacheKey = generateCacheKey(
@@ -3609,7 +4819,10 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
     );
     const isMatchesCatalog = catalogId.startsWith("matches_");
     const isDynamicCatalog =
-      isMatchesCatalog || catalogId.startsWith("livetv_");
+      isMatchesCatalog ||
+      catalogId.startsWith("livetv_") ||
+      catalogId.startsWith("northlive_") ||
+      catalogId.startsWith("vavoo_");
 
     // Vérifier le cache (1 minute pour matches/LiveTV, 24h pour le reste)
     const cached = isDynamicCatalog
@@ -3662,14 +4875,18 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
       console.log(
         `[TVMIO] Result: ${catalog.metas ? catalog.metas.length : 0} channels`,
       );
-      // [DÉSACTIVÉ] Linkzy temporairement désactivé
-      // } else if (catalogId.startsWith('linkzy_')) {
-      //     const channels = await getLinkzyChannelsByCategory(catalogId);
-      //     catalog = { metas: channels };
+    } else if (catalogId.startsWith("northlive_")) {
+      // Northlive (FREE, iframe embed) — from the 1h-cached France channel list.
+      const channels = await getNorthliveChannelsByCategory(catalogId);
+      catalog = { metas: channels };
+    } else if (catalogId.startsWith("vavoo_")) {
+      // Vavoo (FREE, direct HLS) — country group from the 1h cache.
+      const channels = await getVavooChannels(catalogId);
+      catalog = { metas: channels };
     } else if (catalogId.startsWith("matches_")) {
-      // Source Matches (Sosplay matches)
+      // Source Matches (FCTV33)
       console.log(`[LIVETV] Fetching Matches catalog: ${catalogId}`);
-      const matches = await scrapeSosplayMatches(catalogId);
+      const matches = await scrapeFctvMatches(catalogId);
       console.log(`[LIVETV] Matches result: ${matches.length} matches`);
       catalog = {
         metas: matches,
@@ -3691,6 +4908,12 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
       catalog = {
         metas: channels,
       };
+    } else if (catalogId.startsWith("daddylive_")) {
+      console.log(`[LIVETV] Fetching Daddylive catalog: ${catalogId}`);
+      const channels = await scrapeDaddyliveChannels(catalogId);
+      catalog = {
+        metas: channels,
+      };
     } else if (catalogId.startsWith("wiflix_")) {
       // Source Witv (Wiflix)
       console.log(`[LIVETV] Fetching Wiflix catalog: ${catalogId}`);
@@ -3704,14 +4927,6 @@ router.get("/catalog/:type/:catalogId", async (req, res) => {
       console.log(
         `[LIVETV] Wiflix catalog response: ${JSON.stringify(catalog).substring(0, 500)}`,
       );
-    } else if (catalogId.startsWith("vavoo_")) {
-      // Source Vavoo
-      const url = `${VAVOO_BASE_URL}/catalog/${type}/${catalogId}.json`;
-      const response = await axios.get(url, { timeout: 10000 });
-      catalog = response.data;
-
-      // Note: Si on doit supprimer les images comme demandé ("sans image"),
-      // on pourrait effectuer un map ici sur catalog.metas
     } else {
       // Source TV Direct (Défaut)
       const url = `${TVDIRECT_BASE_URL}/catalog/${type}/${catalogId}.json`;
@@ -3759,11 +4974,12 @@ router.get("/stream/:type/:channelId", async (req, res) => {
       isVip = await verifyAccessKey(accessKey);
     }
 
-    // Block VIP-only sources immediately if not VIP
-    if (
-      (channelId.startsWith("matches_") || channelId.startsWith("iptv_")) &&
-      !isVip.vip
-    ) {
+    // Block VIP-only sources immediately if not VIP.
+    // Matches (match_/matches_) are free: the IP-locked native stream is resolved
+    // client-side by the extension/userscript (RESOLVE_FCTV), and free users without
+    // it fall back to the embed player (see the match_ branch below). Only IPTV is
+    // strictly VIP.
+    if (channelId.startsWith("iptv_") && !isVip.vip) {
       return res.status(403).json({ error: "Réservé aux membres VIP" });
     }
 
@@ -3783,7 +4999,10 @@ router.get("/stream/:type/:channelId", async (req, res) => {
       });
     }
 
-    const skipOuterCache = channelId.startsWith("livetv_");
+    const skipOuterCache =
+      channelId.startsWith("livetv_") ||
+      channelId.startsWith("daddylive_") ||
+      channelId.startsWith("vavoo_");
     const cacheKey = generateCacheKey(
       `stream_${type}_${channelId}_${mode}_${sourceIndex ?? "all"}_v6_${isVip.vip ? "vip" : "free"}`,
     );
@@ -3848,56 +5067,154 @@ router.get("/stream/:type/:channelId", async (req, res) => {
         console.log(`[TVMIO] No streams found for ${channelId} in M3U`);
         streamData = { streams: [] };
       }
-      // [DÉSACTIVÉ] Linkzy temporairement désactivé
-      // } else if (channelId.startsWith('linkzy_')) {
-      //     const sources = await getLinkzyStream(channelId);
-      //     if (sources && sources.length > 0) {
-      //         streamData = {
-      //             streams: sources.map(source => ({
-      //                 title: `${source.label || 'Linkzy Stream'}`,
-      //                 url: source.url,
-      //                 behaviorHints: { notWebReady: false }
-      //             }))
-      //         };
-      //     } else {
-      //         streamData = { streams: [] };
-      //     }
+    } else if (channelId.startsWith("northlive_")) {
+      // === SOURCE NORTHLIVE (FREE, iframe embed) ===
+      // Deterministic player_url from the slug — no VIP, no proxy, no resolution.
+      const slug = channelId.slice("northlive_".length);
+      const embedUrl = northliveEmbedUrl(slug);
+      streamData = {
+        streams: [
+          {
+            title: "northlive",
+            url: embedUrl,
+            originalUrl: embedUrl,
+            _isEmbed: true,
+            behaviorHints: { notWebReady: false },
+          },
+        ],
+      };
+    } else if (channelId.startsWith("vavoo_")) {
+      // === SOURCE VAVOO (FREE, direct HLS) ===
+      // Resolve the play URL to a raw .m3u8. Returned as-is and played
+      // client-side via _directPlay (no proxy, no VIP, no extension).
+      // Cache policy: https URLs are kept 2h; an http (bare-IP) fallback is
+      // only kept 2 min so the next request re-rolls for an https edge.
+      const vavooCacheKey = generateCacheKey(`vavoo_stream_${channelId}_v1`);
+      const cachedVavoo = await getFromCacheMs(vavooCacheKey, 120000); // 2 min
+      if (cachedVavoo) {
+        return res.json(cachedVavoo);
+      }
+      const cachedHttpsVavoo = await getFromCacheMs(
+        vavooCacheKey,
+        2 * 60 * 60 * 1000, // 2h
+      );
+      if (cachedHttpsVavoo?.streams?.[0]?.url?.startsWith("https://")) {
+        return res.json(cachedHttpsVavoo);
+      }
+
+      const m3u8 = await resolveVavooStream(channelId);
+      if (!m3u8) {
+        return res.status(404).json({ error: "Flux Vavoo introuvable" });
+      }
+
+      streamData = {
+        streams: [
+          {
+            title: "Vavoo",
+            url: m3u8,
+            _directPlay: true,
+            behaviorHints: { notWebReady: false },
+          },
+        ],
+      };
+      await saveToCache(vavooCacheKey, streamData);
     } else if (channelId.startsWith("match_")) {
-      // === SOURCE MATCHES (Sosplay matches) ===
+      // === SOURCE MATCHES (FCTV33) ===
       const matchCacheKey = generateCacheKey(
-        `match_stream_${channelId}_ua2_${streamCacheVariant}`,
+        `fctv_match_stream_${channelId}_ua1_${streamCacheVariant}`,
       );
 
       // Check for fresh cache (30 seconds)
       const cachedMatch = await getFromCacheMs(matchCacheKey, 30000);
 
       if (cachedMatch) {
-        console.log(`[SOSPLAY-MATCHES] Serving cached stream for ${channelId}`);
+        console.log(`[FCTV-MATCHES] Serving cached stream for ${channelId}`);
         return res.json(cachedMatch);
       }
 
       // No cache or expired - fetch fresh
-      console.log(`[SOSPLAY-MATCHES] Fetching fresh stream for ${channelId}`);
-      const matchStreams = await resolveSosplayMatchStream(channelId);
+      console.log(`[FCTV-MATCHES] Fetching fresh stream for ${channelId}`);
+      const matchStreams = await resolveFctvMatchStream(channelId);
 
       if (!matchStreams || matchStreams.length === 0) {
         return res.status(404).json({ error: "Flux match introuvable" });
       }
 
-      // Build streams array with all French servers
+      // Public base of THIS API, so the native playlist endpoint URL is absolute.
+      const publicApiBase =
+        process.env.PUBLIC_API_BASE ||
+        `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+
+      // VIP -> server proxies the segments. Free -> "raw" mode: the browser
+      // extension / userscript injects the player Referer (no proxy needed).
+      const fctvNativeMode = isVip.vip ? "proxy" : "raw";
+      const fctvPlayerBase = await getFctvPlayerBaseUrl();
+      const fctvApiBase = await getFctvApiBase();
+
+      // Build streams array with all FCTV servers.
       const streams = matchStreams.map((stream) => {
+        // Embed player (iframe) is loaded directly in an <iframe>; never proxy it.
+        if (stream._isEmbed) {
+          return {
+            title: stream.title,
+            url: stream.url,
+            originalUrl: stream.url,
+            _isEmbed: true,
+            behaviorHints: { notWebReady: false },
+          };
+        }
+
+        if (stream._fctvNative) {
+          const p = stream._fctvNative;
+          // VIP: the server proxies the (IP-consistent) segments via the smart
+          // playlist endpoint + PROXY_SERVER_URL.
+          if (fctvNativeMode === "proxy") {
+            const url =
+              `${publicApiBase}/api/livetv/fctv/playlist?matchId=${encodeURIComponent(p.matchId)}` +
+              `&streamId=${encodeURIComponent(p.streamId)}&siteType=${encodeURIComponent(p.siteType)}` +
+              `&sportType=${encodeURIComponent(p.sportType)}&mode=proxy`;
+            return {
+              title: stream.title,
+              url,
+              originalUrl: url,
+              behaviorHints: { notWebReady: false },
+            };
+          }
+          // Free: the stream is IP-locked, so it must be resolved in the user's
+          // browser by the extension/userscript (RESOLVE_FCTV). Empty url here;
+          // the frontend fills it. Without an extension the stub is dropped and
+          // the user falls back to the embed player.
+          return {
+            title: stream.title,
+            url: "",
+            _fctvLocal: {
+              matchId: p.matchId,
+              streamId: p.streamId,
+              siteType: p.siteType,
+              sportType: p.sportType,
+              apiBase: fctvApiBase,
+            },
+            _fctvReferer: `${fctvPlayerBase}/`,
+            behaviorHints: { notWebReady: false },
+          };
+        }
+
         const encodedUrl = encodeURIComponent(stream.url);
 
+        const refererBase = stream.referer || FCTV_PLAYER_BASE_URL;
         const headers = JSON.stringify(
           buildStreamProxyHeaders(
-            stream.referer || "https://dishtrainer.net/",
-            "https://dishtrainer.net",
+            refererBase,
+            refererBase,
             stream.userAgent || STREAM_PROXY_USER_AGENT,
           ),
         );
         const encodedHeaders = encodeURIComponent(headers);
-        // Only proxyify if VIP
-        const proxyUrl = isVip.vip
+        // FCTV native m3u8 + TS segments are Referer-gated to the player origin,
+        // so they MUST be proxied (the proxy injects that Referer) for every
+        // user — not just VIP. Other streams keep the VIP-only proxy behaviour.
+        const mustProxy = stream.needsProxy === true;
+        const proxyUrl = PROXY_SERVER_URL && (mustProxy || isVip.vip)
           ? `${PROXY_SERVER_URL}?url=${encodedUrl}&headers=${encodedHeaders}`
           : stream.url;
 
@@ -4092,6 +5409,69 @@ router.get("/stream/:type/:channelId", async (req, res) => {
 
         await saveToCache(livetvCacheKey, streamData);
       }
+    } else if (channelId.startsWith("daddylive_")) {
+      if (mode === "sources") {
+        const ddSourcesCacheKey = generateCacheKey(
+          `daddylive_sources_${channelId}_v1`,
+        );
+        const cachedDdSources = await getFromCacheMs(ddSourcesCacheKey, 600000); // 10 min
+        if (cachedDdSources) {
+          return res.json(cachedDdSources);
+        }
+
+        const sources = await getDaddyliveSources(channelId);
+        if (!sources || sources.length === 0) {
+          return res
+            .status(404)
+            .json({ error: "Sources Daddylive introuvables" });
+        }
+
+        streamData = { sources, _cacheTime: Date.now() };
+        await saveToCache(ddSourcesCacheKey, streamData);
+      } else {
+        const ddCacheKey = generateCacheKey(
+          `daddylive_stream_${channelId}_source_${sourceIndex ?? "all"}_${streamCacheVariant}`,
+        );
+        const cachedDd = await getFromCacheMs(ddCacheKey, 30000); // 30s (m3u8 has `expires`)
+        if (cachedDd) {
+          return res.json(cachedDd);
+        }
+
+        const ddStreams = await resolveDaddyliveStream(channelId, {
+          sourceIndex,
+        });
+        if (!ddStreams || ddStreams.length === 0) {
+          return res.status(404).json({ error: "Flux Daddylive introuvable" });
+        }
+
+        const streams = ddStreams.map((stream) => {
+          const encodedUrl = encodeURIComponent(stream.url);
+          const headers = JSON.stringify(
+            buildStreamProxyHeaders(
+              stream.referer || DADDYLIVE_REFERER,
+              DADDYLIVE_ORIGIN,
+              stream.userAgent || LIVE_PAGE_USER_AGENT,
+            ),
+          );
+          const encodedHeaders = encodeURIComponent(headers);
+          const proxyUrl = isVip.vip
+            ? `${PROXY_SERVER_URL}?url=${encodedUrl}&headers=${encodedHeaders}`
+            : stream.url;
+
+          return {
+            title: `Daddylive - ${stream.title}`,
+            url: proxyUrl,
+            originalUrl: stream.url,
+            referer: stream.referer || DADDYLIVE_REFERER,
+            userAgent: stream.userAgent || LIVE_PAGE_USER_AGENT,
+            _sourceIndex: stream._sourceIndex,
+            behaviorHints: { notWebReady: false },
+          };
+        });
+
+        streamData = { streams, _cacheTime: Date.now() };
+        await saveToCache(ddCacheKey, streamData);
+      }
     } else if (channelId.startsWith("wiflix_")) {
       // === SOURCE WITV (WIFLIX) ===
       const wiflixCacheKey = generateCacheKey(
@@ -4175,42 +5555,6 @@ router.get("/stream/:type/:channelId", async (req, res) => {
 
       // Save to cache with timestamp
       await saveToCache(wiflixCacheKey, streamData);
-    } else if (channelId.startsWith("vavoo_") || channelId.includes("vavoo")) {
-      // === SOURCE VAVOO ===
-      // Requiert un proxy via proxiesembed
-      const url = `${VAVOO_BASE_URL}/stream/${type}/${channelId}.json`;
-      const response = await axios.get(url, { timeout: 10000 });
-      streamData = response.data;
-
-      if (streamData.streams) {
-        // Wrapper les URLs dans le proxy local
-        streamData.streams = streamData.streams.map((stream) => {
-          if (stream.url) {
-            // Encoder l'URL destination
-            const encodedUrl = encodeURIComponent(stream.url);
-
-            // Préparer les headers (User-Agent Vavoo) pour le proxy
-            const headers = JSON.stringify({ "User-Agent": "VAVOO/2.6" });
-            const encodedHeaders = encodeURIComponent(headers);
-
-            // Créer l'URL pointant vers notre serveur proxy (only if VIP)
-            const proxyUrl = isVip.vip
-              ? `${PROXY_SERVER_URL}?url=${encodedUrl}&headers=${encodedHeaders}`
-              : stream.url;
-
-            return {
-              ...stream,
-              url: proxyUrl, // L'URL que le lecteur utilisera
-              originalUrl: stream.url, // Conserver l'URL originale au cas où
-              behaviorHints: {
-                ...stream.behaviorHints,
-                notWebReady: false,
-              },
-            };
-          }
-          return stream;
-        });
-      }
     } else {
       // === SOURCE TV DIRECT ===
       const url = `${TVDIRECT_BASE_URL}/stream/${type}/${channelId}.json`;
@@ -4272,6 +5616,99 @@ router.get("/stream/:type/:channelId", async (req, res) => {
 });
 
 /**
+ * GET /api/livetv/fctv/playlist?matchId=&streamId=&siteType=&sportType=
+ * FCTV native HLS smart-playlist. Resolves a fresh token, fetches the upstream
+ * tokenised m3u8, and rewrites every segment to the playlist host + path-token
+ * form (handles cdnSmartLink absolute/&token segments), routed through
+ * PROXY_SERVER_URL so the player-origin Referer is injected. This is what makes
+ * the Referer-gated v3b streams playable natively in HLSPlayer.
+ */
+router.get("/fctv/playlist", async (req, res) => {
+  const matchId = req.query.matchId;
+  const streamId = req.query.streamId;
+  const siteType = req.query.siteType || FCTV_DEFAULT_SITE_TYPE;
+  const sportType = req.query.sportType || 1;
+  // proxy = segments via PROXY_SERVER_URL (VIP). raw = bare CDN urls; the
+  // browser extension / userscript injects the player Referer (free users).
+  const mode = req.query.mode === "raw" ? "raw" : "proxy";
+  if (!matchId || !streamId) {
+    return res.status(400).send("missing matchId/streamId");
+  }
+
+  try {
+    const playerBase = await getFctvPlayerBaseUrl();
+    const upstreamHeaders = {
+      "User-Agent": STREAM_PROXY_USER_AGENT,
+      Accept: "*/*",
+      Origin: playerBase,
+      Referer: `${playerBase}/`,
+    };
+    const fetchPlaylist = (data) =>
+      axios.get(data.playlistUrl, {
+        responseType: "text",
+        headers: upstreamHeaders,
+        timeout: 15000,
+        validateStatus: () => true,
+      });
+    const ok = (r) =>
+      r && r.status === 200 && typeof r.data === "string" && r.data.includes("#EXTM3U");
+
+    // First try the (briefly cached) token; if the upstream rejects it (token
+    // expired), re-resolve a fresh token and retry once.
+    let resolved = await resolveFctvUpstreamPlaylist(streamId, siteType, matchId, sportType);
+    let pr = resolved ? await fetchPlaylist(resolved) : null;
+    if (!ok(pr)) {
+      resolved = await resolveFctvUpstreamPlaylist(streamId, siteType, matchId, sportType, true);
+      pr = resolved ? await fetchPlaylist(resolved) : null;
+    }
+    if (!resolved || !ok(pr)) {
+      console.warn(`[FCTV-PLAYLIST] upstream ${pr ? pr.status : "no-resolve"} for match ${matchId} stream ${streamId}`);
+      return res.status(502).send("upstream playlist failed");
+    }
+
+    // NOTE: the segment CDN's Referer ACL requires the TRAILING SLASH
+    // (`https://host/` returns 200, `https://host` returns 403).
+    const segProxyHeaders = encodeURIComponent(
+      JSON.stringify(
+        buildStreamProxyHeaders(`${playerBase}/`, playerBase, STREAM_PROXY_USER_AGENT),
+      ),
+    );
+
+    const rewritten = pr.data
+      .split("\n")
+      .map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) return line;
+        let abs;
+        try {
+          abs = new URL(trimmed, resolved.playlistUrl);
+        } catch {
+          return line;
+        }
+        // Normalise to: <playlist origin>/token-<T>/<path-after-host>?<query−token>
+        abs.searchParams.delete("token");
+        const path = abs.pathname.replace(/^\/token-[^/]+/, "");
+        const norm = `${resolved.origin}/token-${resolved.token}${path}${abs.search}`;
+        // raw mode (free + extension/userscript): bare CDN url; the extension
+        // injects the player Referer on the request -> no proxy needed.
+        if (mode === "raw") return norm;
+        return PROXY_SERVER_URL
+          ? `${PROXY_SERVER_URL}?url=${encodeURIComponent(norm)}&headers=${segProxyHeaders}`
+          : norm;
+      })
+      .join("\n");
+
+    res.set("Content-Type", "application/vnd.apple.mpegurl");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Cache-Control", "no-store");
+    return res.send(rewritten);
+  } catch (error) {
+    console.error(`[FCTV-PLAYLIST] error match ${matchId} stream ${streamId}:`, error.message);
+    return res.status(502).send("fctv playlist error");
+  }
+});
+
+/**
  * GET /api/livetv/resolve/:playId
  * Résout une URL de lecture spécifique (TV Direct)
  */
@@ -4326,8 +5763,12 @@ router.delete("/cache", async (req, res) => {
 const XTREAM_URL = (process.env.XTREAM_URL || "").replace(/\/+$/, "");
 const XTREAM_USER = process.env.XTREAM_USER || "";
 const XTREAM_PASS = process.env.XTREAM_PASS || "";
-const IPTV_IMAGE_PROXY = "https://proxy.movix.tax/proxy";
-const IPTV_STREAM_PROXY = "https://proxiesembed.movix.tax/proxy";
+const IPTV_IMAGE_PROXY = (
+  process.env.IPTV_IMAGE_PROXY || "http://localhost:25568/proxy"
+).replace(/\/+$/, "");
+const IPTV_STREAM_PROXY = (
+  process.env.IPTV_STREAM_PROXY || "http://localhost:25569/proxy"
+).replace(/\/+$/, "");
 
 // Cache catégories IPTV en mémoire (change rarement)
 let iptvCategoriesCache = null;
@@ -4388,7 +5829,7 @@ router.get("/iptv/categories", requireVip, async (req, res) => {
 /**
  * GET /api/livetv/iptv/streams/:categoryId
  * Récupère les chaînes d'une catégorie Xtream (VIP only)
- * Images proxifiées via proxy.movix.cash
+ * Images proxifiées via proxy.movix.fun
  */
 router.get("/iptv/streams/:categoryId", requireVip, async (req, res) => {
   const { categoryId } = req.params;
@@ -4451,5 +5892,17 @@ router.get("/iptv/stream-url/:streamId", requireVip, async (req, res) => {
     res.status(500).json({ error: "Erreur lors de la construction de l'URL" });
   }
 });
+
+// Warm the northlive channel cache at boot and refresh it hourly (user request:
+// "récupère toutes les pages toutes les heures et mets en cache"). Failures are
+// swallowed — the lazy fetch in the manifest/catalog routes is the fallback.
+fetchAllNorthlive(true).catch((e) =>
+  console.warn(`[NORTHLIVE] initial warm failed: ${e.message}`),
+);
+setInterval(() => {
+  fetchAllNorthlive(true).catch((e) =>
+    console.warn(`[NORTHLIVE] hourly refresh failed: ${e.message}`),
+  );
+}, NORTHLIVE_REFRESH_MS).unref();
 
 module.exports = router;

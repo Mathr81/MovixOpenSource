@@ -89,6 +89,14 @@ const BLOCKED_SYNC_KEYS = new Set([
 
 const PROFILE_LOAD_PRESERVED_KEYS = new Set([
   SYNC_OUTBOX_STORAGE_KEY,
+  // VIP credential/entitlement keys are server-authoritative (verified via
+  // /api/check-vip + refreshVipState), like is_admin. They stay syncable for
+  // cross-device propagation but MUST NOT be wiped during the profile-load
+  // wipe-and-restore: the transient removeItem('is_vip') fired a native
+  // cross-tab `storage` event that flipped VIPs to non-VIP for a tick and
+  // re-triggered the ad popup on open watch tabs. See AdFreePopupContext.
+  'access_code',
+  'access_code_expires',
   'access_token',
   'auth',
   'auth_method',
@@ -106,6 +114,7 @@ const PROFILE_LOAD_PRESERVED_KEYS = new Set([
   'google_user',
   'guest_uuid',
   'is_admin',
+  'is_vip',
   'movix_pending_auth_action',
   'resolved_user_id',
   'resolved_user_type',

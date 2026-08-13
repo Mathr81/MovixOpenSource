@@ -1,6 +1,6 @@
 /**
  * Stockage DB des clients OAuth + stats + grants VIP. Remplace le fichier
- * `data/oauth-clients.json` (déprécié — migration auto au boot).
+ * `data/oauth-clients.json` (déprécié — aucune migration automatique au boot).
  *
  * Les autres modules continuent d'appeler `loadOAuthClients()` (sync) de
  * `oauthClients.js`, qui lit depuis le cache pré-warmé par les fonctions
@@ -11,8 +11,9 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { getPool } = require('../mysqlPool');
+const { redis } = require('../config/redis');
+const { ensureTableGroup } = require('../db/runtimeEnsure');
 
-const SCHEMA_PATH = path.join(__dirname, '..', 'exportscripts', 'add_oauth_apps_tables.sql');
 const LEGACY_JSON_PATH = path.join(__dirname, '..', 'data', 'oauth-clients.json');
 const ICON_DIR = path.join(__dirname, '..', 'public', 'oauth-icons');
 
@@ -51,32 +52,9 @@ const KNOWN_OAUTH_SCOPES_SET = new Set([
   'ratings.manage',
 ]);
 
-/** Strip les commentaires `-- …` ligne par ligne avant le split.
- *  Note : ne gère pas `/* … *\/` mais le schéma n'en utilise pas. */
-function stripSqlLineComments(sqlText) {
-  return sqlText
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('--'))
-    .join('\n');
-}
-
 /** Crée les tables si elles n'existent pas (idempotent). */
 async function ensureTables() {
-  const pool = getPool();
-  if (!pool) throw new Error('MySQL pool not ready');
-  if (!fs.existsSync(SCHEMA_PATH)) return;
-  // On strip d'abord TOUS les commentaires ligne `-- …` puis on split sur `;`.
-  // Sans le strip, le premier statement embarquait le header de commentaires
-  // du fichier et était filtré par `!startsWith('--')` → aucune table créée
-  // et le INSERT migrate plantait sur "Table 'oauth_clients' doesn't exist".
-  const sql = stripSqlLineComments(fs.readFileSync(SCHEMA_PATH, 'utf-8'));
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  for (const stmt of statements) {
-    await pool.query(stmt);
-  }
+  await ensureTableGroup(getPool(), 'oauth');
   // Crée aussi le dossier oauth-icons s'il n'existe pas.
   if (!fs.existsSync(ICON_DIR)) {
     fs.mkdirSync(ICON_DIR, { recursive: true, mode: 0o755 });
@@ -204,6 +182,60 @@ function getCachedClients() {
 
 function invalidateCache() {
   memCache = { loadedAt: 0, clients: [] };
+}
+
+// ─── Cross-worker cache invalidation (Redis pub/sub) ─────────────────────
+// Movix runs in Node cluster mode (server.js): each worker has its own
+// in-process `memCache`. A DB mutation only reloads the worker that handled
+// it — other workers keep serving stale OAuth clients until they reboot.
+// After every mutation we publish on a Redis channel so all workers reload.
+// Without this, a redirect_uri added to a client after boot is rejected
+// intermittently, depending on which worker the request is routed to.
+
+const CLIENTS_CHANGED_CHANNEL = 'oauth:clients:changed';
+let cacheSubscriber = null;
+
+/** Notify every cluster worker that the oauth_clients table changed. */
+async function publishClientsChanged() {
+  try {
+    await redis.publish(CLIENTS_CHANGED_CHANNEL, String(process.pid));
+  } catch (err) {
+    // The local reloadCache() already ran; cross-worker propagation is
+    // best-effort and self-heals at the next mutation or worker restart.
+    console.warn('[OAuth Clients DB] publishClientsChanged failed:', err.message);
+  }
+}
+
+/** Reload this worker's cache, then broadcast so every other worker reloads. */
+async function reloadCacheAndBroadcast() {
+  await reloadCache();
+  await publishClientsChanged();
+}
+
+/**
+ * Start the per-worker cache subscriber. Call once per worker at boot.
+ * Uses a dedicated connection — in ioredis a connection in subscriber mode
+ * cannot run normal commands. ioredis auto-reconnects and re-subscribes.
+ */
+function startClientsCacheSubscriber() {
+  if (cacheSubscriber) return;
+  cacheSubscriber = redis.duplicate();
+  cacheSubscriber.on('error', (err) => {
+    console.error('[OAuth Clients DB] cache subscriber error:', err.message);
+  });
+  cacheSubscriber.on('message', (channel, message) => {
+    if (channel !== CLIENTS_CHANGED_CHANNEL) return;
+    reloadCache()
+      .then(() => console.log(`[OAuth Clients DB] cache reloaded (pub/sub from pid ${message})`))
+      .catch((err) => console.error('[OAuth Clients DB] reloadCache after pub/sub failed:', err.message));
+  });
+  cacheSubscriber.subscribe(CLIENTS_CHANGED_CHANNEL, (err) => {
+    if (err) {
+      console.error('[OAuth Clients DB] subscribe failed:', err.message);
+      return;
+    }
+    console.log('[OAuth Clients DB] cache subscriber ready on', CLIENTS_CHANGED_CHANNEL);
+  });
 }
 
 // ─── Stats helpers ───────────────────────────────────────────────────────
@@ -334,6 +366,9 @@ module.exports = {
   ensureTables,
   migrateLegacyJsonIfNeeded,
   reloadCache,
+  reloadCacheAndBroadcast,
+  publishClientsChanged,
+  startClientsCacheSubscriber,
   getCachedClients,
   invalidateCache,
   recordEvent,

@@ -95,6 +95,10 @@ movix-main/
 
 ## Démarrage rapide
 
+<p align="center">
+  <strong>⚠️ L'utilisation de ce code implique le maintien des crédits et l'interdiction stricte de le monétiser (Zéro pub et abonnements). Voir la License complète </strong>
+</p>
+
 ### Prérequis
 
 - Node.js 18+ et npm
@@ -133,6 +137,15 @@ cp API/proxiesembed/.env.example API/proxiesembed/.env
 # bypass403
 cp API/miscs/.env.example API/miscs/.env
 ```
+
+Initialise ensuite le schéma de l'API principale avant de démarrer les services :
+
+```bash
+cd API/Mainapi
+npm run db:init
+```
+
+Sur une base existante, la commande demande confirmation ; elle en demande une seconde pour les modifications des tables Wrapped, qui peuvent être longues si elles sont volumineuses.
 
 ### Lancer le minimum utile en local
 

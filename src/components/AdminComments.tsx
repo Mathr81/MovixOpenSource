@@ -837,7 +837,7 @@ const AdminComments: React.FC = () => {
                                     className="flex-shrink-0 p-1 rounded-md bg-white/5 hover:bg-white/10 transition-colors mt-0.5"
                                     title={t('admin.viewFull')}
                                 >
-                                    <MoreHorizontal className="h-3.5 w-3.5 text-white/50" />
+                                    <MoreHorizontal className="h-3.5 w-3.5 text-white opacity-50" />
                                 </button>
                             )}
                         </div>
@@ -1069,7 +1069,7 @@ const AdminComments: React.FC = () => {
             {activeTab === 'bans' && (
                 <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
                     <div className="relative flex-1 w-full sm:max-w-xs">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-white/30" />
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-white opacity-30" />
                         <Input
                             placeholder={t('admin.searchBans')}
                             value={bansSearch}
@@ -1293,7 +1293,7 @@ const AdminComments: React.FC = () => {
                                                                     className="flex-shrink-0 p-1 rounded-md bg-white/5 hover:bg-white/10 transition-colors mt-0.5"
                                                                     title={t('admin.viewFull')}
                                                                 >
-                                                                    <MoreHorizontal className="h-3.5 w-3.5 text-white/50" />
+                                                                    <MoreHorizontal className="h-3.5 w-3.5 text-white opacity-50" />
                                                                 </button>
                                                             )}
                                                         </div>
@@ -1762,7 +1762,7 @@ const AdminComments: React.FC = () => {
                                     <Badge variant="rejected" className="bg-red-500/20 text-red-400 border-red-500/30">
                                         {viewComment.moderation_reason}
                                     </Badge>
-                                    <span className="text-[10px] text-white/40">par Gemini AI</span>
+                                    <span className="text-[10px] text-white/40">{t('admin.generatedByGemini')}</span>
                                 </div>
                                 {viewComment.moderation_details && (
                                     <p className="text-xs text-white/60">

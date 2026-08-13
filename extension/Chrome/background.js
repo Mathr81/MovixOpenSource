@@ -1,17 +1,445 @@
-const VAVOO_BASE_URL = "https://tvvoo.hayd.uk/cfg-fr";
-const WITV_BASE_URL = "https://witv.team";
+const WITV_BASE_URL = "https://witv.football";
 const SOSPLAY_BASE_URL = "https://streamonsport.art";
-const LIVETV_BASE_URL = "https://livetv882.me/frx/";
-const LIVETV_EMBED_ORIGIN = "https://livetv882.me";
+const LIVETV_BASE_URL = "https://livetv901.me/frx/";
+const LIVETV_EMBED_ORIGIN = "https://livetv901.me";
 const LIVETV_EMBED_REFERER = LIVETV_BASE_URL;
-// Backend API URL for got-scraping based extraction
-const API_BASE_URL = "https://api.movix.cash";
+// Backend API URL for got-scraping based extraction.
+// Dev override: when the requesting page is localhost (Vite dev on :3000),
+// talk to the local backend (:25565) instead of prod. Set per-message from
+// the sender origin (see maybeUseLocalApi in the onMessage listener below).
+const PROD_API_BASE_URL = "https://api.movix.fun";
+const LOCAL_API_BASE_URL = "http://localhost:25565";
+let API_BASE_URL = PROD_API_BASE_URL;
+
+function maybeUseLocalApi(sender) {
+  try {
+    const u =
+      sender && (sender.url || (sender.tab && sender.tab.url) || sender.origin);
+    if (!u) return;
+    const host = new URL(u).hostname;
+    API_BASE_URL =
+      host === "localhost" || host === "127.0.0.1"
+        ? LOCAL_API_BASE_URL
+        : PROD_API_BASE_URL;
+  } catch (e) {}
+}
 const STREAM_PROXY_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // Import extractors module
+importScripts("fsvid-vidzy-quickjs.js");
 importScripts("extractors.js");
 const Extractors = globalThis.MovixExtractors;
+
+// BEGIN KISSKH FALLBACK
+const KISSKH_BROWSER_API = chrome;
+const KISSKH_SESSION_RULE_ID = 59;
+const KISSKH_MAX_REDIRECTS = 5;
+const KISSKH_REQUEST_TIMEOUT_MS = 10000;
+const KISSKH_MAX_MEDIA_URL_LENGTH = 8192;
+const KISSKH_MAX_HEADER_VALUE_LENGTH = 2048;
+const KISSKH_MAX_SUBTITLE_BYTES = 2097152;
+const KISSKH_MAX_EXCHANGE_BYTES = 32768;
+const KISSKH_MAX_EXCHANGE_LIFETIME_MS = 120000;
+const KISSKH_ALLOWED_HEADER_ORIGIN = "https://kisskh.nl";
+let kisskhSessionRuleQueue = Promise.resolve();
+
+function kisskhFailure(code) {
+  return { success: false, code };
+}
+
+function kisskhHasExactKeys(value, keys) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort())
+  );
+}
+
+function kisskhValidateSubtitleUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > KISSKH_MAX_MEDIA_URL_LENGTH || /[\r\n\0]/.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username || parsed.password || parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateMediaUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > KISSKH_MAX_MEDIA_URL_LENGTH || /[\r\n\0]/.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username || parsed.password || parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateHeaderValue(name, value) {
+  if (
+    typeof value !== "string" || value.length === 0 ||
+    value.length > KISSKH_MAX_HEADER_VALUE_LENGTH || /[\r\n\0]/.test(value)
+  ) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" || parsed.username || parsed.password ||
+      (parsed.port && parsed.port !== "443") || parsed.hash ||
+      parsed.origin !== KISSKH_ALLOWED_HEADER_ORIGIN
+    ) {
+      return null;
+    }
+    if (name === "Origin" && (parsed.pathname !== "/" || parsed.search)) return null;
+    return name === "Origin" ? parsed.origin : parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateExchange(value) {
+  if (!kisskhHasExactKeys(value, ["url", "expiresAt", "requiredHeaders"])) return null;
+  const url = kisskhValidateMediaUrl(value.url);
+  if (
+    !url || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now() ||
+    value.expiresAt > Date.now() + KISSKH_MAX_EXCHANGE_LIFETIME_MS ||
+    value.requiredHeaders === null || typeof value.requiredHeaders !== "object" || Array.isArray(value.requiredHeaders)
+  ) {
+    return null;
+  }
+  const headers = {};
+  for (const [name, rawValue] of Object.entries(value.requiredHeaders)) {
+    if (name !== "Referer" && name !== "Origin") return null;
+    const headerValue = kisskhValidateHeaderValue(name, rawValue);
+    if (!headerValue) return null;
+    headers[name] = headerValue;
+  }
+  return { url, expiresAt: value.expiresAt, requiredHeaders: headers };
+}
+
+async function kisskhReadBoundedBody(response, maxBytes) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxBytes) {
+      return { error: "response_too_large" };
+    }
+  }
+  if (!response.body || typeof response.body.getReader !== "function") {
+    return { error: "unsupported_transport" };
+  }
+  const reader = response.body.getReader();
+  let timeoutId;
+  const readResult = (async () => {
+    const chunks = [];
+    let length = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        length += chunk.byteLength;
+        if (length > maxBytes) {
+          await reader.cancel();
+          return { error: "response_too_large" };
+        }
+        chunks.push(chunk);
+      }
+    } catch {
+      return { error: "upstream_unavailable" };
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { bytes };
+  })();
+  const timeoutResult = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve({ error: "timeout", timedOut: true }), KISSKH_REQUEST_TIMEOUT_MS);
+  });
+  const result = await Promise.race([readResult, timeoutResult]);
+  clearTimeout(timeoutId);
+  if (result.timedOut) {
+    try {
+      await reader.cancel();
+    } catch {}
+    return { error: "timeout" };
+  }
+  return result;
+}
+
+function kisskhBytesToBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+  }
+  return btoa(binary);
+}
+
+async function kisskhFetch(url, init) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), KISSKH_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function kisskhFetchSubtitle(sourceUrl) {
+  let currentUrl = sourceUrl;
+  for (let redirects = 0; redirects <= KISSKH_MAX_REDIRECTS; redirects += 1) {
+    let response;
+    try {
+      response = await kisskhFetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        credentials: "omit",
+        cache: "no-store",
+        headers: { Accept: "text/*", "Cache-Control": "no-store" },
+      });
+    } catch (error) {
+      return kisskhFailure(error?.name === "AbortError" ? "timeout" : "upstream_unavailable");
+    }
+    if (response.status >= 300 && response.status < 400) {
+      if (redirects === KISSKH_MAX_REDIRECTS) return kisskhFailure("upstream_unavailable");
+      const location = response.headers.get("location");
+      let redirected = null;
+      try {
+        redirected = location ? kisskhValidateSubtitleUrl(new URL(location, currentUrl).toString()) : null;
+      } catch {}
+      if (!redirected) return kisskhFailure("invalid_request");
+      currentUrl = redirected;
+      continue;
+    }
+    if (response.status === 429) return kisskhFailure("provider_rate_limited");
+    if (!response.ok) return kisskhFailure("upstream_unavailable");
+    const contentType = response.headers.get("content-type") || "";
+    if (!/^text\/[a-z0-9!#$&^_.+-]+(?:\s*;|$)/i.test(contentType)) {
+      return kisskhFailure("invalid_content_type");
+    }
+    const body = await kisskhReadBoundedBody(response, KISSKH_MAX_SUBTITLE_BYTES);
+    if (body.error) return kisskhFailure(body.error);
+    return {
+      success: true,
+      kind: "subtitle",
+      status: response.status,
+      contentType,
+      bodyBase64: kisskhBytesToBase64(body.bytes),
+    };
+  }
+  return kisskhFailure("upstream_unavailable");
+}
+
+function kisskhAlarmName(expiresAt) {
+  return `${KISSKH_SESSION_RULE_ID}:${expiresAt}`;
+}
+
+function kisskhParseAlarm(alarm) {
+  const match = new RegExp(`^${KISSKH_SESSION_RULE_ID}:(\\d{13})$`).exec(alarm?.name || "");
+  if (!match) return null;
+  const expiresAt = Number(match[1]);
+  return Number.isSafeInteger(expiresAt) && alarm.scheduledTime === expiresAt ? expiresAt : null;
+}
+
+function kisskhHasSessionTransport() {
+  return Boolean(
+    KISSKH_BROWSER_API?.declarativeNetRequest?.getSessionRules &&
+    KISSKH_BROWSER_API?.declarativeNetRequest?.updateSessionRules &&
+    KISSKH_BROWSER_API?.alarms?.getAll &&
+    KISSKH_BROWSER_API?.alarms?.create &&
+    KISSKH_BROWSER_API?.alarms?.clear,
+  );
+}
+
+async function kisskhClearAlarms() {
+  if (!KISSKH_BROWSER_API?.alarms?.getAll) return;
+  const alarms = await KISSKH_BROWSER_API.alarms.getAll();
+  await Promise.all(
+    alarms
+      .filter(alarm => String(alarm.name || "").startsWith(`${KISSKH_SESSION_RULE_ID}:`))
+      .map(alarm => KISSKH_BROWSER_API.alarms.clear(alarm.name)),
+  );
+}
+
+async function kisskhRemoveSessionRule() {
+  if (!kisskhHasSessionTransport()) return false;
+  await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [KISSKH_SESSION_RULE_ID],
+  });
+  await kisskhClearAlarms();
+  return true;
+}
+
+function kisskhExactRegex(url) {
+  return `^${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+}
+
+async function kisskhInstallSessionRule(exchange) {
+  if (!kisskhHasSessionTransport()) return false;
+  const update = kisskhSessionRuleQueue.then(async () => {
+    await kisskhClearAlarms();
+    const requestHeaders = Object.entries(exchange.requiredHeaders).map(([header, value]) => ({
+      header,
+      operation: "set",
+      value,
+    }));
+    try {
+      await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [KISSKH_SESSION_RULE_ID],
+        addRules: [{
+          id: KISSKH_SESSION_RULE_ID,
+          priority: 100,
+          action: { type: "modifyHeaders", requestHeaders },
+          condition: {
+            regexFilter: kisskhExactRegex(exchange.url),
+            resourceTypes: ["xmlhttprequest", "media", "other"],
+          },
+        }],
+      });
+      await KISSKH_BROWSER_API.alarms.create(kisskhAlarmName(exchange.expiresAt), {
+        when: exchange.expiresAt,
+      });
+      return true;
+    } catch {
+      try {
+        await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+          removeRuleIds: [KISSKH_SESSION_RULE_ID],
+        });
+        await kisskhClearAlarms();
+      } catch {}
+      return false;
+    }
+  });
+  kisskhSessionRuleQueue = update.then(() => undefined, () => undefined);
+  return update;
+}
+
+async function reconcileKisskhSessionRule() {
+  if (!kisskhHasSessionTransport()) return false;
+  const [rules, alarms] = await Promise.all([
+    KISSKH_BROWSER_API.declarativeNetRequest.getSessionRules(),
+    KISSKH_BROWSER_API.alarms.getAll(),
+  ]);
+  const ruleCount = rules.filter(rule => rule.id === KISSKH_SESSION_RULE_ID).length;
+  const relatedAlarms = alarms.filter(alarm => String(alarm.name || "").startsWith(`${KISSKH_SESSION_RULE_ID}:`));
+  const expiry = relatedAlarms.length === 1 ? kisskhParseAlarm(relatedAlarms[0]) : null;
+  if (ruleCount === 1 && expiry !== null && expiry > Date.now()) return true;
+  if (ruleCount > 0) {
+    await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [KISSKH_SESSION_RULE_ID],
+    });
+  }
+  await kisskhClearAlarms();
+  return false;
+}
+
+async function kisskhExchangeMedia(fallbackToken) {
+  let response;
+  try {
+    response = await kisskhFetch(`${PROD_API_BASE_URL}/api/kisskh/fallback/${fallbackToken}`, {
+      method: "POST",
+      redirect: "error",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (error) {
+    return kisskhFailure(error?.name === "AbortError" ? "timeout" : "upstream_unavailable");
+  }
+  if (response.status === 429) return kisskhFailure("provider_rate_limited");
+  if (!response.ok) return kisskhFailure("upstream_unavailable");
+  if (!/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get("cache-control") || "")) {
+    return kisskhFailure("provider_changed");
+  }
+  if (!/^application\/json(?:\s*;|$)/i.test(response.headers.get("content-type") || "")) {
+    return kisskhFailure("provider_changed");
+  }
+  const body = await kisskhReadBoundedBody(response, KISSKH_MAX_EXCHANGE_BYTES);
+  if (body.error) return kisskhFailure(body.error === "response_too_large" ? "provider_changed" : body.error);
+  let rawExchange;
+  try {
+    rawExchange = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.bytes));
+  } catch {
+    return kisskhFailure("provider_changed");
+  }
+  const exchange = kisskhValidateExchange(rawExchange);
+  if (!exchange) return kisskhFailure("provider_changed");
+  const headerNames = Object.keys(exchange.requiredHeaders);
+  if (headerNames.length === 0) {
+    if (kisskhHasSessionTransport()) await kisskhRemoveSessionRule();
+    return {
+      success: true,
+      kind: "media",
+      url: exchange.url,
+      expiresAt: exchange.expiresAt,
+      headersApplied: false,
+    };
+  }
+  if (!(await kisskhInstallSessionRule(exchange))) return kisskhFailure("unsupported_transport");
+  return {
+    success: true,
+    kind: "media",
+    url: exchange.url,
+    expiresAt: exchange.expiresAt,
+    headersApplied: true,
+  };
+}
+
+async function handleKisskhFallback(payload) {
+  if (!kisskhHasExactKeys(payload, payload?.kind === "subtitle" ? ["kind", "sourceUrl"] : ["kind", "fallbackToken"])) {
+    return kisskhFailure("invalid_request");
+  }
+  if (payload.kind === "subtitle") {
+    const sourceUrl = kisskhValidateSubtitleUrl(payload.sourceUrl);
+    return sourceUrl ? kisskhFetchSubtitle(sourceUrl) : kisskhFailure("invalid_request");
+  }
+  if (
+    payload.kind !== "media" || typeof payload.fallbackToken !== "string" ||
+    payload.fallbackToken.length < 16 || payload.fallbackToken.length > 2048 ||
+    !/^[A-Za-z0-9_-]+$/.test(payload.fallbackToken)
+  ) {
+    return kisskhFailure("invalid_request");
+  }
+  return kisskhExchangeMedia(payload.fallbackToken);
+}
+
+if (KISSKH_BROWSER_API?.alarms?.onAlarm?.addListener) {
+  KISSKH_BROWSER_API.alarms.onAlarm.addListener(async alarm => {
+    const expiresAt = kisskhParseAlarm(alarm);
+    if (expiresAt === null) return;
+    if (expiresAt > Date.now()) {
+      await KISSKH_BROWSER_API.alarms.create(alarm.name, { when: expiresAt });
+      return;
+    }
+    await kisskhRemoveSessionRule();
+  });
+}
+KISSKH_BROWSER_API.runtime.onStartup.addListener(() => {
+  void reconcileKisskhSessionRule().catch(() => {});
+});
+void reconcileKisskhSessionRule().catch(() => {});
+// END KISSKH FALLBACK
 
 // Cache for Wiflix channels with their page slugs
 let wiflixChannelCache = {};
@@ -27,7 +455,7 @@ const DEFAULT_EXTRACTION_PREFS = {
     sibnet: true, uqload: true, doodstream: true, seekstreaming: true,
   },
   livetv: {
-    linkzy: true, wiflix: true, sosplay: true, livetv: true, matches: true,
+    wiflix: true, sosplay: true, livetv: true, matches: true,
   },
 };
 let extractionPrefs = DEFAULT_EXTRACTION_PREFS;
@@ -116,6 +544,11 @@ async function setupRules() {
           "movix.cloud",
           "movix.tax",
           "movix.club",
+          "movix.chat",
+          "movix.golf",
+          "movix.date",
+          "movix.fun",
+          "movix.show",
         ],
         resourceTypes: [
           "xmlhttprequest",
@@ -138,6 +571,7 @@ async function setupRules() {
 
 // Handle messages
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  maybeUseLocalApi(sender);
   handleMessage(message)
     .then(sendResponse)
     .catch((err) => sendResponse({ error: err.message }));
@@ -150,7 +584,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
  */
 function getLiveTvSourceKey(catalogId) {
   if (!catalogId || typeof catalogId !== 'string') return null;
-  if (catalogId.startsWith('linkzy_')) return 'linkzy';
   if (catalogId.startsWith('wiflix_')) return 'wiflix';
   if (catalogId.startsWith('sosplay_')) return 'sosplay';
   if (catalogId.startsWith('livetv_')) return 'livetv';
@@ -202,6 +635,8 @@ async function handleMessage(message) {
   }
 
   switch (action) {
+    case "KISSKH_FALLBACK":
+      return await handleKisskhFallback(payload);
     case "GET_MANIFEST":
       return await getManifest();
     case "GET_CATALOG": {
@@ -261,6 +696,21 @@ async function handleMessage(message) {
         return { success: true };
       }
       return { success: false, error: "Could not setup headers" };
+    }
+
+    // FCTV (matches) native: inject the player Referer on the CDN segments so
+    // free users play natively without the server proxy.
+    case "SETUP_FCTV_HEADERS": {
+      const okFctv = await setupFctvHeadersRule(payload?.referer);
+      return { success: okFctv };
+    }
+
+    // FCTV (matches) native: resolve ONE server locally (IP-bound) -> m3u8 url.
+    // Also installs the Referer DNR rule for the segments.
+    case "RESOLVE_FCTV": {
+      const fctvUrl = await resolveFctvStream(payload || {});
+      if (fctvUrl) return { success: true, url: fctvUrl };
+      return { success: false, error: "fctv resolve failed" };
     }
 
     case "SET_EXTRACTION_PREFS": {
@@ -339,6 +789,24 @@ async function proxyHttpRequest(url, headers = {}) {
 
 // === NEXUS M3U8 EXTRACTION HANDLERS ===
 
+function getSeekStreamingPlaybackUrls(result) {
+  const urls = [];
+  const seen = new Set();
+  const add = (url) => {
+    if (typeof url !== "string" || !url || seen.has(url)) return;
+    seen.add(url);
+    urls.push(url);
+  };
+  if (Array.isArray(result?.hlsCandidates)) {
+    for (const candidate of result.hlsCandidates) {
+      add(candidate?.url);
+    }
+  }
+  add(result?.hlsUrl);
+  add(result?.m3u8Url);
+  return urls;
+}
+
 /**
  * Handle single embed extraction request
  * payload: { type: 'voe'|'fsvid'|..., url: 'https://...' }
@@ -350,6 +818,36 @@ async function handleExtractM3u8(payload) {
   // Auto-detect type if not provided
   const embedType = type || Extractors.detectEmbedType(url);
   if (!embedType) return { success: false, error: "Unknown embed type" };
+
+  if (embedType === "seekstreaming") {
+    let extractionRuleId = null;
+    try {
+      const extractionHeaders = await Extractors.setupHeadersForService(
+        embedType,
+        url,
+        url,
+      );
+      if (extractionHeaders) {
+        extractionRuleId = await addHeadersRule(
+          extractionHeaders.domainPattern,
+          extractionHeaders.headers,
+        );
+      }
+      const result = await Extractors.extractSingle(embedType, url);
+      if (result.success) {
+        for (const videoUrl of getSeekStreamingPlaybackUrls(result)) {
+          const playbackHeaders =
+            await Extractors.setupHeadersForService(embedType, videoUrl, url);
+          if (playbackHeaders) {
+            await replaceSeekPlaybackRule(playbackHeaders);
+          }
+        }
+      }
+      return result;
+    } finally {
+      await removeHeadersRule(extractionRuleId);
+    }
+  }
 
   // Set up DNR headers BEFORE extraction so the fetch request succeeds
   try {
@@ -375,6 +873,7 @@ async function handleExtractM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         embedType,
         videoUrl,
+        url,
       );
       if (headerInfo) {
         await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
@@ -400,6 +899,8 @@ async function handleExtractAllM3u8(payload) {
 
   console.log(`[NEXUS] Extracting all from ${sources.length} sources`);
 
+  const seekExtractionRuleIds = [];
+
   // Set up DNR headers for all sources BEFORE extraction
   try {
     const detected = Extractors.detectSupportedEmbeds(sources);
@@ -407,9 +908,16 @@ async function handleExtractAllM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         item.type,
         item.url,
+        item.url,
       );
       if (headerInfo) {
-        await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+        const ruleId = await addHeadersRule(
+          headerInfo.domainPattern,
+          headerInfo.headers,
+        );
+        if (item.type === "seekstreaming" && Number.isInteger(ruleId)) {
+          seekExtractionRuleIds.push(ruleId);
+        }
       }
     }
     console.log(
@@ -419,31 +927,45 @@ async function handleExtractAllM3u8(payload) {
     console.warn("[NEXUS] Failed to set pre-extraction headers for batch:", e);
   }
 
-  const results = await Extractors.extractAll(sources);
+  try {
+    const results = await Extractors.extractAll(sources);
 
-  // Set up DNR headers for all successful extractions (video URLs)
-  for (const result of results) {
-    if (result.success) {
-      const videoUrl = result.hlsUrl || result.m3u8Url;
-      if (videoUrl) {
-        const headerInfo = await Extractors.setupHeadersForService(
-          result.type,
-          videoUrl,
-        );
-        if (headerInfo) {
-          await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+    // Set up DNR headers for all successful extractions (video URLs)
+    for (const result of results) {
+      if (result.success) {
+        const videoUrls = result.type === "seekstreaming"
+          ? getSeekStreamingPlaybackUrls(result)
+          : [result.hlsUrl || result.m3u8Url].filter(Boolean);
+        for (const videoUrl of videoUrls) {
+          const headerInfo = await Extractors.setupHeadersForService(
+            result.type,
+            videoUrl,
+            result.url,
+          );
+          if (headerInfo) {
+            if (result.type === "seekstreaming") {
+              await replaceSeekPlaybackRule(headerInfo);
+            } else {
+              await addHeadersRule(
+                headerInfo.domainPattern,
+                headerInfo.headers,
+              );
+            }
+          }
         }
       }
     }
-  }
 
-  const successCount = results.filter((r) => r.success).length;
-  return {
-    success: successCount > 0,
-    total: results.length,
-    successCount,
-    results,
-  };
+    const successCount = results.filter((r) => r.success).length;
+    return {
+      success: successCount > 0,
+      total: results.length,
+      successCount,
+      results,
+    };
+  } finally {
+    await Promise.all(seekExtractionRuleIds.map(removeHeadersRule));
+  }
 }
 
 /**
@@ -461,8 +983,8 @@ function handleDetectEmbeds(payload) {
 function buildBackendApiHeaders(accessKey, extraHeaders = {}) {
   const headers = {
     Accept: "application/json",
-    Origin: "https://movix.cash",
-    Referer: "https://movix.cash/",
+    Origin: "https://movix.fun",
+    Referer: "https://movix.fun/",
     ...extraHeaders,
   };
 
@@ -474,9 +996,6 @@ function buildBackendApiHeaders(accessKey, extraHeaders = {}) {
 }
 
 async function getManifest() {
-  console.log("Fetching manifest from Vavoo...");
-  const vavooData = await fetchSafe(`${VAVOO_BASE_URL}/manifest.json`, "Vavoo");
-
   const manifest = {
     id: "org.stremio.merged",
     version: "1.0.0",
@@ -487,16 +1006,6 @@ async function getManifest() {
     types: ["tv"],
     idPrefixes: [],
   };
-
-  // Add Vavoo catalogs
-  if (vavooData) {
-    if (vavooData.catalogs) manifest.catalogs.push(...vavooData.catalogs);
-    if (vavooData.idPrefixes) {
-      manifest.idPrefixes.push(...vavooData.idPrefixes);
-    } else {
-      manifest.idPrefixes.push("vavoo_");
-    }
-  }
 
   // Add Wiflix (WITV) catalogs
   const wiflixCatalogs = [
@@ -574,12 +1083,16 @@ async function getCatalog(type, catalogId, accessKey = null) {
     return await response.json();
   }
 
-  // Default: Vavoo catalog
-  const url = `${VAVOO_BASE_URL}/catalog/${type}/${catalogId}.json`;
-  const catalog = await fetchSafe(url, "Catalog " + catalogId);
-  if (!catalog) throw new Error("Catalog fetch failed");
-
-  return catalog;
+  // Default: route to backend (handles matches_, TV Direct, etc.)
+  console.log(`[CATALOG] Fetching catalog via Backend: ${catalogId}`);
+  const response = await fetch(
+    `${API_BASE_URL}/api/livetv/catalog/tv/${catalogId}`,
+    {
+      headers: buildBackendApiHeaders(accessKey),
+    },
+  );
+  if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
+  return await response.json();
 }
 
 // Wiflix catalog categories mapping (URL paths)
@@ -742,21 +1255,16 @@ async function getStream(type, channelId, accessKey = null, options = {}) {
     return await getLiveTvStream(channelId, accessKey, options);
   }
 
-  // Default: Vavoo stream
-  const url = `${VAVOO_BASE_URL}/stream/${type}/${channelId}.json`;
-  const streamData = await fetchSafe(url, "Vavoo Stream");
-
-  if (streamData && streamData.streams) {
-    for (const stream of streamData.streams) {
-      if (stream.url) {
-        await addUserAgentRule(stream.url, "VAVOO/2.6");
-      }
-    }
-  }
-
-  if (!streamData) throw new Error("Stream fetch failed");
-
-  return streamData;
+  // Default: route to backend (handles matches_, TV Direct, etc.)
+  console.log(`[STREAM] Fetching stream via Backend: ${channelId}`);
+  const response = await fetch(
+    `${API_BASE_URL}/api/livetv/stream/tv/${channelId}`,
+    {
+      headers: buildBackendApiHeaders(accessKey),
+    },
+  );
+  if (!response.ok) throw new Error(`Backend API error: ${response.status}`);
+  return await response.json();
 }
 
 // Find the channel page URL from cache or by searching
@@ -1114,7 +1622,7 @@ async function getWiflixStream(channelId, accessKey = null) {
 // Add DNR rule for Wiflix headers
 async function addWiflixHeadersRule(
   urlPattern,
-  referer = "https://witv.team/",
+  referer = "https://witv.football/",
 ) {
   try {
     const url = new URL(urlPattern);
@@ -1773,7 +2281,7 @@ function shouldIgnoreLiveTvIframeUrl(rawUrl) {
     const combined = `${hostname}${pathname}${search}`;
 
     if (
-      hostname === "ads.livetv882.me" ||
+      hostname === "ads.livetv901.me" ||
       hostname.startsWith("ads.") ||
       hostname.startsWith("ad.")
     ) {
@@ -2381,28 +2889,175 @@ async function saveToCache(key, data, ttlMinutes) {
 
 // DNR Helper
 let ruleIdCounter = 100;
+// Reserved below the general 100+ allocator; FCTV owns fixed rule 60.
+const SEEK_PLAYBACK_RULE_ID_MIN = 61;
+const SEEK_PLAYBACK_RULE_ID_MAX = 99;
+
+function isSeekPlaybackRuleId(ruleId) {
+  return (
+    Number.isInteger(ruleId) &&
+    ruleId >= SEEK_PLAYBACK_RULE_ID_MIN &&
+    ruleId <= SEEK_PLAYBACK_RULE_ID_MAX
+  );
+}
 
 async function addUserAgentRule(urlPattern, userAgent) {
   return addHeadersRule(urlPattern, { "User-Agent": userAgent });
 }
 
-async function addHeadersRule(urlPattern, headers) {
-  const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
-  const existingIds = new Set(existingRules.map((r) => r.id));
-
-  let id = ruleIdCounter;
-  while (existingIds.has(id)) {
-    id++;
+// FCTV (matches) native streams: the rotating segment CDN hosts are Referer-
+// gated to the current player origin. They all share a `/cfall/s.../v3b/` path,
+// so one rule injects the player Referer for every host + cdnSmartLink redirect.
+// Fixed id => replaced when the player domain rotates.
+const FCTV_HEADERS_RULE_ID = 60;
+async function setupFctvHeadersRule(referer) {
+  if (!referer) return false;
+  const ref = referer.endsWith("/") ? referer : referer + "/";
+  let origin;
+  try {
+    origin = new URL(ref).origin;
+  } catch {
+    origin = ref.replace(/\/+$/, "");
   }
-  ruleIdCounter = id + 1;
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [FCTV_HEADERS_RULE_ID],
+      addRules: [
+        {
+          id: FCTV_HEADERS_RULE_ID,
+          priority: 20,
+          action: {
+            type: "modifyHeaders",
+            requestHeaders: [
+              { header: "Referer", operation: "set", value: ref },
+              { header: "Origin", operation: "set", value: origin },
+              { header: "User-Agent", operation: "set", value: STREAM_PROXY_USER_AGENT },
+            ],
+          },
+          condition: {
+            urlFilter: "/cfall/s",
+            resourceTypes: ["xmlhttprequest", "media", "other"],
+          },
+        },
+      ],
+    });
+    return true;
+  } catch (e) {
+    console.error("[FCTV] Failed to add headers rule:", e);
+    return false;
+  }
+}
 
+// === FCTV (matches) local resolver ==========================================
+// The stream is IP-locked: the token must be minted from the SAME IP that
+// fetches the segments. So free users resolve it here, in the browser, then
+// HLS plays the segments directly with the Referer injected by the DNR rule.
+const FCTV_API_BASE = "https://apis-data-defra10.tcore131ybdf.ru";
+const FCTV_TOKEN_KEYSTREAM_HEX =
+  "15764bab80a419c6abdd5518f3db0ea95bb3b9a2e2b519ce5c159af6917e2000c2d680ae30706a3aba1c9c25786c7c28774eecf20450a3cf414ca17f6472798cfa557c7a8705b7861f06e84f827f8a24676eeab77ce504bfc335b79609b9";
+
+function fctvRot47(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const k = s.charCodeAt(i);
+    out += k < 33 || k > 126 ? s[i] : String.fromCharCode(33 + ((k - 33 + 47) % 94));
+  }
+  return out;
+}
+function fctvReadVarint(buf, off) {
+  let result = 0n, shift = 0n, cur = off;
+  while (cur < buf.length) {
+    const b = buf[cur++];
+    result |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) return { value: result, offset: cur };
+    shift += 7n;
+    if (shift > 70n) break;
+  }
+  throw new Error("varint");
+}
+function fctvDecode(buf, depth = 0) {
+  const fields = [];
+  let off = 0;
+  while (off < buf.length) {
+    let tag;
+    try { tag = fctvReadVarint(buf, off); } catch { break; }
+    off = tag.offset;
+    const field = Number(tag.value >> 3n);
+    const wt = Number(tag.value & 7n);
+    const e = { field, wireType: wt };
+    if (wt === 0) {
+      const p = fctvReadVarint(buf, off); off = p.offset;
+    } else if (wt === 1) {
+      off += 8;
+    } else if (wt === 2) {
+      const pl = fctvReadVarint(buf, off); off = pl.offset;
+      const len = Number(pl.value);
+      const bytes = buf.subarray(off, off + len);
+      off += len;
+      let text = "";
+      try { text = new TextDecoder().decode(bytes); } catch {}
+      let printable = 0;
+      for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); if ((c >= 32 && c <= 126) || c >= 160) printable++; }
+      if (text && printable / text.length > 0.7) e.value = text;
+      if (depth < 8 && bytes.length) { try { const ch = fctvDecode(bytes, depth + 1); if (ch.length) e.children = ch; } catch {} }
+    } else if (wt === 5) {
+      off += 4;
+    } else break;
+    fields.push(e);
+  }
+  return fields;
+}
+const fctvField = (fields, f) => (fields || []).find((e) => e.field === f);
+const fctvChildren = (fields, f) => { const x = fctvField(fields, f); return (x && x.children) || []; };
+function fctvMakeToken(rbSession) {
+  const ks = [];
+  for (let i = 0; i < FCTV_TOKEN_KEYSTREAM_HEX.length; i += 2) ks.push(parseInt(FCTV_TOKEN_KEYSTREAM_HEX.substr(i, 2), 16));
+  const pt = new TextEncoder().encode(rbSession);
+  const n = Math.min(pt.length, ks.length);
+  let bin = "";
+  for (let i = 0; i < n; i++) bin += String.fromCharCode(pt[i] ^ ks[i]);
+  return encodeURIComponent(btoa(bin) + "a");
+}
+
+// Resolve one server -> tokenised m3u8 url (IP-bound to THIS browser).
+async function resolveFctvStream(opts) {
+  const { matchId, streamId, siteType, sportType, referer, apiBase } = opts || {};
+  if (!matchId || !streamId) return null;
+  const base = apiBase || FCTV_API_BASE;
+  const u = new URL(base + "/api/stream/detail");
+  u.searchParams.set("streamId", String(streamId));
+  u.searchParams.set("siteType", String(siteType || 2001));
+  u.searchParams.set("continent", "EU");
+  u.searchParams.set("country", "FR");
+  u.searchParams.set("digit", "seth");
+  u.searchParams.set("matchId", String(matchId));
+  u.searchParams.set("sportType", String(sportType || 1));
+  // NB: a service worker can't set Referer on fetch — stream/detail returns the
+  // rb-session header regardless. Only the segments are Referer-gated (DNR rule).
+  const resp = await fetch(u.toString(), { headers: { Accept: "*/*" } });
+  const rbSession = resp.headers.get("rb-session");
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  const root = fctvDecode(buf);
+  const body = fctvChildren(root, 10);
+  const inner = fctvChildren(body, 2).length ? fctvChildren(body, 2) : body;
+  const maskedField = fctvField(inner, 4);
+  const masked = maskedField && typeof maskedField.value === "string" ? maskedField.value : "";
+  if (!masked || !rbSession) return null;
+  let parsed;
+  try { parsed = new URL(fctvRot47(masked).slice(8)); } catch { return null; }
+  const token = fctvMakeToken(rbSession);
+  if (referer) await setupFctvHeadersRule(referer);
+  return `${parsed.origin}/token-${token}${parsed.pathname}${parsed.search}`;
+}
+
+function createHeadersRule(id, urlPattern, headers) {
   const requestHeaders = Object.entries(headers).map(([header, value]) => ({
     header: header,
     operation: "set",
     value: value,
   }));
 
-  const rule = {
+  return {
     id: id,
     priority: 10,
     action: {
@@ -2421,12 +3076,96 @@ async function addHeadersRule(urlPattern, headers) {
       ],
     },
   };
+}
+
+async function addHeadersRule(urlPattern, headers) {
+  const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
+  const existingIds = new Set(existingRules.map((r) => r.id));
+
+  let id = ruleIdCounter;
+  while (existingIds.has(id)) {
+    id++;
+  }
+  ruleIdCounter = id + 1;
+
+  const rule = createHeadersRule(id, urlPattern, headers);
 
   try {
     await chrome.declarativeNetRequest.updateDynamicRules({
       addRules: [rule],
     });
+    return id;
   } catch (e) {
     console.error("Failed to add dynamic rule:", e);
+    return null;
   }
+}
+
+async function removeHeadersRule(ruleId) {
+  if (!Number.isInteger(ruleId)) return;
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+  });
+}
+
+async function persistSeekPlaybackRule(headerInfo) {
+  try {
+    const existingRules =
+      await chrome.declarativeNetRequest.getDynamicRules();
+    const seekRules = existingRules.filter((rule) =>
+      isSeekPlaybackRuleId(rule.id),
+    );
+    const matchingRule = seekRules.find(
+      (rule) => rule.condition?.urlFilter === headerInfo.domainPattern,
+    );
+    const usedIds = new Set(seekRules.map((rule) => rule.id));
+    let ruleId = matchingRule?.id ?? null;
+
+    if (ruleId === null) {
+      for (
+        let candidate = SEEK_PLAYBACK_RULE_ID_MIN;
+        candidate <= SEEK_PLAYBACK_RULE_ID_MAX;
+        candidate += 1
+      ) {
+        if (!usedIds.has(candidate)) {
+          ruleId = candidate;
+          break;
+        }
+      }
+    }
+
+    if (ruleId === null) {
+      ruleId = SEEK_PLAYBACK_RULE_ID_MIN;
+      console.warn(
+        "[NEXUS] Seek playback rule capacity reached; evicting oldest slot",
+      );
+    }
+
+    const rule = createHeadersRule(
+      ruleId,
+      headerInfo.domainPattern,
+      headerInfo.headers,
+    );
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+      addRules: [rule],
+    });
+    return ruleId;
+  } catch (e) {
+    console.error("Failed to persist Seek playback rule:", e);
+    return null;
+  }
+}
+
+let seekPlaybackRuleUpdateQueue = Promise.resolve();
+
+function replaceSeekPlaybackRule(headerInfo) {
+  const update = seekPlaybackRuleUpdateQueue.then(() =>
+    persistSeekPlaybackRule(headerInfo),
+  );
+  seekPlaybackRuleUpdateQueue = update.then(
+    () => undefined,
+    () => undefined,
+  );
+  return update;
 }

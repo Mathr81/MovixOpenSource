@@ -16,36 +16,31 @@ const axios = require('axios');
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { memoryCache } = require('../config/redis');
 const { fetchTmdbDetails } = require('../utils/tmdbCache');
+const { acquireRedisLock } = require('../utils/redisLock');
 
 // ---- Lazy-bound dependencies injected via configure() ----
 let deps = {
   CPASMAL_BASE_URL: '',
   TMDB_API_URL: '',
   TMDB_API_KEY: '',
-  axiosCpasmalRequest: async () => { throw new Error('cpasmal not configured'); },
-  DARKINO_PROXIES: [],
-  getDarkinoHttpProxyAgent: () => null,
+  makeCpasmalRequest: async () => { throw new Error('cpasmal not configured'); },
   getFromCacheNoExpiration: async () => null,
   shouldUpdateCache: async () => true
 };
 
 /**
- * Crée une fonction de requête scopée qui utilise toujours le même proxy HTTP (DARKINO_PROXIES).
- * Garantit que tout le scraping d'un même film/série passe par la même IP.
- * Un proxy est obligatoire — si aucun n'est disponible, une erreur est levée.
+ * Toutes les requêtes Cpasmal passent par CycleTLS (JA3 Chrome) : Cloudflare
+ * bot-challenge les requêtes axios + proxies datacenter avec un 403 (GET comme
+ * POST). makeCpasmalRequest tourne un vrai JA3 Chrome sur le pool ProxyScrape.
+ * Adapte la config axios-style { method, url, data, headers } du routeur vers
+ * la signature de makeCpasmalRequest et renvoie un objet axios-like { data }.
  */
 function _createScopedRequest() {
-  const proxies = deps.DARKINO_PROXIES;
-  if (!proxies || proxies.length === 0) {
-    throw new Error('Cpasmal: aucun proxy HTTP configuré (DARKINO_PROXIES vide)');
-  }
-  const proxy = proxies[Math.floor(Math.random() * proxies.length)];
-  const agents = deps.getDarkinoHttpProxyAgent(proxy);
-  if (!agents) {
-    throw new Error(`Cpasmal: impossible de créer l'agent proxy pour ${proxy.host}:${proxy.port}`);
-  }
-  agents._label = `${proxy.host}:${proxy.port}`;
-  return (config) => deps.axiosCpasmalRequest({ ...config, _cpasmalAgents: agents });
+  return (config) => deps.makeCpasmalRequest(config.url, {
+    method: config.method || 'get',
+    body: config.data || '',
+    headers: config.headers || {},
+  });
 }
 
 function configure(injected) {
@@ -66,7 +61,61 @@ function _log403(context, error) {
 
 function hasEmptyLinks(data) {
   if (!data || !data.links) return true;
-  return data.links.vf.length === 0 && data.links.vostfr.length === 0;
+  const vf = Array.isArray(data.links.vf) ? data.links.vf : [];
+  const vostfr = Array.isArray(data.links.vostfr) ? data.links.vostfr : [];
+  return vf.length === 0 && vostfr.length === 0;
+}
+
+function hasPlayableCpasmalResult(data) {
+  return Boolean(data && !data.notFound && !hasEmptyLinks(data));
+}
+
+async function saveCpasmalCachePreservingPlayable(cacheKey, candidate) {
+  const candidateIsPlayable = hasPlayableCpasmalResult(candidate);
+  const candidateIsEmpty = candidate && !candidate.notFound && hasEmptyLinks(candidate);
+  const cacheFilePath = path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`);
+  const lock = await acquireRedisLock(`cpasmal-cache-write:${cacheKey}`, {
+    ttl: 10,
+    retries: 20,
+    retryDelay: 50,
+  });
+
+  if (!lock) {
+    if (!candidateIsPlayable) {
+      console.warn(`[CPASMAL CACHE] Ecriture vide ignoree sans verrou pour ${cacheKey}`);
+      return false;
+    }
+    await fsp.writeFile(cacheFilePath, JSON.stringify(candidate), 'utf-8');
+    await memoryCache.set(`${CACHE_DIR.CPASMAL}:${cacheKey}`, candidate);
+    return true;
+  }
+
+  try {
+    if (!candidateIsPlayable) {
+      const latestCache = await deps.getFromCacheNoExpiration(CACHE_DIR.CPASMAL, cacheKey);
+      if (hasPlayableCpasmalResult(latestCache)) {
+        try {
+          const now = new Date();
+          await fsp.utimes(cacheFilePath, now, now);
+        } catch (error) { /* ignore */ }
+        return false;
+      }
+    }
+
+    await fsp.writeFile(cacheFilePath, JSON.stringify(candidate), 'utf-8');
+    await memoryCache.set(`${CACHE_DIR.CPASMAL}:${cacheKey}`, candidate);
+
+    if (candidateIsEmpty) {
+      try {
+        const oldTime = new Date(Date.now() - 30 * 60 * 1000);
+        await fsp.utimes(cacheFilePath, oldTime, oldTime);
+      } catch (error) { /* ignore */ }
+    }
+
+    return true;
+  } finally {
+    await lock.release();
+  }
 }
 
 function sortCpasmalLinks(links) {
@@ -189,15 +238,30 @@ function _scoreCpasmalResults($, items, title, year, type, normalize) {
 
 // Run a single cpasmal search query across multiple pages, return { bestMatch, bestScore }
 async function _runCpasmalSearch(searchQuery, title, year, type, normalize, maxPages, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   let bestMatch = null;
   let bestScore = -1;
   let page = 1;
 
   while (page <= maxPages) {
     try {
-      const searchUrl = `${deps.CPASMAL_BASE_URL}/index.php?do=search&subaction=search&search_start=${page}&full_search=0&story=${encodeURIComponent(searchQuery)}`;
-      const response = await doRequest({ method: 'get', url: searchUrl });
+      // POST form (DLE classic): Cloudflare WAF 403s the GET ?do=search querystring, POST body passes.
+      const params = new URLSearchParams();
+      params.append('do', 'search');
+      params.append('subaction', 'search');
+      params.append('search_start', String(page));
+      params.append('full_search', '0');
+      params.append('story', searchQuery);
+      const response = await doRequest({
+        method: 'post',
+        url: `${deps.CPASMAL_BASE_URL}/index.php`,
+        data: params.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': deps.CPASMAL_BASE_URL,
+          'Referer': `${deps.CPASMAL_BASE_URL}/`
+        }
+      });
       const $ = cheerio.load(response.data);
 
       const items = $('div.thumb');
@@ -223,7 +287,7 @@ async function _runCpasmalSearch(searchQuery, title, year, type, normalize, maxP
 }
 
 async function searchCpasmal(title, year, type, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   // Prepare search query: normalize spaces and keep colons
   let searchQuery = title.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -246,8 +310,22 @@ async function searchCpasmal(title, year, type, requestFn) {
   // === Strategy 3: If still no good match, try full_search=1 ===
   if (bestScore < 20) {
     try {
-      const fullSearchUrl = `${deps.CPASMAL_BASE_URL}/index.php?do=search&subaction=search&search_start=1&full_search=1&story=${encodeURIComponent(searchQuery)}`;
-      const response = await doRequest({ method: 'get', url: fullSearchUrl });
+      const params = new URLSearchParams();
+      params.append('do', 'search');
+      params.append('subaction', 'search');
+      params.append('search_start', '1');
+      params.append('full_search', '1');
+      params.append('story', searchQuery);
+      const response = await doRequest({
+        method: 'post',
+        url: `${deps.CPASMAL_BASE_URL}/index.php`,
+        data: params.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': deps.CPASMAL_BASE_URL,
+          'Referer': `${deps.CPASMAL_BASE_URL}/`
+        }
+      });
       const $ = cheerio.load(response.data);
       const items = $('div.thumb');
       if (items.length > 0) {
@@ -267,7 +345,7 @@ async function searchCpasmal(title, year, type, requestFn) {
 
 // Helper to extract links from a movie page
 async function extractMovieLinks(url, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   if (process.env.DEBUG_CPASMAL) console.time(`[Cpasmal] ExtractMovieLinks ${url}`);
   try {
     const response = await doRequest({ method: 'get', url: url });
@@ -353,7 +431,7 @@ async function extractMovieLinks(url, requestFn) {
 
 // Helper to extract links from a series episode
 async function extractSeriesLinks(seriesUrl, seasonNumber, episodeNumber, requestFn) {
-  const doRequest = requestFn || deps.axiosCpasmalRequest;
+  const doRequest = requestFn || _createScopedRequest();
   if (process.env.DEBUG_CPASMAL) console.time(`[Cpasmal] ExtractSeriesLinks ${seriesUrl}`);
   try {
     const response = await doRequest({ method: 'get', url: seriesUrl });
@@ -626,9 +704,6 @@ const updateCpasmalCache = async (cacheKey, type, ...args) => {
       return;
     }
 
-    // background update
-    const existingCache = await deps.getFromCacheNoExpiration(CACHE_DIR.CPASMAL, cacheKey);
-
     let newData;
     if (type === 'movie') {
       newData = await fetchCpasmalMovieData(args[0], false);
@@ -636,34 +711,8 @@ const updateCpasmalCache = async (cacheKey, type, ...args) => {
       newData = await fetchCpasmalTvData(args[0], args[1], args[2], false);
     }
 
-    if (newData) {
-      await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(newData), 'utf-8');
-      const memKey = `${CACHE_DIR.CPASMAL}:${cacheKey}`;
-      await memoryCache.set(memKey, newData);
-
-      // Si les liens sont vides, antidater le fichier pour forcer un re-fetch au prochain appel
-      if (hasEmptyLinks(newData)) {
-        const cacheFilePath = path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`);
-        try {
-          const oldTime = new Date(Date.now() - 30 * 60 * 1000);
-          await fsp.utimes(cacheFilePath, oldTime, oldTime);
-        } catch (e) { /* ignore */ }
-      }
-    } else if (existingCache && !existingCache.notFound) {
-      // On a déjà un cache valide — ne PAS le remplacer par notFound (erreur 403, timeout, etc.)
-      // On touche juste le fichier pour repousser le prochain check
-      const cacheFilePath = path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`);
-      try {
-        const now = new Date();
-        await fsp.utimes(cacheFilePath, now, now);
-      } catch (e) { /* ignore */ }
-    } else {
-      // Pas de cache existant ou cache déjà notFound → on met à jour le notFound
-      const notFoundData = { notFound: true, timestamp: Date.now() };
-      await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(notFoundData), 'utf-8');
-      const memKey = `${CACHE_DIR.CPASMAL}:${cacheKey}`;
-      await memoryCache.set(memKey, notFoundData);
-    }
+    const candidate = newData || { notFound: true, timestamp: Date.now() };
+    await saveCpasmalCachePreservingPlayable(cacheKey, candidate);
   } catch (error) {
     // silent
   }
@@ -720,12 +769,11 @@ router.get('/movie/:tmdbid', async (req, res) => {
 
     if (!data) {
       const notFoundData = { notFound: true, tmdbId: tmdbid, timestamp: Date.now() };
-      await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(notFoundData), 'utf-8');
+      await saveCpasmalCachePreservingPlayable(cacheKey, notFoundData);
       return res.status(404).json({ error: 'Movie not found on Cpasmal' });
     }
 
-    await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(data), 'utf-8');
-    await memoryCache.set(`${CACHE_DIR.CPASMAL}:${cacheKey}`, data);
+    await saveCpasmalCachePreservingPlayable(cacheKey, data);
     const prochaineMiseAJour = new Date(Date.now() + 40 * 60 * 1000).toISOString();
     res.json({ ...data, prochaineMiseAJour });
     if (process.env.DEBUG_CPASMAL) console.timeEnd(`[Cpasmal API] Total /movie/${tmdbid}`);
@@ -799,12 +847,11 @@ router.get('/tv/:tmdbid/:season/:episode', async (req, res) => {
 
     if (!data) {
       const notFoundData = { notFound: true, tmdbId: tmdbid, season, episode, timestamp: Date.now() };
-      await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(notFoundData), 'utf-8');
+      await saveCpasmalCachePreservingPlayable(cacheKey, notFoundData);
       return res.status(404).json({ error: 'TV Show not found on Cpasmal' });
     }
 
-    await fsp.writeFile(path.join(CACHE_DIR.CPASMAL, `${cacheKey}.json`), JSON.stringify(data), 'utf-8');
-    await memoryCache.set(`${CACHE_DIR.CPASMAL}:${cacheKey}`, data);
+    await saveCpasmalCachePreservingPlayable(cacheKey, data);
     const prochaineMiseAJour = new Date(Date.now() + 40 * 60 * 1000).toISOString();
     res.json({ ...data, prochaineMiseAJour });
 

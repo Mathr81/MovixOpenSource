@@ -3,7 +3,7 @@
 # ==============================================================
 # Stage 1 — Builder : install all deps + Vite production build
 # ==============================================================
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 WORKDIR /app
 
 # 1) Lockfile-only first => layer cached as long as deps don't change
@@ -51,16 +51,18 @@ RUN --mount=type=cache,id=movix-vite,target=/app/node_modules/.cache \
 # ==============================================================
 # Stage 2 — Runner : minimal Node image to serve dist/ + Hono SSR
 # ==============================================================
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production \
     PORT=3001
 
-# Reuse node_modules from builder, then prune devDeps in-place (no re-download)
-COPY --from=builder /app/package.json /app/package-lock.json ./
-COPY --from=builder /app/node_modules ./node_modules
-RUN npm prune --omit=dev && rm -rf /root/.npm /tmp/*
+# Install only the Hono workspace dependencies required by the runtime.
+COPY package.json package-lock.json ./
+COPY server/package.json ./server/package.json
+RUN --mount=type=cache,id=movix-npm-runner,target=/root/.npm,sharing=locked \
+    npm ci --omit=dev --workspace=server --include-workspace-root=false \
+    --prefer-offline --no-audit --no-fund
 
 # Built static assets + Hono server + helper imported by server/index.js
 COPY --from=builder /app/dist ./dist
@@ -69,7 +71,7 @@ COPY --from=builder /app/functions/_lib ./functions/_lib
 
 EXPOSE 3001
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=2s --retries=3 \
     CMD wget -qO- http://127.0.0.1:${PORT}/health || exit 1
 
 USER node

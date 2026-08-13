@@ -15,22 +15,7 @@ Movix ne tourne pas sur un seul serveur monolithique. Selon la feature, le front
 
 ## Setup minimal
 
-Commandes utiles pour préparer le dossier `API/` :
-
-```bash
-# Backend principal
-cd API/Mainapi
-npm install
-```
-
-```bash
-# Services Python
-cd API/proxiesembed
-pip install -r requirements.txt
-
-cd ../miscs
-pip install flask requests python-dotenv
-```
+Toutes les commandes suivantes partent de la racine du dépôt et reviennent explicitement à celle-ci entre les services.
 
 ### Configurer les `.env`
 
@@ -41,6 +26,28 @@ cp API/Mainapi/.env.example API/Mainapi/.env
 cp API/watchpartyAPI/.env.example API/watchpartyAPI/.env
 cp API/proxiesembed/.env.example API/proxiesembed/.env
 cp API/miscs/.env.example API/miscs/.env
+```
+
+Configure au minimum `API/Mainapi/.env` avant d'initialiser son schéma MySQL.
+
+```bash
+# Backend principal
+cd API/Mainapi
+npm install
+npm run db:init
+cd ../..
+```
+
+`db:init` initialise ou complète le schéma MainAPI. Sur une base existante, et pour les grandes tables Wrapped, il demande des confirmations : lis les avertissements du [README MainAPI](Mainapi/README.md#initialiser-ou-compléter-le-schéma-mysql) avant de continuer.
+
+```bash
+# Services Python
+cd API/proxiesembed
+pip install -r requirements.txt
+
+cd ../miscs
+pip install flask requests python-dotenv
+cd ../..
 ```
 
 Note utile :

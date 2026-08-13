@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { getPool } = require('../mysqlPool');
+const { ensureTableGroup } = require('../db/runtimeEnsure');
 
 const AUTHORIZATION_REQUEST_TTL_MS = 10 * 60 * 1000;
 const AUTHORIZATION_CODE_TTL_MS = 10 * 60 * 1000;
@@ -158,66 +159,7 @@ async function ensureOAuthStorage(pool = getPool()) {
   if (!pool) {
     throw new Error('MySQL pool not ready for OAuth storage');
   }
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
-      code_hash CHAR(64) PRIMARY KEY,
-      client_id VARCHAR(191) NOT NULL,
-      user_id VARCHAR(255) NOT NULL,
-      user_type ENUM('oauth', 'bip39') NOT NULL,
-      session_id VARCHAR(255) DEFAULT NULL,
-      scopes TEXT NOT NULL,
-      redirect_uri TEXT NOT NULL,
-      code_challenge VARCHAR(255) DEFAULT NULL,
-      code_challenge_method VARCHAR(20) DEFAULT NULL,
-      expires_at DATETIME NOT NULL,
-      used_at DATETIME DEFAULT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_oauth_codes_client (client_id),
-      INDEX idx_oauth_codes_user (user_id, user_type),
-      INDEX idx_oauth_codes_expiry (expires_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS oauth_authorization_requests (
-      request_hash CHAR(64) PRIMARY KEY,
-      client_id VARCHAR(191) NOT NULL,
-      redirect_uri TEXT NOT NULL,
-      response_type VARCHAR(20) NOT NULL DEFAULT 'code',
-      scopes TEXT NOT NULL,
-      state TEXT DEFAULT '',
-      code_challenge VARCHAR(255) DEFAULT NULL,
-      code_challenge_method VARCHAR(20) DEFAULT NULL,
-      expires_at DATETIME NOT NULL,
-      consumed_at DATETIME DEFAULT NULL,
-      decision ENUM('approved', 'rejected') DEFAULT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_oauth_requests_client (client_id),
-      INDEX idx_oauth_requests_expiry (expires_at),
-      INDEX idx_oauth_requests_consumed (consumed_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS oauth_access_tokens (
-      token_hash CHAR(64) PRIMARY KEY,
-      client_id VARCHAR(191) NOT NULL,
-      user_id VARCHAR(255) NOT NULL,
-      user_type ENUM('oauth', 'bip39') NOT NULL,
-      session_id VARCHAR(255) DEFAULT NULL,
-      scopes TEXT NOT NULL,
-      expires_at DATETIME NOT NULL,
-      revoked_at DATETIME DEFAULT NULL,
-      authorization_code_hash CHAR(64) DEFAULT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_oauth_tokens_client (client_id),
-      INDEX idx_oauth_tokens_user (user_id, user_type),
-      INDEX idx_oauth_tokens_expiry (expires_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
+  await ensureTableGroup(pool, 'oauth');
 }
 
 async function registerAuthorizationRequest(pool, payload) {

@@ -1,202 +1,255 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr" class="dark" translate="no">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
-    <meta name="robots" content="index, follow, noarchive, max-snippet:-1, max-image-preview:large, max-video-preview:-1">
-    <meta name="google" content="notranslate">
-    <meta name="apple-mobile-web-app-title" content="Movix" />
-    <meta name="application-name" content="Movix" />
-    <meta name="msapplication-TileColor" content="#000000" />
-    <meta name="theme-color" content="#000000" />
-    <meta name="description" content="Regardez des milliers de films et séries en streaming HD sur Movix. Catalogue complet en VF et VOSTFR, live TV, collections et watch parties synchronisées entre amis." />
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+        <meta
+            name="robots"
+            content="index, follow, noarchive, max-snippet:-1, max-image-preview:large, max-video-preview:-1"
+        />
+        <meta name="google" content="notranslate" />
+        <meta name="apple-mobile-web-app-title" content="Movix" />
+        <meta name="application-name" content="Movix" />
+        <meta name="msapplication-TileColor" content="#000000" />
+        <meta name="theme-color" content="#000000" />
+        <meta
+            name="description"
+            content="Regardez des milliers de films et séries en streaming HD sur Movix. Catalogue complet en VF et VOSTFR, live TV, collections et watch parties synchronisées entre amis."
+        />
 
-    <!-- Prefetch -->
-    <link rel="dns-prefetch" href="//image.tmdb.org">
-    <link rel="preconnect" href="https://image.tmdb.org" crossorigin>
-    <link rel="dns-prefetch" href="//www.gstatic.com">
-    <link rel="dns-prefetch" href="//www.google.com">
-    <link rel="preconnect" href="https://www.gstatic.com" crossorigin>
-    <link rel="dns-prefetch" href="//www.googletagmanager.com">
-    <link rel="preconnect" href="https://www.googletagmanager.com">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <!-- Prefetch -->
+        <link rel="dns-prefetch" href="//image.tmdb.org" />
+        <link rel="preconnect" href="https://image.tmdb.org" crossorigin />
+        <link rel="dns-prefetch" href="//www.gstatic.com" />
+        <link rel="dns-prefetch" href="//www.google.com" />
+        <link rel="preconnect" href="https://www.gstatic.com" crossorigin />
+        <link rel="dns-prefetch" href="//www.googletagmanager.com" />
+        <link rel="preconnect" href="https://www.googletagmanager.com" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 
-    <!-- Bootstrap Icons -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+        <!-- Bootstrap Icons -->
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
+        />
 
-    <!-- Icons -->
-    <link rel="icon" href="/movix.png" />
-    <link rel="icon" type="image/png" href="/movix.png" sizes="96x96" />
-    <link rel="icon" type="image/svg+xml" href="/movix.png" />
-    <link rel="shortcut icon" href="/movix.png" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/movix.png" />
-    <link rel="manifest" href="/manifest.json" />
+        <!-- Icons -->
+        <link rel="icon" href="/movix.png" />
+        <link rel="icon" type="image/png" href="/movix.png" sizes="96x96" />
+        <link rel="icon" type="image/svg+xml" href="/movix.png" />
+        <link rel="shortcut icon" href="/movix.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/movix.png" />
+        <link rel="manifest" href="/manifest.json" />
 
-    <title data-rh="true">Movix — Films et séries en streaming gratuit | VF, VOSTFR, HD</title>
+        <title data-rh="true">
+            Movix — Films et séries en streaming gratuit | VF, VOSTFR, HD
+        </title>
 
-    <!-- JSON-LD -->
-    <script type="application/ld+json" data-rh="true">
-    [
-      {
-        "@context": "https://schema.org",
-        "@type": "Organization",
-        "name": "Movix",
-        "alternateName": "Movix Streaming",
-        "url": "https://movix.cash",
-        "description": "Movix est une plateforme française open-source (CC BY-NC 4.0) de streaming multimédia : films, séries, anime, TV en direct et Watch Parties synchronisées.",
-        "logo": {
-          "@type": "ImageObject",
-          "url": "https://movix.cash/movix.png",
-          "width": 512,
-          "height": 512
-        },
-        "sameAs": [
-          "https://t.me/movix_site"
-        ],
-        "contactPoint": {
-          "@type": "ContactPoint",
-          "contactType": "customer support",
-          "email": "movixstreaming@gmail.com",
-          "availableLanguage": ["French", "English"]
-        }
-      },
-      {
-        "@context": "https://schema.org",
-        "@type": "WebSite",
-        "name": "Movix",
-        "url": "https://movix.cash",
-        "inLanguage": "fr",
-        "potentialAction": {
-          "@type": "SearchAction",
-          "target": {
-            "@type": "EntryPoint",
-            "urlTemplate": "https://movix.cash/search?q={search_term_string}"
-          },
-          "query-input": "required name=search_term_string"
-        }
-      }
-    ]
-    </script>
-  <script>
-    // Object.hasOwn is ES2022 (Chrome 93+, Safari 15.4+, Firefox 92+). react-markdown
-    // calls it directly; older Chromium builds (e.g. Chrome 88 on armv7l) crash without this.
-    if (typeof Object.hasOwn !== 'function') {
-      Object.defineProperty(Object, 'hasOwn', {
-        value: function (obj, prop) {
-          if (obj === null || obj === undefined) {
-            throw new TypeError('Cannot convert undefined or null to object');
-          }
-          return Object.prototype.hasOwnProperty.call(Object(obj), prop);
-        },
-        configurable: true,
-        writable: true,
-      });
-    }
-  </script>
-  <script>
-    (() => {
-      const buildId = '%VITE_APP_BUILD_ID%';
-      const buildStorageKey = 'movix_build_id';
-      const recoveryStorageKey = `movix_build_recovery_${buildId}`;
-      const refreshSearchParam = 'movix_build_refresh';
+        <!-- JSON-LD -->
+        <script type="application/ld+json" data-rh="true">
+            [
+                {
+                    "@context": "https://schema.org",
+                    "@type": "Organization",
+                    "name": "Movix",
+                    "alternateName": "Movix Streaming",
+                    "url": "__MOVIX_SITE_URL__",
+                    "description": "Movix est une plateforme française open-source (CC BY-NC 4.0) de streaming multimédia : films, séries, anime, TV en direct et Watch Parties synchronisées.",
+                    "logo": {
+                        "@type": "ImageObject",
+                        "url": "__MOVIX_SITE_URL__/movix.png",
+                        "width": 512,
+                        "height": 512
+                    },
+                    "sameAs": ["https://t.me/movix_site"],
+                    "contactPoint": {
+                        "@type": "ContactPoint",
+                        "contactType": "customer support",
+                        "email": "movixstreaming@gmail.com",
+                        "availableLanguage": ["French", "English"]
+                    }
+                },
+                {
+                    "@context": "https://schema.org",
+                    "@type": "WebSite",
+                    "name": "Movix",
+                    "url": "__MOVIX_SITE_URL__",
+                    "inLanguage": "fr",
+                    "potentialAction": {
+                        "@type": "SearchAction",
+                        "target": {
+                            "@type": "EntryPoint",
+                            "urlTemplate": "__MOVIX_SITE_URL__/search?q={search_term_string}"
+                        },
+                        "query-input": "required name=search_term_string"
+                    }
+                }
+            ]
+        </script>
+        <script>
+            // Object.hasOwn is ES2022 (Chrome 93+, Safari 15.4+, Firefox 92+). react-markdown
+            // calls it directly; older Chromium builds (e.g. Chrome 88 on armv7l) crash without this.
+            if (typeof Object.hasOwn !== "function") {
+                Object.defineProperty(Object, "hasOwn", {
+                    value: function (obj, prop) {
+                        if (obj === null || obj === undefined) {
+                            throw new TypeError(
+                                "Cannot convert undefined or null to object",
+                            );
+                        }
+                        return Object.prototype.hasOwnProperty.call(
+                            Object(obj),
+                            prop,
+                        );
+                    },
+                    configurable: true,
+                    writable: true,
+                });
+            }
+        </script>
+        <script>
+            (() => {
+                const buildId = "%VITE_APP_BUILD_ID%";
+                const buildStorageKey = "movix_build_id";
+                const recoveryStorageKey = `movix_build_recovery_${buildId}`;
+                const refreshSearchParam = "movix_build_refresh";
 
-      const buildRecoveryUrl = () => {
-        const url = new URL(window.location.href);
-        url.searchParams.set(refreshSearchParam, `${buildId}-${Date.now()}`);
-        return url.toString();
-      };
+                const buildRecoveryUrl = () => {
+                    const url = new URL(window.location.href);
+                    url.searchParams.set(
+                        refreshSearchParam,
+                        `${buildId}-${Date.now()}`,
+                    );
+                    return url.toString();
+                };
 
-      const recoverClientCache = async () => {
-        try {
-          if ('serviceWorker' in navigator) {
-            const registrations = await navigator.serviceWorker.getRegistrations();
-            await Promise.all(registrations.map((registration) => registration.unregister()));
-          }
+                const recoverClientCache = async () => {
+                    try {
+                        if ("serviceWorker" in navigator) {
+                            const registrations =
+                                await navigator.serviceWorker.getRegistrations();
+                            await Promise.all(
+                                registrations.map((registration) =>
+                                    registration.unregister(),
+                                ),
+                            );
+                        }
 
-          if ('caches' in window) {
-            const cacheKeys = await caches.keys();
-            await Promise.all(cacheKeys.map((cacheKey) => caches.delete(cacheKey)));
-          }
-        } catch {
-          // Ignore cleanup errors and continue with reload.
-        }
+                        if ("caches" in window) {
+                            const cacheKeys = await caches.keys();
+                            await Promise.all(
+                                cacheKeys.map((cacheKey) =>
+                                    caches.delete(cacheKey),
+                                ),
+                            );
+                        }
+                    } catch {
+                        // Ignore cleanup errors and continue with reload.
+                    }
 
-        try {
-          localStorage.setItem(buildStorageKey, buildId);
-          sessionStorage.setItem(recoveryStorageKey, 'done');
-        } catch {
-          // Ignore storage errors.
-        }
+                    try {
+                        localStorage.setItem(buildStorageKey, buildId);
+                        sessionStorage.setItem(recoveryStorageKey, "done");
+                    } catch {
+                        // Ignore storage errors.
+                    }
 
-        window.location.replace(buildRecoveryUrl());
-      };
+                    window.location.replace(buildRecoveryUrl());
+                };
 
-      try {
-        const currentUrl = new URL(window.location.href);
-        const previousBuildId = localStorage.getItem(buildStorageKey);
-        const alreadyRecovered = sessionStorage.getItem(recoveryStorageKey) === 'done';
+                try {
+                    const currentUrl = new URL(window.location.href);
+                    const previousBuildId =
+                        localStorage.getItem(buildStorageKey);
+                    const alreadyRecovered =
+                        sessionStorage.getItem(recoveryStorageKey) === "done";
 
-        if (previousBuildId && previousBuildId !== buildId && !alreadyRecovered) {
-          window.__MOVIX_CACHE_RECOVERY__ = recoverClientCache();
-          return;
-        }
+                    if (
+                        previousBuildId &&
+                        previousBuildId !== buildId &&
+                        !alreadyRecovered
+                    ) {
+                        window.__MOVIX_CACHE_RECOVERY__ = recoverClientCache();
+                        return;
+                    }
 
-        localStorage.setItem(buildStorageKey, buildId);
+                    localStorage.setItem(buildStorageKey, buildId);
 
-        if (currentUrl.searchParams.has(refreshSearchParam)) {
-          currentUrl.searchParams.delete(refreshSearchParam);
-          window.history.replaceState({}, document.title, currentUrl.toString());
-        }
-      } catch {
-        // Ignore storage errors.
-      }
+                    if (currentUrl.searchParams.has(refreshSearchParam)) {
+                        currentUrl.searchParams.delete(refreshSearchParam);
+                        window.history.replaceState(
+                            {},
+                            document.title,
+                            currentUrl.toString(),
+                        );
+                    }
+                } catch {
+                    // Ignore storage errors.
+                }
 
-      window.addEventListener('error', (event) => {
-        const target = event.target;
-        if (!(target instanceof HTMLScriptElement)) return;
-        if (target.type !== 'module') return;
-        if (!target.src.includes('/assets/')) return;
+                window.addEventListener(
+                    "error",
+                    (event) => {
+                        const target = event.target;
+                        if (!(target instanceof HTMLScriptElement)) return;
+                        if (target.type !== "module") return;
+                        if (!target.src.includes("/assets/")) return;
 
-        try {
-          if (sessionStorage.getItem(recoveryStorageKey) === 'done') {
-            return;
-          }
-        } catch {
-          // Ignore storage errors.
-        }
+                        try {
+                            if (
+                                sessionStorage.getItem(recoveryStorageKey) ===
+                                "done"
+                            ) {
+                                return;
+                            }
+                        } catch {
+                            // Ignore storage errors.
+                        }
 
-        window.__MOVIX_CACHE_RECOVERY__ = recoverClientCache();
-      }, true);
-    })();
-  </script>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
-  <script type="module" src="/src/main.tsx"></script>
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-6Q3B4D5KQL"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
+                        window.__MOVIX_CACHE_RECOVERY__ = recoverClientCache();
+                    },
+                    true,
+                );
+            })();
+        </script>
+        <script
+            src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+            async
+            defer
+        ></script>
+        <script type="module" src="/src/main.tsx"></script>
+        <!-- Google tag (gtag.js) -->
+        <script
+            async
+            src="https://www.googletagmanager.com/gtag/js?id=G-6Q3B4D5KQL"
+        ></script>
+        <script>
+            window.dataLayer = window.dataLayer || [];
+            function gtag() {
+                dataLayer.push(arguments);
+            }
+            gtag("js", new Date());
 
-    gtag('config', 'G-6Q3B4D5KQL');
-  </script>
-</head>
-<body>
-    
-    <div id="root"></div>
+            gtag("config", "G-6Q3B4D5KQL");
+        </script>
+    </head>
+    <body>
+        <div id="root"></div>
 
-    <script>
-      // Cache-bust the Cast SDK URL on every page load so a stale SDK never
-      // sticks around in the browser/SW cache (defensive — gstatic already
-      // sets sane Cache-Control, but cinepulse does this too).
-      (function loadCastSender() {
-        var s = document.createElement('script');
-        s.type = 'text/javascript';
-        s.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1&cb=' + Date.now();
-        document.body.appendChild(s);
-      })();
-    </script>
-</body>
+        <script>
+            // Cache-bust the Cast SDK URL on every page load so a stale SDK never
+            // sticks around in the browser/SW cache (defensive — gstatic already
+            // sets sane Cache-Control, but cinepulse does this too).
+            (function loadCastSender() {
+                var s = document.createElement("script");
+                s.type = "text/javascript";
+                s.src =
+                    "https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1&cb=" +
+                    Date.now();
+                document.body.appendChild(s);
+            })();
+        </script>
+    </body>
 </html>

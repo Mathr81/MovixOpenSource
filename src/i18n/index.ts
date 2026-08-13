@@ -2,8 +2,8 @@ import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 
+import { resolveCurrentDomain } from './currentDomain';
 import fr from './locales/fr.json';
-import en from './locales/en.json';
 
 export const SUPPORTED_LANGUAGES = [
   { code: 'fr', label: 'Fran\u00e7ais', flagUrl: 'https://flagcdn.com/w40/fr.png' },
@@ -77,28 +77,72 @@ const getStoredLanguage = (): LoadedLanguage | null => {
   }
 };
 
+// L'anglais n'est pas déclaré dans `resources` au boot : ~356 Ko de JSON
+// parsés pour rien pour l'immense majorité des visiteurs (FR = langue
+// primaire du site). On le charge dynamiquement, une seule fois (mémoïsé),
+// uniquement quand la langue résolue/choisie est l'anglais.
+let englishBundlePromise: Promise<void> | null = null;
+const loadEnglishBundle = (): Promise<void> => {
+  if (!englishBundlePromise) {
+    englishBundlePromise = import('./locales/en.json').then((mod) => {
+      i18n.addResourceBundle('en', 'translation', mod.default, true, true);
+    });
+  }
+  return englishBundlePromise;
+};
+
+const maybeLoadEnglishBundle = (lang?: string | null): void => {
+  if (normalizeLanguageCode(lang) === 'en') {
+    void loadEnglishBundle();
+  }
+};
+
 i18n
   .use(LanguageDetector)
   .use(initReactI18next)
   .init({
     resources: {
       fr: { translation: fr },
-      en: { translation: en },
     },
+    // Empêche react-i18next d'attendre indéfiniment (ou de suspendre) une
+    // langue déclarée dans supportedLngs mais pas bundlée au boot ('en') :
+    // on la charge nous-mêmes via addResourceBundle plus bas.
+    partialBundledLanguages: true,
     lng: getStoredLanguage() || undefined, // Use stored language if available
-    fallbackLng: DEFAULT_LANGUAGE,
+    // Volontairement 'fr' et non DEFAULT_LANGUAGE : fr est le seul bundle
+    // garanti disponible de façon synchrone au boot, donc le seul repli
+    // fiable tant que le bundle 'en' n'est pas encore chargé.
+    fallbackLng: 'fr',
     supportedLngs: [...LOADED_LANGUAGE_CODES],
     load: 'languageOnly',
     cleanCode: true,
     interpolation: {
       escapeValue: false, // React already escapes
+      defaultVariables: {
+        currentDomain: resolveCurrentDomain(),
+      },
     },
     detection: {
       order: ['localStorage', 'navigator'],
       lookupLocalStorage: 'user_language',
       caches: ['localStorage'],
     },
+    react: {
+      // Re-render les composants dès que le bundle 'en' arrive via
+      // addResourceBundle (sans ça le texte resterait figé en français
+      // jusqu'à un re-render déclenché par autre chose).
+      bindI18nStore: 'added',
+    },
+  })
+  .then(() => {
+    // Couvre le cas où la langue résolue au boot (stockage ou détection
+    // navigateur synchrone) est déjà l'anglais.
+    maybeLoadEnglishBundle(i18n.resolvedLanguage || i18n.language);
   });
+
+// Couvre les changements de langue ultérieurs vers l'anglais (sélecteur de
+// langue via changeLanguage, détection async par IP dans detectInitialLanguage).
+i18n.on('languageChanged', maybeLoadEnglishBundle);
 
 // Helper to change language and persist locally
 export const changeLanguage = async (lang: SupportedLanguage): Promise<void> => {

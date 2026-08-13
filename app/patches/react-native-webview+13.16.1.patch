@@ -1,0 +1,99 @@
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+index 80c6803..f70b87d 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+@@ -253,7 +253,11 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+             this.bridgeListener = new WebViewCompat.WebMessageListener() {
+               @Override
+               public void onPostMessage(@NonNull WebView view, @NonNull WebMessageCompat message, @NonNull Uri sourceOrigin, boolean isMainFrame, @NonNull JavaScriptReplyProxy replyProxy) {
+-                RNCWebView.this.onMessage(message.getData(), sourceOrigin.toString());
++                String sourceUrl = sourceOrigin.toString();
++                if (isMainFrame && TextUtils.isEmpty(sourceUrl)) {
++                  sourceUrl = view.getUrl();
++                }
++                RNCWebView.this.onMessage(message.getData(), sourceUrl, isMainFrame);
+               }
+             };
+             WebViewCompat.addWebMessageListener(
+@@ -324,7 +324,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+       injectJavascriptObject();
+     }
+ 
+-    public void onMessage(String message, String sourceUrl) {
++    public void onMessage(String message, String sourceUrl, boolean isTopFrame) {
+         ThemedReactContext reactContext = getThemedReactContext();
+         RNCWebView mWebView = this;
+ 
+@@ -338,6 +338,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+                     }
+                     WritableMap data = mRNCWebViewClient.createWebViewEvent(webView, sourceUrl);
+                     data.putString("data", message);
++                    data.putBoolean("isTopFrame", isTopFrame);
+ 
+                     if (mMessagingJSModule != null) {
+                         dispatchDirectMessage(data);
+@@ -349,6 +350,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         } else {
+             WritableMap eventData = Arguments.createMap();
+             eventData.putString("data", message);
++            eventData.putBoolean("isTopFrame", isTopFrame);
+ 
+             if (mMessagingJSModule != null) {
+                 dispatchDirectMessage(eventData);
+@@ -446,7 +448,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         public void postMessage(String message) {
+             if (mWebView.getMessagingEnabled()) {
+                 // Post to main thread because `mWebView.getUrl()` requires to be executed on main.
+-                mWebView.post(() -> mWebView.onMessage(message, mWebView.getUrl()));
++                mWebView.post(() -> mWebView.onMessage(message, mWebView.getUrl(), false));
+             } else {
+                 FLog.w(TAG, "ReactNativeWebView.postMessage method was called but messaging is disabled. Pass an onMessage handler to the WebView.");
+             }
+diff --git a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts b/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
+index 8dd6cef..25f86ea 100644
+--- a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
++++ b/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
+@@ -21,6 +21,7 @@ export type WebViewMessageEvent = Readonly<{
+     canGoForward: boolean;
+     lockIdentifier: Double;
+     data: string;
++    isTopFrame: boolean;
+ }>;
+ export type WebViewOpenWindowEvent = Readonly<{
+     targetUrl: string;
+diff --git a/node_modules/react-native-webview/lib/WebViewTypes.d.ts b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+index 998cc88..a7b7001 100644
+--- a/node_modules/react-native-webview/lib/WebViewTypes.d.ts
++++ b/node_modules/react-native-webview/lib/WebViewTypes.d.ts
+@@ -68,6 +68,7 @@ export interface FileDownload {
+ export type DecelerationRateConstant = 'normal' | 'fast';
+ export interface WebViewMessage extends WebViewNativeEvent {
+     data: string;
++    isTopFrame: boolean;
+ }
+ export interface WebViewError extends WebViewNativeEvent {
+     /**
+diff --git a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+index 7f4e6c4..d5c2579 100644
+--- a/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
++++ b/node_modules/react-native-webview/src/RNCWebViewNativeComponent.ts
+@@ -29,6 +29,7 @@ export type WebViewMessageEvent = Readonly<{
+   canGoForward: boolean;
+   lockIdentifier: Double;
+   data: string;
++  isTopFrame: boolean;
+ }>;
+ export type WebViewOpenWindowEvent = Readonly<{
+   targetUrl: string;
+diff --git a/node_modules/react-native-webview/src/WebViewTypes.ts b/node_modules/react-native-webview/src/WebViewTypes.ts
+index eca8141..06ee3bb 100644
+--- a/node_modules/react-native-webview/src/WebViewTypes.ts
++++ b/node_modules/react-native-webview/src/WebViewTypes.ts
+@@ -110,6 +110,7 @@ export type DecelerationRateConstant = 'normal' | 'fast';
+ 
+ export interface WebViewMessage extends WebViewNativeEvent {
+   data: string;
++  isTopFrame: boolean;
+ }
+ 
+ export interface WebViewError extends WebViewNativeEvent {

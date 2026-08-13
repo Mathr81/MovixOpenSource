@@ -1,4 +1,4 @@
-﻿﻿const express = require("express");
+const express = require("express");
 const router = express.Router();
 const fs = require("fs").promises;
 const path = require("path");
@@ -136,13 +136,18 @@ function formatContentForResponse(text) {
   return formatted;
 }
 
-// OpenRouter API Configuration for content moderation (using Gemini 2.5 Flash Lite)
+// ZZAPI Configuration for content moderation
+const ZZAPI_API_KEY = process.env.ZZAPI_API_KEY;
+const ZZAPI_API_URL = "https://zzapi.cc/v1/chat/completions";
+const ZZAPI_MODEL = "claude-haiku-4-5-20251001";
+
+// OpenRouter Fallback Configuration
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const OPENROUTER_MODEL = "google/gemini-2.5-flash-lite";
+const OPENROUTER_MODEL = "deepseek/deepseek-v4-flash";
 
-// Fonction de modération avec OpenRouter/Gemini (exécutée en background)
-async function moderateContentWithGemini(
+// Fonction de modération avec OpenRouter (exécutée en background)
+async function moderateContentWithAI(
   contentId,
   contentType,
   content,
@@ -154,40 +159,70 @@ async function moderateContentWithGemini(
 Pseudo de l'utilisateur: ${JSON.stringify(username)}
 Commentaire à analyser: ${JSON.stringify(content)}
 
-Critères de modération (s'appliquent au pseudo ET au commentaire):
-1. INSULTES: Contient des insultes, injures, propos haineux ou dégradants
+Critères de modération (s'appliquent au pseudo ET au commentaire). Ne flag QUE les violations claires et évidentes ; en cas de doute, ne pas flagger :
+1. INSULTES: Insultes, injures, propos haineux ou dégradants visant une personne ou un groupe. Le simple agacement, les majuscules ou la ponctuation excessive ne sont PAS des insultes.
 2. EROTIQUE: Contient du contenu érotique, sexuel ou inapproprié
-3. DEMANDE_AJOUT: Demande d'ajout de films, séries, fonctionnalités ou autre contenu
+3. DEMANDE_AJOUT: UNIQUEMENT une demande explicite d'ajouter un nouveau film/série/contenu au catalogue (ex: "ajoutez le film X svp", "vous pouvez mettre la série Y ?"). NE PAS flagger : les questions, les signalements de bug ("les épisodes ne marchent pas", "lien mort", "ce n'est pas le bon film"), les plaintes sur du contenu manquant ou retiré ("où est la saison 5 ?", "pourquoi la saison 5 a disparu ?"), les demandes d'aide à un modérateur, ni la discussion normale.
 4. PSEUDO_INAPPROPRIE: Le pseudo contient des insultes, contenu érotique, ou est inapproprié
 
 Réponds UNIQUEMENT avec ce format JSON (sans markdown, sans backticks):
 {"flagged": true/false, "reason": "INSULTES" ou "EROTIQUE" ou "DEMANDE_AJOUT" ou "PSEUDO_INAPPROPRIE" ou null, "details": "explication courte"}`;
 
-    const response = await axios.post(
-      OPENROUTER_API_URL,
-      {
-        model: OPENROUTER_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        max_tokens: 500,
-        temperature: 0.1,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "HTTP-Referer": FRONTEND_BASE_URL,
-          "X-Title": "Movix Comment Moderation",
+    let responseText = "";
+    try {
+      // Primary API: ZZAPI
+      const response = await axios.post(
+        ZZAPI_API_URL,
+        {
+          model: ZZAPI_MODEL,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          max_tokens: 500,
+          temperature: 0.1,
         },
-        timeout: 15000,
-      },
-    );
-
-    const responseText = response.data?.choices?.[0]?.message?.content || "";
+        {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${ZZAPI_API_KEY}`,
+            "HTTP-Referer": FRONTEND_BASE_URL,
+            "X-Title": "Movix Comment Moderation",
+          },
+          timeout: 15000,
+        },
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || "";
+    } catch (primaryError) {
+      console.warn("⚠️ ZZAPI failed for moderation, falling back to OpenRouter:", primaryError.message);
+      // Fallback API: OpenRouter
+      const response = await axios.post(
+        OPENROUTER_API_URL,
+        {
+          model: OPENROUTER_MODEL,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          max_tokens: 500,
+          temperature: 0.1,
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            "HTTP-Referer": FRONTEND_BASE_URL,
+            "X-Title": "Movix Comment Moderation",
+          },
+          timeout: 15000,
+        },
+      );
+      responseText = response.data?.choices?.[0]?.message?.content || "";
+    }
 
     // Parser la réponse JSON
     let moderationResult;
@@ -295,7 +330,13 @@ const requireAuth = async (req, res, next) => {
     };
     next();
   } catch (error) {
-    return res.status(401).json({ error: "Token invalide" });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(401).json({ error: "Token invalide" });
+    }
+    // MySQL indisponible (restart, queue limit…) : 503 plutôt que 401,
+    // sinon le front déconnecte l'utilisateur.
+    console.error("[comments][requireAuth] Vérif session impossible:", error.message);
+    return res.status(503).json({ error: "Service temporairement indisponible" });
   }
 };
 
@@ -1941,14 +1982,14 @@ router.post("/:commentId/replies", requireAuth, writeRateLimit, async (req, res)
       console.error("Erreur webhook Discord (non bloquant):", err),
     );
 
-    // Modération automatique avec Gemini en arrière-plan (ne pas attendre)
-    moderateContentWithGemini(
+    // Modération automatique avec l'IA en arrière-plan (ne pas attendre)
+    moderateContentWithAI(
       result.lastID,
       "reply",
       content,
       userData.username,
     ).catch((err) =>
-      console.error("Erreur modération Gemini réponse (non bloquant):", err),
+      console.error("Erreur modération IA réponse (non bloquant):", err),
     );
 
     res.status(201).json({
@@ -3789,15 +3830,15 @@ router.post("/", requireAuth, writeRateLimit, async (req, res) => {
       console.error("Erreur webhook Discord (non bloquant):", err),
     );
 
-    // Modération automatique avec Gemini en arrière-plan (ne pas attendre)
-    moderateContentWithGemini(
+    // Modération automatique avec l'IA en arrière-plan (ne pas attendre)
+    moderateContentWithAI(
       result.lastID,
       "comment",
       content,
       userData.username,
     ).catch((err) =>
       console.error(
-        "Erreur modération Gemini commentaire (non bloquant):",
+        "Erreur modération IA commentaire (non bloquant):",
         err,
       ),
     );

@@ -12,7 +12,15 @@ import type {
   WebViewMessageEvent,
   ShouldStartLoadRequest,
 } from 'react-native-webview/lib/WebViewTypes';
-import { handleBridgeMessage, type BridgeMessageOptions } from '../services/bridge';
+import {
+  clearBridgeCapabilities,
+  handleBridgeMessage,
+  refreshCastShimStatus,
+  startCastShimEventForwarding,
+  startPictureInPictureEventForwarding,
+} from '../services/bridge';
+import { setLocalPlaybackAwake } from '../services/playbackAwake';
+import { setPictureInPicturePlaybackActive } from '../services/pictureInPicture';
 import { buildInjectedJavaScript, type InjectOptions } from '../injection/inject';
 import { CONFIG } from '../config';
 
@@ -22,6 +30,7 @@ export interface WebViewBrowserRef {
   reload: () => void;
   loadUrl: (url: string) => void;
   injectJavaScript: (script: string) => void;
+  refreshCastShimStatus: () => void;
 }
 
 interface WebViewBrowserProps {
@@ -40,6 +49,7 @@ interface WebViewBrowserProps {
   onLoadEnd?: () => void;
   onMediaPlayback?: (playing: boolean) => void;
   onStorageSnapshot?: (data: Record<string, string>) => void;
+  onPictureInPictureModeChange?: (active: boolean) => void;
 }
 
 // Domaines tiers légitimes qui doivent rester dans la WebView même s'ils ne
@@ -60,6 +70,15 @@ function isAllowedHost(hostname: string, allowedHosts: string[]): boolean {
   );
 }
 
+function isUsableHttpUrl(value: unknown): value is string {
+  return (
+    typeof value === 'string'
+    && value.length > 0
+    && !/[\u0000-\u0020\\]/.test(value)
+    && /^https?:\/\/[^/?#]+(?:[/?#]|$)/i.test(value)
+  );
+}
+
 const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
   (
     {
@@ -73,21 +92,66 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       onLoadEnd,
       onMediaPlayback,
       onStorageSnapshot,
+      onPictureInPictureModeChange,
     },
     ref,
   ) => {
     const webViewRef = useRef<WebView>(null);
+    const topLevelUrlRef = useRef(url);
     const injectedJS = useMemo(
-      () => buildInjectedJavaScript({ proxyEnabled, castMode, storageSnapshot }),
+      () =>
+        buildInjectedJavaScript({
+          proxyEnabled,
+          castMode,
+          pictureInPictureEnabled:
+            Platform.OS === 'android' && Number(Platform.Version) >= 26,
+          storageSnapshot,
+        }),
+      // storageSnapshot volontairement hors deps : il n'est lu qu'au premier
+      // rendu du document, une remontée d'instantané ne doit pas réinjecter le
+      // script (ce qui rechargerait la WebView en cours de session).
       // eslint-disable-next-line react-hooks/exhaustive-deps
       [proxyEnabled, castMode],
     );
 
+    React.useEffect(() => {
+      topLevelUrlRef.current = url;
+    }, [url]);
+
+    React.useEffect(() => {
+      const stopCastStatusForwarding = startCastShimEventForwarding(webViewRef);
+      const stopPictureInPictureForwarding = startPictureInPictureEventForwarding(
+        webViewRef,
+        event => {
+          if (event.kind === 'prepare') onPictureInPictureModeChange?.(true);
+          if (event.kind === 'state') onPictureInPictureModeChange?.(event.active);
+          if (event.kind === 'error') onPictureInPictureModeChange?.(false);
+        },
+      );
+      return () => {
+        clearBridgeCapabilities(webViewRef);
+        stopCastStatusForwarding();
+        stopPictureInPictureForwarding();
+        setPictureInPicturePlaybackActive(false);
+        setLocalPlaybackAwake(false);
+      };
+    }, [onPictureInPictureModeChange]);
+
     useImperativeHandle(ref, () => ({
-      goBack: () => webViewRef.current?.goBack(),
-      goForward: () => webViewRef.current?.goForward(),
-      reload: () => webViewRef.current?.reload(),
+      goBack: () => {
+        clearBridgeCapabilities(webViewRef);
+        webViewRef.current?.goBack();
+      },
+      goForward: () => {
+        clearBridgeCapabilities(webViewRef);
+        webViewRef.current?.goForward();
+      },
+      reload: () => {
+        clearBridgeCapabilities(webViewRef);
+        webViewRef.current?.reload();
+      },
       loadUrl: (newUrl: string) => {
+        clearBridgeCapabilities(webViewRef);
         webViewRef.current?.injectJavaScript(
           `window.location.href = ${JSON.stringify(newUrl)}; true;`,
         );
@@ -95,19 +159,29 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       injectJavaScript: (script: string) => {
         webViewRef.current?.injectJavaScript(script);
       },
+      refreshCastShimStatus: () => {
+        void refreshCastShimStatus(webViewRef);
+      },
     }));
 
-    const bridgeOptions = useMemo<BridgeMessageOptions>(
-      () => ({ onMediaPlayback, onStorageSnapshot }),
-      [onMediaPlayback, onStorageSnapshot],
-    );
-
-    const onMessage = useCallback(
-      (event: WebViewMessageEvent) => {
-        handleBridgeMessage(event.nativeEvent.data, webViewRef, bridgeOptions);
-      },
-      [bridgeOptions],
-    );
+    const onMessage = useCallback((event: WebViewMessageEvent) => {
+      const isTopFrame = event.nativeEvent.isTopFrame === true;
+      const reportedSourceUrl =
+        typeof event.nativeEvent.url === 'string' ? event.nativeEvent.url : '';
+      const hasUsableReportedOrigin = isUsableHttpUrl(reportedSourceUrl);
+      const sourceUrl = hasUsableReportedOrigin
+        ? reportedSourceUrl
+        : isTopFrame
+          ? topLevelUrlRef.current
+          : '';
+      handleBridgeMessage(event.nativeEvent.data, webViewRef, {
+        sourceUrl,
+        trustedOrigins: [url],
+        isTopFrame: event.nativeEvent.isTopFrame === true,
+        onMediaPlayback,
+        onStorageSnapshot,
+      });
+    }, [url, onMediaPlayback, onStorageSnapshot]);
 
     const onHttpError = useCallback(
       (event: any) => {
@@ -118,7 +192,9 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       [onError],
     );
 
-    const onShouldStartLoadWithRequest = useCallback(
+    // Filtrage des schémas : le web reste dans la WebView, le reste part vers
+    // l'app correspondante (deep links).
+    const allowNavigation = useCallback(
       (request: ShouldStartLoadRequest) => {
         const { url, navigationType, isTopFrame } = request;
         if (url.startsWith('about:') || url.startsWith('blob:')) {
@@ -176,7 +252,18 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         // Bridge messages
         onMessage={onMessage}
         // Navigation
-        onShouldStartLoadWithRequest={onShouldStartLoadWithRequest}
+        onShouldStartLoadWithRequest={(request) => {
+          // Une navigation de la frame principale invalide les capabilities du
+          // document précédent (cast shim, PiP shim) et met à jour l'origine de
+          // confiance utilisée pour valider les messages du bridge.
+          if (request.isTopFrame !== false) {
+            if (isUsableHttpUrl(request.url)) {
+              topLevelUrlRef.current = request.url;
+            }
+            clearBridgeCapabilities(webViewRef);
+          }
+          return allowNavigation(request);
+        }}
         onNavigationStateChange={onNavigationStateChange}
         // Errors
         onError={onWebViewError}

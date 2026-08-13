@@ -277,13 +277,15 @@ export function generateSearchVariations(originalTerm: string): string[] {
     }
   }
 
-  // Remove duplicates, empty strings, and variations considered too generic (single short/common word)
+  // Remove duplicates, empty strings, and variations considered too generic (single short/common word).
+  // Le titre original échappe au garde anti-générique : sinon les titres courts d'un seul mot
+  // ("Baki", "Gantz"…) produisent 0 variation et aucune recherche anime n'est lancée.
   return variations.filter(
     (term, index, arr) =>
       term &&
       term.trim() &&
       arr.indexOf(term) === index &&
-      isAcceptableVariation(term),
+      (term === originalTerm || isAcceptableVariation(term)),
   );
 }
 

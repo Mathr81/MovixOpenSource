@@ -1129,14 +1129,6 @@ const Collections: React.FC = () => {
     );
   }
 
-  const containerVariants = {
-    hidden: { opacity: 0 },
-    visible: {
-      opacity: 1,
-      transition: { staggerChildren: 0.08 },
-    },
-  };
-
   const itemVariants = {
     hidden: { opacity: 0, y: 20 },
     visible: { opacity: 1, y: 0 },
@@ -1292,9 +1284,14 @@ const Collections: React.FC = () => {
               <>
                 {/* Mode d'affichage selon la sélection */}
                 {debouncedDisplayMode === 'cards' && (
-                  <motion.div variants={containerVariants} initial="hidden" whileInView="visible" viewport={{ once: true, margin: '-50px' }} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
                     {filteredCollections.map((collection, index) => (
-                      <motion.div key={collection.id} variants={itemVariants}>
+                      <motion.div
+                        key={collection.id}
+                        initial={newCollectionIds.has(collection.id) ? 'hidden' : false}
+                        animate="visible"
+                        variants={itemVariants}
+                      >
                         <CollectionCard
                           collection={collection}
                           index={index}
@@ -1307,13 +1304,18 @@ const Collections: React.FC = () => {
                         />
                       </motion.div>
                     ))}
-                  </motion.div>
+                  </div>
                 )}
 
                 {debouncedDisplayMode === 'list' && (
-                  <motion.div variants={containerVariants} initial="hidden" whileInView="visible" viewport={{ once: true, margin: '-50px' }} className="space-y-10 max-w-6xl mx-auto">
+                  <div className="space-y-10 max-w-6xl mx-auto">
                     {filteredCollections.map((collection, index) => (
-                      <motion.div key={collection.id} variants={itemVariants}>
+                      <motion.div
+                        key={collection.id}
+                        initial={newCollectionIds.has(collection.id) ? 'hidden' : false}
+                        animate="visible"
+                        variants={itemVariants}
+                      >
                         <CollectionListItem
                           collection={collection}
                           index={index}
@@ -1326,7 +1328,7 @@ const Collections: React.FC = () => {
                         />
                       </motion.div>
                     ))}
-                  </motion.div>
+                  </div>
                 )}
                 
                 {/* Infinity Scroll - Zone de chargement optimisée */}

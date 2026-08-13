@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Platform } from 'react-native';
+import { AppState, type AppStateStatus, Platform } from 'react-native';
 
 import { UPDATE_CHECK } from '../config';
 import {
@@ -18,6 +18,10 @@ import {
   type DownloadProgress,
 } from '../services/updateDownloader';
 import { fetchLatestVersion, type Manifest } from '../services/versionCheck';
+import {
+  canReusePendingApk,
+  decideUpdateForegroundAction,
+} from './updateResume';
 
 export type UpdateStage =
   | 'idle'
@@ -67,6 +71,23 @@ function fileNameForBuild(buildNumber: number): string {
 export function useAppUpdate(githubUrl: string | null) {
   const [state, setState] = useState<UpdateState>(initialState);
   const cancelRef = useRef(false);
+  const stateRef = useRef(state);
+  const pendingRef = useRef<PendingDownload | null>(null);
+  const mountedRef = useRef(true);
+  const foregroundBusyRef = useRef(false);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const pollGenerationRef = useRef(0);
+
+  stateRef.current = state;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelRef.current = true;
+      pollGenerationRef.current += 1;
+    };
+  }, []);
 
   // --- On mount: reconcile local / pending DL / fresh manifest -----------
   // Cases handled:
@@ -78,6 +99,7 @@ export function useAppUpdate(githubUrl: string | null) {
   useEffect(() => {
     if (Platform.OS !== 'android') return;
     let cancelled = false;
+    cancelRef.current = false;
 
     (async () => {
       try {
@@ -91,8 +113,10 @@ export function useAppUpdate(githubUrl: string | null) {
         if (raw) {
           try {
             pending = JSON.parse(raw) as PendingDownload;
+            pendingRef.current = pending;
           } catch {
             await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+            pendingRef.current = null;
           }
         }
 
@@ -103,6 +127,7 @@ export function useAppUpdate(githubUrl: string | null) {
           } catch {}
           await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
           pending = null;
+          pendingRef.current = null;
         }
 
         if (!githubUrl) return; // wait until address config resolves
@@ -119,6 +144,7 @@ export function useAppUpdate(githubUrl: string | null) {
             } catch {}
             await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
             pending = null;
+            pendingRef.current = null;
           }
 
           // Case C: pending for same target as manifest — query DL.
@@ -156,6 +182,7 @@ export function useAppUpdate(githubUrl: string | null) {
             }
             // DL failed / query errored / unknown → clear, fall through to offer fresh.
             await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+            pendingRef.current = null;
           }
 
           // No (valid) pending → offer the fresh manifest.
@@ -195,6 +222,7 @@ export function useAppUpdate(githubUrl: string | null) {
             }
           } catch {}
           await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+          pendingRef.current = null;
         }
         // Case E: idle, stay silent.
       } catch (err) {
@@ -208,6 +236,22 @@ export function useAppUpdate(githubUrl: string | null) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [githubUrl]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+
+    const subscription = AppState.addEventListener('change', nextState => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextState;
+      if (previousState !== 'active' && nextState === 'active') {
+        void handleForegroundResume();
+      }
+    });
+
+    return () => subscription.remove();
+    // The handler reads current data through refs, so this subscription stays stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Actions ---------------------------------------------------------
 
@@ -231,8 +275,60 @@ export function useAppUpdate(githubUrl: string | null) {
       return;
     }
 
+    await beginDownload(manifest);
+  }, [state.manifest]);
+
+  const cancel = useCallback(async () => {
+    if (state.downloadId == null) return;
+    // Leave cancelRef.current = true until a new accept() starts a fresh DL.
+    // Any in-flight pollUntilDone promise will see the flag and bail out in its .then.
+    cancelRef.current = true;
+    pollGenerationRef.current += 1;
+    try {
+      await cancelDownload(state.downloadId);
+    } catch (err) {
+      console.warn('[useAppUpdate] cancel failed', err);
+    }
+    await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+    pendingRef.current = null;
+    setState({ ...initialState });
+  }, [state.downloadId]);
+
+  const openSettings = useCallback(async () => {
+    try {
+      await openInstallSettings();
+    } catch (err) {
+      console.warn('[useAppUpdate] openInstallSettings failed', err);
+    }
+  }, []);
+
+  const retry = useCallback(() => {
+    const current = stateRef.current;
+    const pending = pendingRef.current;
+    if (
+      current.error === 'install_denied' &&
+      current.manifest &&
+      pending &&
+      canReusePendingApk(pending, current.manifest.buildNumber)
+    ) {
+      cancelRef.current = false;
+      void verifyAndInstall(pending);
+      return;
+    }
+
+    setState(s => ({
+      ...s,
+      stage: s.manifest ? 'offered' : 'idle',
+      error: null,
+    }));
+  }, []);
+
+  // --- Internal helpers -------------------------------------------------
+
+  async function beginDownload(manifest: Manifest) {
     // Fresh download — release any cancel lock from a previous session.
     cancelRef.current = false;
+    pollGenerationRef.current += 1;
 
     try {
       const fileName = fileNameForBuild(manifest.buildNumber);
@@ -251,11 +347,13 @@ export function useAppUpdate(githubUrl: string | null) {
         apkFilePath: filePath,
         startedAt: new Date().toISOString(),
       };
+      pendingRef.current = pending;
       await AsyncStorage.setItem(
         UPDATE_CHECK.PENDING_DOWNLOAD_KEY,
         JSON.stringify(pending),
       );
 
+      if (!mountedRef.current) return;
       setState({
         stage: 'downloading',
         manifest,
@@ -267,50 +365,35 @@ export function useAppUpdate(githubUrl: string | null) {
       resumeProgressLoop(pending);
     } catch (err) {
       console.warn('[useAppUpdate] enqueue failed', err);
-      setState(s => ({ ...s, stage: 'error', error: 'network' }));
+      if (mountedRef.current) {
+        setState(s => ({ ...s, stage: 'error', error: 'network' }));
+      }
     }
-  }, [state.manifest]);
-
-  const cancel = useCallback(async () => {
-    if (state.downloadId == null) return;
-    // Leave cancelRef.current = true until a new accept() starts a fresh DL.
-    // Any in-flight pollUntilDone promise will see the flag and bail out in its .then.
-    cancelRef.current = true;
-    try {
-      await cancelDownload(state.downloadId);
-    } catch (err) {
-      console.warn('[useAppUpdate] cancel failed', err);
-    }
-    await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
-    setState({ ...initialState });
-  }, [state.downloadId]);
-
-  const openSettings = useCallback(async () => {
-    try {
-      await openInstallSettings();
-    } catch (err) {
-      console.warn('[useAppUpdate] openInstallSettings failed', err);
-    }
-  }, []);
-
-  const retry = useCallback(() => {
-    setState(s => ({ ...s, stage: s.manifest ? 'offered' : 'idle', error: null }));
-  }, []);
-
-  // --- Internal helpers -------------------------------------------------
+  }
 
   function resumeProgressLoop(pending: PendingDownload) {
+    const generation = ++pollGenerationRef.current;
     pollUntilDone(
       pending.downloadId,
       progress => {
+        if (generation !== pollGenerationRef.current) return;
         setState(s =>
           s.stage === 'downloading' ? { ...s, progress } : s,
         );
       },
-      () => !cancelRef.current,
+      () =>
+        mountedRef.current &&
+        !cancelRef.current &&
+        generation === pollGenerationRef.current,
     )
       .then(final => {
-        if (cancelRef.current) return;
+        if (
+          cancelRef.current ||
+          !mountedRef.current ||
+          generation !== pollGenerationRef.current
+        ) {
+          return;
+        }
         if (final.status === 'successful') {
           verifyAndInstall(pending);
         } else {
@@ -318,12 +401,19 @@ export function useAppUpdate(githubUrl: string | null) {
         }
       })
       .catch(err => {
+        if (
+          !mountedRef.current ||
+          generation !== pollGenerationRef.current
+        ) {
+          return;
+        }
         console.warn('[useAppUpdate] poll error', err);
         setState(s => ({ ...s, stage: 'error', error: 'unknown' }));
       });
   }
 
   async function verifyAndInstall(pending: PendingDownload) {
+    pendingRef.current = pending;
     setState(s => ({ ...s, stage: 'verifying' }));
     try {
       const hash = await computeSha256(pending.apkFilePath);
@@ -333,6 +423,7 @@ export function useAppUpdate(githubUrl: string | null) {
           want: pending.targetSha256,
         });
         await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+        pendingRef.current = null;
         setState(s => ({ ...s, stage: 'error', error: 'sha_mismatch' }));
         return;
       }
@@ -350,6 +441,66 @@ export function useAppUpdate(githubUrl: string | null) {
     } catch (err) {
       console.warn('[useAppUpdate] installApk failed', err);
       setState(s => ({ ...s, stage: 'error', error: 'install_denied' }));
+    }
+  }
+
+  async function handleForegroundResume() {
+    if (foregroundBusyRef.current || !mountedRef.current) return;
+
+    const current = stateRef.current;
+    if (
+      !current.manifest ||
+      (current.stage !== 'need_permission' && current.stage !== 'installing')
+    ) {
+      return;
+    }
+
+    foregroundBusyRef.current = true;
+    try {
+      const [installPermissionGranted, localBuildNumber] = await Promise.all([
+        canInstallApks(),
+        getLocalVersionCode().catch(() => 0),
+      ]);
+      if (
+        !mountedRef.current ||
+        stateRef.current.stage !== current.stage
+      ) {
+        return;
+      }
+
+      const action = decideUpdateForegroundAction({
+        stage: current.stage,
+        installPermissionGranted,
+        localBuildNumber,
+        targetBuildNumber: current.manifest.buildNumber,
+      });
+
+      if (action === 'continue_after_permission') {
+        await beginDownload(current.manifest);
+        return;
+      }
+
+      if (action === 'installed') {
+        await AsyncStorage.removeItem(UPDATE_CHECK.PENDING_DOWNLOAD_KEY);
+        pendingRef.current = null;
+        setState({ ...initialState });
+        return;
+      }
+
+      if (action === 'install_not_completed') {
+        setState(s => ({
+          ...s,
+          stage: 'error',
+          error: 'install_denied',
+        }));
+      }
+    } catch (err) {
+      console.warn('[useAppUpdate] foreground reconciliation failed', err);
+      if (mountedRef.current) {
+        setState(s => ({ ...s, stage: 'error', error: 'unknown' }));
+      }
+    } finally {
+      foregroundBusyRef.current = false;
     }
   }
 

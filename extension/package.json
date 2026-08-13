@@ -1,0 +1,12 @@
+{
+  "name": "movix-extension-assets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:quickjs": "node scripts/build-quickjs.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "quickjs-emscripten": "0.32.0"
+  }
+}

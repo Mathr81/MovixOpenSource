@@ -7,6 +7,12 @@ import { detectHoster } from './hosterRegistry';
 import { getSourcePriorityPrefs } from './sourcePriorityPrefs';
 import { sortHostersByPriority } from './sourceAutoSelect';
 import type { PriorityCategory, TopLevelSourceId, LanguageId } from '../types/sourcePriority';
+import {
+  hasCompleteBulkCoverage,
+  isSeekStreamingEmbedUrl,
+  normalizeSeekStreamingCandidates,
+  type SeekStreamingCandidate,
+} from './seekStreamingCandidates';
 
 // Cache pour stocker les URLs qui ont échoué pour éviter les re-tentatives
 const failedUrlsCache = new Set<string>();
@@ -111,6 +117,9 @@ async function tryExtensionFirst(type: string, url: string, serverFallback: () =
         console.log(`[NEXUS] Extension extraction success for ${type}`);
         return result;
       }
+      if (result?.reason === 'deleted') {
+        return result;
+      }
       // Extension failed - only fallback to server if VIP
       if (isUserVip()) {
         console.warn(`[NEXUS] Extension failed for ${type}, falling back to server (VIP)`);
@@ -159,8 +168,10 @@ export interface PlayerInfo {
 export interface M3u8Result {
   hlsUrl?: string;
   m3u8Url?: string;
+  hlsCandidates?: SeekStreamingCandidate[];
   success: boolean;
   error?: string;
+  reason?: 'deleted';
   fromCache?: boolean;
 }
 
@@ -172,7 +183,7 @@ export interface M3u8Result {
 // préférence utilisateur. La signature reste union de literals + `string`
 // fallback pour ne pas casser le narrowing des usages existants.
 export type BuiltinEmbedType =
-  | 'supervideo' | 'dropload' | 'voe' | 'uqload' | 'darkibox' | 'vidzy'
+  | 'supervideo' | 'dropload' | 'voe' | 'uqload' | 'darkibox' | 'vidzy' | 'vidmoly'
   | 'fsvid' | 'sibnet' | 'doodstream' | 'seekstreaming';
 
 export interface EmbedDetectionResult {
@@ -1016,16 +1027,26 @@ export function detectSupportedEmbeds(
       });
     }
 
-    // Détection VOE et UQLOAD (VIP requis sauf si extension Nexus installée)
+    // Détection VOE, Vidmoly et UQLOAD (VIP requis sauf si extension Nexus installée)
     const isVip = isUserVip();
     const hasExtension = hasNexusExtractors();
     const canAccess = isVip || hasExtension;
-    
-    if (urlLower.includes('voe.sx') && isVoeExtractionEnabled() && canAccess) {
+    const detectedHoster = detectHosterFromPrefs(url);
+
+    if (detectedHoster === 'voe' && isVoeExtractionEnabled() && canAccess) {
       detectedEmbeds.push({
         type: 'voe',
         url,
         enabled: isVoeExtractionEnabled(),
+        priority: 1
+      });
+    }
+
+    if (detectedHoster === 'vidmoly' && isVidmolyExtractionEnabled() && canAccess) {
+      detectedEmbeds.push({
+        type: 'vidmoly',
+        url,
+        enabled: isVidmolyExtractionEnabled(),
         priority: 1
       });
     }
@@ -1153,30 +1174,37 @@ export async function extractM3u8OnDetection(
 ): Promise<ExtractionProgress[]> {
 
   const extensionReady = hasNexusExtractors() || await waitForNexusExtractors();
+  const detectedEmbeds = detectSupportedEmbeds(sources, context);
 
   // If extension with Nexus extractors is available, use its bulk extraction for better performance
   if (extensionReady && window.movixExtractAllM3u8) {
     console.log('🔌 Using Movix Extension Nexus extractors for parallel extraction');
     try {
       const extensionResult = await window.movixExtractAllM3u8(sources);
-      if (extensionResult && extensionResult.results) {
+      if (hasCompleteBulkCoverage(detectedEmbeds, extensionResult?.results)) {
         return extensionResult.results.map((r: any) => ({
           type: r.type || 'unknown',
           url: r.url || '',
           status: r.success ? 'success' as const : 'error' as const,
-          result: r.success ? { hlsUrl: r.hlsUrl, m3u8Url: r.m3u8Url, success: true } : undefined,
+          result: r.success ? {
+            hlsUrl: r.hlsUrl,
+            m3u8Url: r.m3u8Url,
+            hlsCandidates: r.type === 'seekstreaming'
+              ? normalizeSeekStreamingCandidates(r)
+              : undefined,
+            success: true,
+          } : undefined,
           error: r.error,
           timestamp: Date.now(),
         }));
       }
+      console.warn('Extension bulk coverage incomplete; retrying through individual extraction');
     } catch (e) {
       console.warn('⚠️ Extension bulk extraction failed, falling back to individual extraction:', e);
     }
   }
 
   // Étape 1: Détection des embeds (avec tri selon prefs utilisateur si contexte fourni)
-  const detectedEmbeds = detectSupportedEmbeds(sources, context);
-
   if (detectedEmbeds.length === 0) {
     console.log('ℹ️ Aucun embed supporté détecté');
     return [];
@@ -1249,6 +1277,10 @@ export async function extractM3u8OnDetection(
 
           case 'vidzy':
             result = await extractVidzyM3u8(embed.url, MAIN_API);
+            break;
+
+          case 'vidmoly':
+            result = await extractVidmolyM3u8(embed.url, MAIN_API);
             break;
 
           case 'fsvid':
@@ -1375,14 +1407,12 @@ export function isDoodStreamEmbed(url: string): boolean {
 }
 
 /**
- * Détecter si une URL est un embed SeekStreaming (embed4me / embedseek)
- * Note : ancien comportement matchait aussi toute URL contenant `/#`. On conserve
- * ce fallback pour rétrocompat (sinon certains embeds custom lazy-hash casseraient).
+ * Détecter si une URL est un embed SeekStreaming vérifié.
  * @param url URL à vérifier
  * @returns boolean
  */
 export function isSeekStreamingEmbed(url: string): boolean {
-  return detectHosterFromPrefs(url) === 'seekstreaming' || url.includes('/#');
+  return isSeekStreamingEmbedUrl(url);
 }
 
 /**
@@ -1420,6 +1450,20 @@ async function extractDoodStreamFileServer(doodUrl: string): Promise<M3u8Result 
   try {
     const response = await fetch(`${PROXIES_EMBED_API}/api/extract-doodstream?url=${encodeURIComponent(doodUrl)}`, { headers: getVipHeaders() });
     if (!response.ok) {
+      if (response.status === 410) {
+        try {
+          const deleted = await response.json();
+          if (deleted?.reason === 'deleted') {
+            return {
+              success: false,
+              error: deleted.error || 'DoodStream: File was deleted',
+              reason: 'deleted',
+            };
+          }
+        } catch {
+          // Keep the generic HTTP error for malformed server responses.
+        }
+      }
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
@@ -1478,11 +1522,13 @@ async function extractSeekStreamingM3u8Server(seekUrl: string): Promise<M3u8Resu
     }
 
     const data = await response.json();
-
-    // Préférer l'URL CF (CDN), sinon utiliser l'URL IP
-    const videoUrl = data.url || data.ip_url;
-    if (videoUrl) {
-      return { hlsUrl: videoUrl, success: true };
+    const hlsCandidates = normalizeSeekStreamingCandidates(data);
+    if (hlsCandidates.length > 0) {
+      return {
+        hlsUrl: hlsCandidates[0].url,
+        hlsCandidates,
+        success: true,
+      };
     }
 
     failedUrlsCache.add(seekUrl);

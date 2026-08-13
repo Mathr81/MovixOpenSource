@@ -8,7 +8,9 @@ import com.facebook.react.ReactPackage
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.soloader.SoLoader
 import com.movix.app.CastPackage
-import com.movix.app.pip.PipPackage
+import com.movix.app.proxy.MediaProxyPackage
+import com.movix.app.playback.PlaybackAwakePackage
+import com.movix.app.pip.PictureInPicturePackage
 import com.movix.app.update.UpdatePackage
 
 class MainApplication : Application(), ReactApplication {
@@ -20,7 +22,9 @@ class MainApplication : Application(), ReactApplication {
                     add(DnsPackage())
                     add(UpdatePackage())
                     add(CastPackage())
-                    add(PipPackage())
+                    add(MediaProxyPackage())
+                    add(PlaybackAwakePackage())
+                    add(PictureInPicturePackage())
                 }
 
             override fun getJSMainModuleName(): String = "index"

@@ -8,7 +8,7 @@
     <!-- Associated Domains pour deep links -->
     <key>com.apple.developer.associated-domains</key>
     <array>
-        <string>applinks:movix.cash</string>
+        <string>applinks:movix.tax</string>
     </array>
 </dict>
 </plist>

@@ -353,7 +353,7 @@ const AdminLinkSubmissions: React.FC = () => {
                 />
             )}
             <div className="flex-1 min-w-0">
-                <a href={sub.url} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:text-blue-300 truncate block" title={sub.url}>
+                <a href={/^https?:\/\//i.test(sub.url ?? '') ? sub.url : '#'} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-400 hover:text-blue-300 truncate block" title={sub.url}>
                     {sub.url}
                 </a>
                 <div className="flex items-center gap-1.5 mt-0.5">

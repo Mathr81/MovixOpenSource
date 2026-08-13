@@ -3,8 +3,8 @@
 /** Sources top-level disponibles pour Films/Séries. Ordre = default hardcodé actuel. */
 export const TOP_LEVEL_SOURCE_IDS = [
   'darkino', 'mp4', 'nexus_hls', 'bravo',
-  'fstream', 'wiflix', 'omega', 'coflix', 'frembed', 'vostfr',
-  'viper', 'vox', 'custom',
+  'fstream', 'wiflix', 'j1f', 'swiftflow', 'omega', 'coflix', 'frembed', 'vostfr',
+  'viper', 'vox', 'kisskh', 'custom',
 ] as const;
 export type TopLevelSourceId = typeof TOP_LEVEL_SOURCE_IDS[number];
 
@@ -17,8 +17,8 @@ export const DEPRECATED_HOSTER_IDS = [] as const;
 
 /** Hosters built-in connus. Les custom hosters utilisent des ids prefixés `custom_`. */
 export const BUILTIN_HOSTER_IDS = [
-  'voe', 'vidmoly', 'uqload', 'sibnet', 'doodstream',
-  'seekstreaming', 'smoothpre', 'minochinos', 'vidzy', 'darkibox',
+  'voe', 'vidmoly', 'vidzy', 'uqload', 'sibnet', 'doodstream',
+  'seekstreaming', 'smoothpre', 'minochinos', 'darkibox',
   'supervideo', 'dropload', 'oneupload', 'fsvid',
 ] as const;
 export type BuiltinHosterId = typeof BUILTIN_HOSTER_IDS[number];
@@ -64,7 +64,7 @@ export interface CustomHoster {
 }
 
 export interface SourcePriorityPrefs {
-  version: 1;
+  version: 3;
   categories: {
     moviesTv: MoviesTvPrefs;
     anime: AnimePrefs;

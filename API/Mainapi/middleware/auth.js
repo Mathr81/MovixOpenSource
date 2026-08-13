@@ -244,8 +244,18 @@ async function isAdmin(req, res, next) {
       return res.status(403).json({ success: false, error: 'Accès refusé - Droits admin requis' });
     }
 
-    // Récupérer le rôle (par défaut 'admin' si non défini)
+    // Récupérer le rôle (par défaut 'admin' si non défini — lignes legacy
+    // créées avant l'ajout de la colonne `role`).
     const role = rows[0].role || 'admin';
+
+    // Les uploaders sont aussi dans la table `admins` (role='uploader') mais ne
+    // doivent PAS franchir `isAdmin` : ces routes (clés VIP, factures, OAuth apps,
+    // stats, gestion d'équipe…) sont réservées aux admins. Les routes ouvertes
+    // aux uploaders utilisent `isUploaderOrAdmin`. Sans ce contrôle, n'importe
+    // quel uploader pouvait appeler directement les API admin-only.
+    if (role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Accès refusé - Droits admin requis' });
+    }
 
     // Ajouter les infos admin à la requête (avec le rôle)
     req.admin = { userId, userType, adminId: rows[0].id, role };

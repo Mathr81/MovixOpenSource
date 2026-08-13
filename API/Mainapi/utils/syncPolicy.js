@@ -35,9 +35,12 @@ const SYNCABLE_EXACT_KEYS = new Set([
   'subtitleStyle',
   'support_popup_seen',
   'user_language',
-  // SECURITY (audit P0) : `is_vip` retiré du sync — c'est juste un cache UI
-  // côté frontend qui doit être recalculé via /api/check-vip à chaque session.
-  // Le laisser syncable permettait à n'importe qui de forger son statut VIP.
+  // `is_vip` est un cache UI côté frontend. Le statut réel est validé côté
+  // serveur sur chaque requête sensible via /api/check-vip (x-access-key) ;
+  // forger `is_vip` en localStorage (sync ou DevTools) ne donne aucun accès
+  // VIP réel, juste un affichage trompeur. On le garde syncable pour que le
+  // statut suive l'utilisateur entre appareils sans recheck immédiat.
+  'is_vip',
   'watched_movie',
   'watched_tv',
   'watchPartyNickname'
@@ -104,6 +107,16 @@ const SYNC_LIMITS = Object.freeze({
   maxValueDepth: 8
 });
 
+// Bornes affichage des identifiants utilisateur.
+// `profileName` = nom du profil Movix (créé via /api/profiles ou /api/oauth/profiles).
+// `displayName` = pseudo OAuth (Discord/Google) tel qu'on l'affiche dans l'UI.
+//   Discord limite à 32 chars ; Google peut aller plus loin → on tronque à 64.
+const IDENTITY_LIMITS = Object.freeze({
+  profileNameMin: 1,
+  profileNameMax: 32,
+  displayNameMax: 64,
+});
+
 class SyncPolicyError extends Error {
   constructor(message, status = 400, code = 'SYNC_POLICY_ERROR') {
     super(message);
@@ -111,6 +124,69 @@ class SyncPolicyError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+/**
+ * Valide un nom de profil utilisateur.
+ *
+ *  - Trim
+ *  - Retire les caractères de contrôle (U+0000–U+001F, U+007F) qui peuvent
+ *    casser l'affichage ou être utilisés pour des attaques de spoofing.
+ *  - Refuse les caractères zero-width (U+200B-U+200D, U+FEFF) pour la même raison.
+ *  - Borne la longueur entre `profileNameMin` (1) et `profileNameMax` (32).
+ *
+ * Throw `SyncPolicyError` si invalide. Sinon retourne la chaîne nettoyée.
+ */
+// Caracteres dangereux a stripper avant validation/affichage des noms :
+//   \x00-\x1F\x7F : controle ASCII
+//   \u200B-\u200D  : zero-width (spoofing)
+//   \uFEFF         : BOM
+const DANGEROUS_NAME_CHARS = /[\x00-\x1F\x7F\u200B-\u200D\uFEFF]/g;
+
+function cleanNameInput(raw) {
+  return String(raw).replace(DANGEROUS_NAME_CHARS, '').trim();
+}
+
+function validateProfileName(raw) {
+  if (typeof raw !== 'string') {
+    throw new SyncPolicyError('Le nom de profil doit etre une chaine', 400, 'INVALID_PROFILE_NAME');
+  }
+  const cleaned = cleanNameInput(raw);
+  if (cleaned.length < IDENTITY_LIMITS.profileNameMin) {
+    throw new SyncPolicyError('Le nom de profil ne peut pas etre vide', 400, 'PROFILE_NAME_TOO_SHORT');
+  }
+  if (cleaned.length > IDENTITY_LIMITS.profileNameMax) {
+    throw new SyncPolicyError(
+      `Le nom de profil ne peut pas depasser ${IDENTITY_LIMITS.profileNameMax} caracteres`,
+      400,
+      'PROFILE_NAME_TOO_LONG',
+    );
+  }
+  return cleaned;
+}
+
+/**
+ * Version booléenne de validateProfileName : ne throw pas, retourne juste
+ * un boolean. Utilisé sur les chemins de lecture (vérifier si le username
+ * stocké respecte la policy → si non, forcer l'user à le changer).
+ */
+function isProfileNameValid(raw) {
+  if (typeof raw !== 'string') return false;
+  const cleaned = cleanNameInput(raw);
+  return cleaned.length >= IDENTITY_LIMITS.profileNameMin
+    && cleaned.length <= IDENTITY_LIMITS.profileNameMax;
+}
+
+/**
+ * Tronque proprement un display name (pseudo OAuth provider) pour l'affichage.
+ * Pas de throw : on accepte les valeurs legacy deja stockees, on les coupe juste
+ * si elles depassent. Ajoute une ellipse si tronque.
+ */
+function truncateDisplayName(raw, max = IDENTITY_LIMITS.displayNameMax) {
+  if (typeof raw !== 'string') return '';
+  const cleaned = cleanNameInput(raw);
+  if (cleaned.length <= max) return cleaned;
+  return cleaned.slice(0, Math.max(1, max - 1)) + "\u2026";
 }
 
 function canonicalPath(value) {
@@ -417,6 +493,7 @@ function getOwnedProfile(userData, profileId) {
 module.exports = {
   ALLOWED_SYNC_USER_TYPES,
   BLOCKED_SYNC_KEYS,
+  IDENTITY_LIMITS,
   SYNC_LIMITS,
   SyncPolicyError,
   assertUserDataSize,
@@ -430,6 +507,9 @@ module.exports = {
   isSyncableStorageKey,
   resolveInside,
   sanitizeLegacySyncData,
+  isProfileNameValid,
   sanitizeProfileData,
-  validateAndNormalizeOps
+  truncateDisplayName,
+  validateAndNormalizeOps,
+  validateProfileName
 };

@@ -42,11 +42,21 @@ const ProfileSelection: React.FC = () => {
 
   const currentSelectedOption = ageRestrictionOptions.find(o => o.value === newAgeRestriction) || ageRestrictionOptions[0];
 
-  const handleProfileSelect = async (profileId: string) => {
+  const handleProfileSelect = (profileId: string) => {
     setIsFading(true);
     setTimeout(async () => {
-      await selectProfile(profileId);
-      navigate('/');
+      let navigated = false;
+      try {
+        const selected = await selectProfile(profileId);
+        if (selected) {
+          navigate('/');
+          navigated = true;
+        }
+      } catch (error) {
+        console.error('Profile selection failed:', error);
+      } finally {
+        if (!navigated) setIsFading(false);
+      }
     }, 500);
   };
 

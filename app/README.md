@@ -39,7 +39,7 @@ app/
 
 ### Comment ça marche
 
-1. **WebView** charge `movix.cash`
+1. **WebView** charge `movix.tax`
 2. **Bridge runtime** est injecté AVANT le chargement de la page — fournit `GM_xmlhttpRequest`, `GM_getValue`, `GM_setValue`, `GM_deleteValue`, `unsafeWindow`
 3. **Userscript original** est injecté et fonctionne comme dans Tampermonkey
 4. Quand le userscript fait une requête via `GM_xmlhttpRequest`, le bridge envoie un message à React Native
