@@ -25,3 +25,4 @@ m3u8
 pywidevine
 protobuf
 html5lib
+python-quickjs-ng==0.15.1.1

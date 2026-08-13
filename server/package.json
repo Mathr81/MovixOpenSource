@@ -1,0 +1,10 @@
+{
+  "name": "movix-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@hono/node-server": "1.19.14",
+    "hono": "4.12.29"
+  }
+}

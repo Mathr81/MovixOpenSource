@@ -272,7 +272,7 @@ const ProviderCatalogPage: React.FC = () => {
                             <div className="flex items-center gap-3">
                                 <motion.button whileHover={{ x: -3 }} whileTap={{ scale: 0.9 }} onClick={() => navigate(`/provider/${providerId}`)}
                                     className="p-2 rounded-xl bg-white/5 border border-white/10 hover:border-white/20 hover:bg-white/10 transition-all">
-                                    <ArrowLeft className="w-5 h-5 text-white/70" />
+          <ArrowLeft className="w-5 h-5 text-white opacity-70" />
                                 </motion.button>
                                 <div className="flex items-center gap-3 flex-wrap">
                                     <h1 className="text-2xl md:text-3xl font-bold">

@@ -38,6 +38,11 @@ const {
 
 const router = express.Router();
 
+const setNoStore = (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  return next();
+};
+
 // express-rate-limit v8 exige `ipKeyGenerator()` dans le fallback IPv6
 // pour éviter qu'un user IPv6 contourne la limite. Sans ça : `ValidationError`
 // au boot (warning, mais bruit dans les logs).
@@ -883,7 +888,7 @@ router.post('/vip/invoices', async (req, res) => {
   }
 });
 
-router.get('/vip/invoices/:publicId', async (req, res) => {
+router.get('/vip/invoices/:publicId', setNoStore, async (req, res) => {
   try {
     const tokenRecord = await getOauthTokenAuth(req, ['vip.manage']);
     const pool = getPool();
@@ -907,7 +912,7 @@ router.get('/vip/invoices/:publicId', async (req, res) => {
   }
 });
 
-router.post('/vip/invoices/:publicId/check', async (req, res) => {
+router.post('/vip/invoices/:publicId/check', setNoStore, async (req, res) => {
   try {
     const tokenRecord = await getOauthTokenAuth(req, ['vip.manage']);
     const pool = getPool();

@@ -7,6 +7,7 @@ import AdFreePlayerAds from '../components/AdFreePlayerAds';
 import { toast } from 'sonner';
 import { getTmdbLanguage } from '../i18n';
 import { motion, AnimatePresence } from 'framer-motion';
+import { findDarkiWorldTitleId } from '@/utils/darkiWorldResultMatch';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -1168,41 +1169,19 @@ const DownloadPage: React.FC = () => {
         return null;
       }
 
-      const normalizeName = (s: string) => s.toLowerCase().trim();
-      const targetName = normalizeName(tmdbDetails.name || tmdbDetails.title || '');
+      const releaseDate = type === 'movie'
+        ? tmdbDetails.release_date
+        : tmdbDetails.first_air_date;
+      const parsedYear = releaseDate ? Number.parseInt(releaseDate.slice(0, 4), 10) : null;
+      const matchingId = findDarkiWorldTitleId({
+        results: searchResponse.data.results,
+        targetTmdbId: id,
+        targetTitle: tmdbDetails.name || tmdbDetails.title || '',
+        targetType: type === 'movie' ? 'movie' : 'tv',
+        targetYear: parsedYear != null && Number.isFinite(parsedYear) ? parsedYear : null,
+      });
 
-      if (type === 'movie') {
-        // Pour les films, chercher par tmdb_id exact
-        let matchingMovie = searchResponse.data.results.find((result: any) => {
-          return (result.have_streaming === 1 || result.have_streaming === 0) &&
-                 result.type !== 'series' &&
-                 result.tmdb_id &&
-                 String(result.tmdb_id) === String(id);
-        });
-        // Fallback: matcher par nom si aucun tmdb_id ne correspond
-        if (!matchingMovie && targetName) {
-          matchingMovie = searchResponse.data.results.find((result: any) => {
-            return result.name && normalizeName(result.name) === targetName &&
-                   result.type !== 'series' && result.type !== 'animes' && result.type !== 'doc';
-          });
-        }
-        return matchingMovie ? matchingMovie.id : null;
-      } else {
-        // Pour les séries, chercher par tmdb_id exact
-        let matchingShow = searchResponse.data.results.find((result: any) => {
-          return (result.type === 'series' || result.type === 'animes' || result.type === 'doc') &&
-                 result.tmdb_id &&
-                 String(result.tmdb_id) === String(id);
-        });
-        // Fallback: matcher par nom si aucun tmdb_id ne correspond
-        if (!matchingShow && targetName) {
-          matchingShow = searchResponse.data.results.find((result: any) => {
-            return result.name && normalizeName(result.name) === targetName &&
-                   result.type !== 'movie';
-          });
-        }
-        return matchingShow ? matchingShow.id : null;
-      }
+      return matchingId == null ? null : String(matchingId);
     } catch (err) {
       console.error('Erreur lors de la recherche sur notre source de téléchargement:', err);
       return null;

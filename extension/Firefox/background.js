@@ -34,6 +34,415 @@ const STREAM_PROXY_USER_AGENT =
 
 // Access extractors loaded via manifest background.scripts
 const Extractors = globalThis.MovixExtractors;
+// BEGIN KISSKH FALLBACK
+const KISSKH_BROWSER_API = browserAPI;
+const KISSKH_SESSION_RULE_ID = 59;
+const KISSKH_MAX_REDIRECTS = 5;
+const KISSKH_REQUEST_TIMEOUT_MS = 10000;
+const KISSKH_MAX_MEDIA_URL_LENGTH = 8192;
+const KISSKH_MAX_HEADER_VALUE_LENGTH = 2048;
+const KISSKH_MAX_SUBTITLE_BYTES = 2097152;
+const KISSKH_MAX_EXCHANGE_BYTES = 32768;
+const KISSKH_MAX_EXCHANGE_LIFETIME_MS = 120000;
+const KISSKH_ALLOWED_HEADER_ORIGIN = "https://kisskh.nl";
+let kisskhSessionRuleQueue = Promise.resolve();
+
+function kisskhFailure(code) {
+  return { success: false, code };
+}
+
+function kisskhHasExactKeys(value, keys) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort())
+  );
+}
+
+function kisskhValidateSubtitleUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > KISSKH_MAX_MEDIA_URL_LENGTH || /[\r\n\0]/.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username || parsed.password || parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateMediaUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > KISSKH_MAX_MEDIA_URL_LENGTH || /[\r\n\0]/.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.username || parsed.password || parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateHeaderValue(name, value) {
+  if (
+    typeof value !== "string" || value.length === 0 ||
+    value.length > KISSKH_MAX_HEADER_VALUE_LENGTH || /[\r\n\0]/.test(value)
+  ) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" || parsed.username || parsed.password ||
+      (parsed.port && parsed.port !== "443") || parsed.hash ||
+      parsed.origin !== KISSKH_ALLOWED_HEADER_ORIGIN
+    ) {
+      return null;
+    }
+    if (name === "Origin" && (parsed.pathname !== "/" || parsed.search)) return null;
+    return name === "Origin" ? parsed.origin : parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function kisskhValidateExchange(value) {
+  if (!kisskhHasExactKeys(value, ["url", "expiresAt", "requiredHeaders"])) return null;
+  const url = kisskhValidateMediaUrl(value.url);
+  if (
+    !url || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now() ||
+    value.expiresAt > Date.now() + KISSKH_MAX_EXCHANGE_LIFETIME_MS ||
+    value.requiredHeaders === null || typeof value.requiredHeaders !== "object" || Array.isArray(value.requiredHeaders)
+  ) {
+    return null;
+  }
+  const headers = {};
+  for (const [name, rawValue] of Object.entries(value.requiredHeaders)) {
+    if (name !== "Referer" && name !== "Origin") return null;
+    const headerValue = kisskhValidateHeaderValue(name, rawValue);
+    if (!headerValue) return null;
+    headers[name] = headerValue;
+  }
+  return { url, expiresAt: value.expiresAt, requiredHeaders: headers };
+}
+
+async function kisskhReadBoundedBody(response, maxBytes) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxBytes) {
+      return { error: "response_too_large" };
+    }
+  }
+  if (!response.body || typeof response.body.getReader !== "function") {
+    return { error: "unsupported_transport" };
+  }
+  const reader = response.body.getReader();
+  let timeoutId;
+  const readResult = (async () => {
+    const chunks = [];
+    let length = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        length += chunk.byteLength;
+        if (length > maxBytes) {
+          await reader.cancel();
+          return { error: "response_too_large" };
+        }
+        chunks.push(chunk);
+      }
+    } catch {
+      return { error: "upstream_unavailable" };
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { bytes };
+  })();
+  const timeoutResult = new Promise(resolve => {
+    timeoutId = setTimeout(() => resolve({ error: "timeout", timedOut: true }), KISSKH_REQUEST_TIMEOUT_MS);
+  });
+  const result = await Promise.race([readResult, timeoutResult]);
+  clearTimeout(timeoutId);
+  if (result.timedOut) {
+    try {
+      await reader.cancel();
+    } catch {}
+    return { error: "timeout" };
+  }
+  return result;
+}
+
+function kisskhBytesToBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+  }
+  return btoa(binary);
+}
+
+async function kisskhFetch(url, init) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), KISSKH_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function kisskhFetchSubtitle(sourceUrl) {
+  let currentUrl = sourceUrl;
+  for (let redirects = 0; redirects <= KISSKH_MAX_REDIRECTS; redirects += 1) {
+    let response;
+    try {
+      response = await kisskhFetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        credentials: "omit",
+        cache: "no-store",
+        headers: { Accept: "text/*", "Cache-Control": "no-store" },
+      });
+    } catch (error) {
+      return kisskhFailure(error?.name === "AbortError" ? "timeout" : "upstream_unavailable");
+    }
+    if (response.status >= 300 && response.status < 400) {
+      if (redirects === KISSKH_MAX_REDIRECTS) return kisskhFailure("upstream_unavailable");
+      const location = response.headers.get("location");
+      let redirected = null;
+      try {
+        redirected = location ? kisskhValidateSubtitleUrl(new URL(location, currentUrl).toString()) : null;
+      } catch {}
+      if (!redirected) return kisskhFailure("invalid_request");
+      currentUrl = redirected;
+      continue;
+    }
+    if (response.status === 429) return kisskhFailure("provider_rate_limited");
+    if (!response.ok) return kisskhFailure("upstream_unavailable");
+    const contentType = response.headers.get("content-type") || "";
+    if (!/^text\/[a-z0-9!#$&^_.+-]+(?:\s*;|$)/i.test(contentType)) {
+      return kisskhFailure("invalid_content_type");
+    }
+    const body = await kisskhReadBoundedBody(response, KISSKH_MAX_SUBTITLE_BYTES);
+    if (body.error) return kisskhFailure(body.error);
+    return {
+      success: true,
+      kind: "subtitle",
+      status: response.status,
+      contentType,
+      bodyBase64: kisskhBytesToBase64(body.bytes),
+    };
+  }
+  return kisskhFailure("upstream_unavailable");
+}
+
+function kisskhAlarmName(expiresAt) {
+  return `${KISSKH_SESSION_RULE_ID}:${expiresAt}`;
+}
+
+function kisskhParseAlarm(alarm) {
+  const match = new RegExp(`^${KISSKH_SESSION_RULE_ID}:(\\d{13})$`).exec(alarm?.name || "");
+  if (!match) return null;
+  const expiresAt = Number(match[1]);
+  return Number.isSafeInteger(expiresAt) && alarm.scheduledTime === expiresAt ? expiresAt : null;
+}
+
+function kisskhHasSessionTransport() {
+  return Boolean(
+    KISSKH_BROWSER_API?.declarativeNetRequest?.getSessionRules &&
+    KISSKH_BROWSER_API?.declarativeNetRequest?.updateSessionRules &&
+    KISSKH_BROWSER_API?.alarms?.getAll &&
+    KISSKH_BROWSER_API?.alarms?.create &&
+    KISSKH_BROWSER_API?.alarms?.clear,
+  );
+}
+
+async function kisskhClearAlarms() {
+  if (!KISSKH_BROWSER_API?.alarms?.getAll) return;
+  const alarms = await KISSKH_BROWSER_API.alarms.getAll();
+  await Promise.all(
+    alarms
+      .filter(alarm => String(alarm.name || "").startsWith(`${KISSKH_SESSION_RULE_ID}:`))
+      .map(alarm => KISSKH_BROWSER_API.alarms.clear(alarm.name)),
+  );
+}
+
+async function kisskhRemoveSessionRule() {
+  if (!kisskhHasSessionTransport()) return false;
+  await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [KISSKH_SESSION_RULE_ID],
+  });
+  await kisskhClearAlarms();
+  return true;
+}
+
+function kisskhExactRegex(url) {
+  return `^${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+}
+
+async function kisskhInstallSessionRule(exchange) {
+  if (!kisskhHasSessionTransport()) return false;
+  const update = kisskhSessionRuleQueue.then(async () => {
+    await kisskhClearAlarms();
+    const requestHeaders = Object.entries(exchange.requiredHeaders).map(([header, value]) => ({
+      header,
+      operation: "set",
+      value,
+    }));
+    try {
+      await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [KISSKH_SESSION_RULE_ID],
+        addRules: [{
+          id: KISSKH_SESSION_RULE_ID,
+          priority: 100,
+          action: { type: "modifyHeaders", requestHeaders },
+          condition: {
+            regexFilter: kisskhExactRegex(exchange.url),
+            resourceTypes: ["xmlhttprequest", "media", "other"],
+          },
+        }],
+      });
+      await KISSKH_BROWSER_API.alarms.create(kisskhAlarmName(exchange.expiresAt), {
+        when: exchange.expiresAt,
+      });
+      return true;
+    } catch {
+      try {
+        await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+          removeRuleIds: [KISSKH_SESSION_RULE_ID],
+        });
+        await kisskhClearAlarms();
+      } catch {}
+      return false;
+    }
+  });
+  kisskhSessionRuleQueue = update.then(() => undefined, () => undefined);
+  return update;
+}
+
+async function reconcileKisskhSessionRule() {
+  if (!kisskhHasSessionTransport()) return false;
+  const [rules, alarms] = await Promise.all([
+    KISSKH_BROWSER_API.declarativeNetRequest.getSessionRules(),
+    KISSKH_BROWSER_API.alarms.getAll(),
+  ]);
+  const ruleCount = rules.filter(rule => rule.id === KISSKH_SESSION_RULE_ID).length;
+  const relatedAlarms = alarms.filter(alarm => String(alarm.name || "").startsWith(`${KISSKH_SESSION_RULE_ID}:`));
+  const expiry = relatedAlarms.length === 1 ? kisskhParseAlarm(relatedAlarms[0]) : null;
+  if (ruleCount === 1 && expiry !== null && expiry > Date.now()) return true;
+  if (ruleCount > 0) {
+    await KISSKH_BROWSER_API.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [KISSKH_SESSION_RULE_ID],
+    });
+  }
+  await kisskhClearAlarms();
+  return false;
+}
+
+async function kisskhExchangeMedia(fallbackToken) {
+  let response;
+  try {
+    response = await kisskhFetch(`${PROD_API_BASE_URL}/api/kisskh/fallback/${fallbackToken}`, {
+      method: "POST",
+      redirect: "error",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (error) {
+    return kisskhFailure(error?.name === "AbortError" ? "timeout" : "upstream_unavailable");
+  }
+  if (response.status === 429) return kisskhFailure("provider_rate_limited");
+  if (!response.ok) return kisskhFailure("upstream_unavailable");
+  if (!/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get("cache-control") || "")) {
+    return kisskhFailure("provider_changed");
+  }
+  if (!/^application\/json(?:\s*;|$)/i.test(response.headers.get("content-type") || "")) {
+    return kisskhFailure("provider_changed");
+  }
+  const body = await kisskhReadBoundedBody(response, KISSKH_MAX_EXCHANGE_BYTES);
+  if (body.error) return kisskhFailure(body.error === "response_too_large" ? "provider_changed" : body.error);
+  let rawExchange;
+  try {
+    rawExchange = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.bytes));
+  } catch {
+    return kisskhFailure("provider_changed");
+  }
+  const exchange = kisskhValidateExchange(rawExchange);
+  if (!exchange) return kisskhFailure("provider_changed");
+  const headerNames = Object.keys(exchange.requiredHeaders);
+  if (headerNames.length === 0) {
+    if (kisskhHasSessionTransport()) await kisskhRemoveSessionRule();
+    return {
+      success: true,
+      kind: "media",
+      url: exchange.url,
+      expiresAt: exchange.expiresAt,
+      headersApplied: false,
+    };
+  }
+  if (!(await kisskhInstallSessionRule(exchange))) return kisskhFailure("unsupported_transport");
+  return {
+    success: true,
+    kind: "media",
+    url: exchange.url,
+    expiresAt: exchange.expiresAt,
+    headersApplied: true,
+  };
+}
+
+async function handleKisskhFallback(payload) {
+  if (!kisskhHasExactKeys(payload, payload?.kind === "subtitle" ? ["kind", "sourceUrl"] : ["kind", "fallbackToken"])) {
+    return kisskhFailure("invalid_request");
+  }
+  if (payload.kind === "subtitle") {
+    const sourceUrl = kisskhValidateSubtitleUrl(payload.sourceUrl);
+    return sourceUrl ? kisskhFetchSubtitle(sourceUrl) : kisskhFailure("invalid_request");
+  }
+  if (
+    payload.kind !== "media" || typeof payload.fallbackToken !== "string" ||
+    payload.fallbackToken.length < 16 || payload.fallbackToken.length > 2048 ||
+    !/^[A-Za-z0-9_-]+$/.test(payload.fallbackToken)
+  ) {
+    return kisskhFailure("invalid_request");
+  }
+  return kisskhExchangeMedia(payload.fallbackToken);
+}
+
+if (KISSKH_BROWSER_API?.alarms?.onAlarm?.addListener) {
+  KISSKH_BROWSER_API.alarms.onAlarm.addListener(async alarm => {
+    const expiresAt = kisskhParseAlarm(alarm);
+    if (expiresAt === null) return;
+    if (expiresAt > Date.now()) {
+      await KISSKH_BROWSER_API.alarms.create(alarm.name, { when: expiresAt });
+      return;
+    }
+    await kisskhRemoveSessionRule();
+  });
+}
+KISSKH_BROWSER_API.runtime.onStartup.addListener(() => {
+  void reconcileKisskhSessionRule().catch(() => {});
+});
+void reconcileKisskhSessionRule().catch(() => {});
+// END KISSKH FALLBACK
 
 // Cache for Wiflix channels with their page slugs
 let wiflixChannelCache = {};
@@ -230,6 +639,8 @@ async function handleMessage(message) {
   }
 
   switch (action) {
+    case "KISSKH_FALLBACK":
+      return await handleKisskhFallback(payload);
     case "GET_MANIFEST":
       return await getManifest();
     case "GET_CATALOG": {
@@ -381,6 +792,24 @@ async function proxyHttpRequest(url, headers = {}) {
 
 // === NEXUS M3U8 EXTRACTION HANDLERS ===
 
+function getSeekStreamingPlaybackUrls(result) {
+  const urls = [];
+  const seen = new Set();
+  const add = (url) => {
+    if (typeof url !== "string" || !url || seen.has(url)) return;
+    seen.add(url);
+    urls.push(url);
+  };
+  if (Array.isArray(result?.hlsCandidates)) {
+    for (const candidate of result.hlsCandidates) {
+      add(candidate?.url);
+    }
+  }
+  add(result?.hlsUrl);
+  add(result?.m3u8Url);
+  return urls;
+}
+
 /**
  * Handle single embed extraction request
  * payload: { type: 'voe'|'fsvid'|..., url: 'https://...' }
@@ -392,6 +821,36 @@ async function handleExtractM3u8(payload) {
   // Auto-detect type if not provided
   const embedType = type || Extractors.detectEmbedType(url);
   if (!embedType) return { success: false, error: "Unknown embed type" };
+
+  if (embedType === "seekstreaming") {
+    let extractionRuleId = null;
+    try {
+      const extractionHeaders = await Extractors.setupHeadersForService(
+        embedType,
+        url,
+        url,
+      );
+      if (extractionHeaders) {
+        extractionRuleId = await addHeadersRule(
+          extractionHeaders.domainPattern,
+          extractionHeaders.headers,
+        );
+      }
+      const result = await Extractors.extractSingle(embedType, url);
+      if (result.success) {
+        for (const videoUrl of getSeekStreamingPlaybackUrls(result)) {
+          const playbackHeaders =
+            await Extractors.setupHeadersForService(embedType, videoUrl, url);
+          if (playbackHeaders) {
+            await replaceSeekPlaybackRule(playbackHeaders);
+          }
+        }
+      }
+      return result;
+    } finally {
+      await removeHeadersRule(extractionRuleId);
+    }
+  }
 
   // Set up DNR headers BEFORE extraction so the fetch request succeeds
   try {
@@ -417,6 +876,7 @@ async function handleExtractM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         embedType,
         videoUrl,
+        url,
       );
       if (headerInfo) {
         await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
@@ -442,6 +902,8 @@ async function handleExtractAllM3u8(payload) {
 
   console.log(`[NEXUS] Extracting all from ${sources.length} sources`);
 
+  const seekExtractionRuleIds = [];
+
   // Set up DNR headers for all sources BEFORE extraction
   try {
     const detected = Extractors.detectSupportedEmbeds(sources);
@@ -449,9 +911,16 @@ async function handleExtractAllM3u8(payload) {
       const headerInfo = await Extractors.setupHeadersForService(
         item.type,
         item.url,
+        item.url,
       );
       if (headerInfo) {
-        await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+        const ruleId = await addHeadersRule(
+          headerInfo.domainPattern,
+          headerInfo.headers,
+        );
+        if (item.type === "seekstreaming" && Number.isInteger(ruleId)) {
+          seekExtractionRuleIds.push(ruleId);
+        }
       }
     }
     console.log(
@@ -461,31 +930,45 @@ async function handleExtractAllM3u8(payload) {
     console.warn("[NEXUS] Failed to set pre-extraction headers for batch:", e);
   }
 
-  const results = await Extractors.extractAll(sources);
+  try {
+    const results = await Extractors.extractAll(sources);
 
-  // Set up DNR headers for all successful extractions (video URLs)
-  for (const result of results) {
-    if (result.success) {
-      const videoUrl = result.hlsUrl || result.m3u8Url;
-      if (videoUrl) {
-        const headerInfo = await Extractors.setupHeadersForService(
-          result.type,
-          videoUrl,
-        );
-        if (headerInfo) {
-          await addHeadersRule(headerInfo.domainPattern, headerInfo.headers);
+    // Set up DNR headers for all successful extractions (video URLs)
+    for (const result of results) {
+      if (result.success) {
+        const videoUrls = result.type === "seekstreaming"
+          ? getSeekStreamingPlaybackUrls(result)
+          : [result.hlsUrl || result.m3u8Url].filter(Boolean);
+        for (const videoUrl of videoUrls) {
+          const headerInfo = await Extractors.setupHeadersForService(
+            result.type,
+            videoUrl,
+            result.url,
+          );
+          if (headerInfo) {
+            if (result.type === "seekstreaming") {
+              await replaceSeekPlaybackRule(headerInfo);
+            } else {
+              await addHeadersRule(
+                headerInfo.domainPattern,
+                headerInfo.headers,
+              );
+            }
+          }
         }
       }
     }
-  }
 
-  const successCount = results.filter((r) => r.success).length;
-  return {
-    success: successCount > 0,
-    total: results.length,
-    successCount,
-    results,
-  };
+    const successCount = results.filter((r) => r.success).length;
+    return {
+      success: successCount > 0,
+      total: results.length,
+      successCount,
+      results,
+    };
+  } finally {
+    await Promise.all(seekExtractionRuleIds.map(removeHeadersRule));
+  }
 }
 
 /**
@@ -2435,6 +2918,17 @@ async function saveToCache(key, data, ttlMinutes) {
 
 // DNR Helper
 let ruleIdCounter = 100;
+// Reserved below the general 100+ allocator; FCTV owns fixed rule 60.
+const SEEK_PLAYBACK_RULE_ID_MIN = 61;
+const SEEK_PLAYBACK_RULE_ID_MAX = 99;
+
+function isSeekPlaybackRuleId(ruleId) {
+  return (
+    Number.isInteger(ruleId) &&
+    ruleId >= SEEK_PLAYBACK_RULE_ID_MIN &&
+    ruleId <= SEEK_PLAYBACK_RULE_ID_MAX
+  );
+}
 
 // FCTV (matches) native streams: rotating segment CDN hosts are Referer-gated
 // to the current player origin; they share a `/cfall/s.../v3b/` path, so one
@@ -2579,24 +3073,14 @@ async function resolveFctvStream(opts) {
   return `${parsed.origin}/token-${token}${parsed.pathname}${parsed.search}`;
 }
 
-async function addHeadersRule(urlPattern, headers) {
-  const existingRules =
-    await browserAPI.declarativeNetRequest.getDynamicRules();
-  const existingIds = new Set(existingRules.map((r) => r.id));
-
-  let id = ruleIdCounter;
-  while (existingIds.has(id)) {
-    id++;
-  }
-  ruleIdCounter = id + 1;
-
+function createHeadersRule(id, urlPattern, headers) {
   const requestHeaders = Object.entries(headers).map(([header, value]) => ({
     header: header,
     operation: "set",
     value: value,
   }));
 
-  const rule = {
+  return {
     id: id,
     priority: 10,
     action: {
@@ -2615,12 +3099,97 @@ async function addHeadersRule(urlPattern, headers) {
       ],
     },
   };
+}
+
+async function addHeadersRule(urlPattern, headers) {
+  const existingRules =
+    await browserAPI.declarativeNetRequest.getDynamicRules();
+  const existingIds = new Set(existingRules.map((r) => r.id));
+
+  let id = ruleIdCounter;
+  while (existingIds.has(id)) {
+    id++;
+  }
+  ruleIdCounter = id + 1;
+
+  const rule = createHeadersRule(id, urlPattern, headers);
 
   try {
     await browserAPI.declarativeNetRequest.updateDynamicRules({
       addRules: [rule],
     });
+    return id;
   } catch (e) {
     console.error("Failed to add dynamic rule:", e);
+    return null;
   }
+}
+
+async function removeHeadersRule(ruleId) {
+  if (!Number.isInteger(ruleId)) return;
+  await browserAPI.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+  });
+}
+
+async function persistSeekPlaybackRule(headerInfo) {
+  try {
+    const existingRules =
+      await browserAPI.declarativeNetRequest.getDynamicRules();
+    const seekRules = existingRules.filter((rule) =>
+      isSeekPlaybackRuleId(rule.id),
+    );
+    const matchingRule = seekRules.find(
+      (rule) => rule.condition?.urlFilter === headerInfo.domainPattern,
+    );
+    const usedIds = new Set(seekRules.map((rule) => rule.id));
+    let ruleId = matchingRule?.id ?? null;
+
+    if (ruleId === null) {
+      for (
+        let candidate = SEEK_PLAYBACK_RULE_ID_MIN;
+        candidate <= SEEK_PLAYBACK_RULE_ID_MAX;
+        candidate += 1
+      ) {
+        if (!usedIds.has(candidate)) {
+          ruleId = candidate;
+          break;
+        }
+      }
+    }
+
+    if (ruleId === null) {
+      ruleId = SEEK_PLAYBACK_RULE_ID_MIN;
+      console.warn(
+        "[NEXUS] Seek playback rule capacity reached; evicting oldest slot",
+      );
+    }
+
+    const rule = createHeadersRule(
+      ruleId,
+      headerInfo.domainPattern,
+      headerInfo.headers,
+    );
+    await browserAPI.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+      addRules: [rule],
+    });
+    return ruleId;
+  } catch (e) {
+    console.error("Failed to persist Seek playback rule:", e);
+    return null;
+  }
+}
+
+let seekPlaybackRuleUpdateQueue = Promise.resolve();
+
+function replaceSeekPlaybackRule(headerInfo) {
+  const update = seekPlaybackRuleUpdateQueue.then(() =>
+    persistSeekPlaybackRule(headerInfo),
+  );
+  seekPlaybackRuleUpdateQueue = update.then(
+    () => undefined,
+    () => undefined,
+  );
+  return update;
 }

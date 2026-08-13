@@ -1,6 +1,6 @@
 /**
  * Stockage DB des clients OAuth + stats + grants VIP. Remplace le fichier
- * `data/oauth-clients.json` (déprécié — migration auto au boot).
+ * `data/oauth-clients.json` (déprécié — aucune migration automatique au boot).
  *
  * Les autres modules continuent d'appeler `loadOAuthClients()` (sync) de
  * `oauthClients.js`, qui lit depuis le cache pré-warmé par les fonctions
@@ -12,8 +12,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { getPool } = require('../mysqlPool');
 const { redis } = require('../config/redis');
+const { ensureTableGroup } = require('../db/runtimeEnsure');
 
-const SCHEMA_PATH = path.join(__dirname, '..', 'exportscripts', 'add_oauth_apps_tables.sql');
 const LEGACY_JSON_PATH = path.join(__dirname, '..', 'data', 'oauth-clients.json');
 const ICON_DIR = path.join(__dirname, '..', 'public', 'oauth-icons');
 
@@ -52,32 +52,9 @@ const KNOWN_OAUTH_SCOPES_SET = new Set([
   'ratings.manage',
 ]);
 
-/** Strip les commentaires `-- …` ligne par ligne avant le split.
- *  Note : ne gère pas `/* … *\/` mais le schéma n'en utilise pas. */
-function stripSqlLineComments(sqlText) {
-  return sqlText
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('--'))
-    .join('\n');
-}
-
 /** Crée les tables si elles n'existent pas (idempotent). */
 async function ensureTables() {
-  const pool = getPool();
-  if (!pool) throw new Error('MySQL pool not ready');
-  if (!fs.existsSync(SCHEMA_PATH)) return;
-  // On strip d'abord TOUS les commentaires ligne `-- …` puis on split sur `;`.
-  // Sans le strip, le premier statement embarquait le header de commentaires
-  // du fichier et était filtré par `!startsWith('--')` → aucune table créée
-  // et le INSERT migrate plantait sur "Table 'oauth_clients' doesn't exist".
-  const sql = stripSqlLineComments(fs.readFileSync(SCHEMA_PATH, 'utf-8'));
-  const statements = sql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  for (const stmt of statements) {
-    await pool.query(stmt);
-  }
+  await ensureTableGroup(getPool(), 'oauth');
   // Crée aussi le dossier oauth-icons s'il n'existe pas.
   if (!fs.existsSync(ICON_DIR)) {
     fs.mkdirSync(ICON_DIR, { recursive: true, mode: 0o755 });

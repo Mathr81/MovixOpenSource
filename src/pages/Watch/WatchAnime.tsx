@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import axios from 'axios';
@@ -23,6 +23,10 @@ import { useWrappedTracker } from '../../hooks/useWrappedTracker';
 import { getTmdbLanguage } from '../../i18n';
 import { useProfile } from '../../context/ProfileContext';
 import { isContentAllowed, getClassificationLabel } from '../../utils/certificationUtils';
+import {
+  createHlsAutoFallbackGuard,
+  syncHlsActiveSource,
+} from '../../utils/hlsAutoFallbackGuard';
 
 const MAIN_API = import.meta.env.VITE_MAIN_API;
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
@@ -166,6 +170,7 @@ const calculateTitleSimilarity = (title1: string, title2: string): number => {
 const WatchAnime: React.FC = () => {
   const { id: encodedId, season, episode } = useParams<{ id: string; season: string; episode: string }>();
   const id = encodedId ? getTmdbId(encodedId) : null;
+  const autoFallbackGuard = useMemo(() => createHlsAutoFallbackGuard(2), [id, season, episode]);
   const navigate = useNavigate();
   const { t } = useTranslation();
   const { currentProfile } = useProfile();
@@ -209,11 +214,28 @@ const WatchAnime: React.FC = () => {
   // For HLS player
   const [showHLSPlayer, setShowHLSPlayer] = useState<boolean>(false);
   const [hlsPlayerSrc, setHlsPlayerSrc] = useState<string>('');
+  const currentActiveUrlRef = useRef<string>('');
+
+  useEffect(() => {
+    autoFallbackGuard.activate();
+    if (currentActiveUrlRef.current) {
+      autoFallbackGuard.syncActiveSource(currentActiveUrlRef.current);
+    }
+    return () => autoFallbackGuard.invalidate();
+  }, [autoFallbackGuard]);
 
 
   // For iframe embed display
   const [embedUrl, setEmbedUrl] = useState<string | null>(null);
   const [showEmbedQuality, setShowEmbedQuality] = useState(false);
+
+  useEffect(() => {
+    syncHlsActiveSource(
+      autoFallbackGuard,
+      currentActiveUrlRef,
+      showHLSPlayer ? hlsPlayerSrc : embedUrl || '',
+    );
+  }, [autoFallbackGuard, embedUrl, hlsPlayerSrc, showHLSPlayer]);
 
   // Episode progress tracking
   const { isWatched, toggleWatched } = useWatchStatus({
@@ -231,6 +253,34 @@ const WatchAnime: React.FC = () => {
   const {
     showPopupForPlayer
   } = useAdFreePopup();
+
+  const acceptAnimeSource = useCallback((source: VideoSource) => {
+    if (!source.url) return;
+
+    syncHlsActiveSource(autoFallbackGuard, currentActiveUrlRef, source.url);
+    setSelectedSource(source);
+
+    const playerType = source.player.toLowerCase();
+    if (playerType.includes('vidmoly')) {
+      showPopupForPlayer('vidmoly');
+    } else if (playerType.includes('sibnet')) {
+      showPopupForPlayer('vidmoly');
+    } else if (playerType.includes('oneupload')) {
+      showPopupForPlayer('omega');
+    } else {
+      showPopupForPlayer('adfree');
+    }
+
+    if (source.isM3u8) {
+      setHlsPlayerSrc(source.url);
+      setShowHLSPlayer(true);
+      setEmbedUrl(null);
+    } else {
+      setEmbedUrl(source.url);
+      setShowHLSPlayer(false);
+      setHlsPlayerSrc('');
+    }
+  }, [autoFallbackGuard, showPopupForPlayer]);
 
   // État pour le menu d'épisodes
   const [showEpisodesMenu, setShowEpisodesMenu] = useState(false);
@@ -1003,32 +1053,8 @@ const WatchAnime: React.FC = () => {
     }
 
     console.log('Final selected source:', sourceToSelect);
-    setSelectedSource(sourceToSelect);
-
-    // Trigger ad popup based on player type for auto-selected source
-    const playerType = sourceToSelect.player.toLowerCase();
-    if (playerType.includes('vidmoly')) {
-      showPopupForPlayer('vidmoly');
-    } else if (playerType.includes('sibnet')) {
-      showPopupForPlayer('vidmoly'); // Sibnet is treated as vidmoly type
-    } else if (playerType.includes('oneupload')) {
-      showPopupForPlayer('omega'); // OneUpload is treated as omega type
-    } else {
-      // For other players, show generic popup
-      showPopupForPlayer('adfree');
-    }
-
-    if (sourceToSelect.isM3u8) {
-      // Use HLS Player for m3u8 sources (including Sibnet sources)
-      setHlsPlayerSrc(sourceToSelect.url);
-      setShowHLSPlayer(true);
-      setEmbedUrl(null);
-    } else {
-      setEmbedUrl(sourceToSelect.url);
-      setShowHLSPlayer(false);
-      setHlsPlayerSrc('');
-    }
-  }, [videoSources, selectedLanguage]);
+    acceptAnimeSource(sourceToSelect);
+  }, [acceptAnimeSource, videoSources, selectedLanguage]);
 
   // Sélection automatique du premier lecteur disponible (seulement au chargement initial)
   useEffect(() => {
@@ -1048,38 +1074,12 @@ const WatchAnime: React.FC = () => {
   // }, [selectedLanguage, selectBestSource, isInitialLoad]);
 
   // Handle source selection
-  const handleSelectSource = (source: VideoSource) => {
-    setSelectedSource(source);
-
-    // Trigger ad popup based on player type
-    const playerType = source.player.toLowerCase();
-    if (playerType.includes('vidmoly')) {
-      showPopupForPlayer('vidmoly');
-    } else if (playerType.includes('sibnet')) {
-      showPopupForPlayer('vidmoly'); // Sibnet is treated as vidmoly type
-    } else if (playerType.includes('oneupload')) {
-      showPopupForPlayer('omega'); // OneUpload is treated as omega type
-    } else {
-      // For other players, show generic popup
-      showPopupForPlayer('adfree');
-    }
-
-    if (source.isM3u8) {
-      // Use HLS Player for m3u8 sources (including Sibnet sources)
-      setHlsPlayerSrc(source.url);
-      setShowHLSPlayer(true);
-      setEmbedUrl(null);
-    } else {
-      // Use embed for other sources
-      setEmbedUrl(source.url);
-      setShowHLSPlayer(false);
-      setHlsPlayerSrc('');
-    }
-
+  const handleSelectSource = useCallback((source: VideoSource) => {
+    acceptAnimeSource(source);
     setShowEmbedQuality(false);
 
     // Progress saving functionality removed
-  };
+  }, [acceptAnimeSource]);
 
   // Listener pour l'événement showSourcesMenu (déclenché par HLSPlayer en cas d'erreur 403)
   useEffect(() => {
@@ -1760,6 +1760,7 @@ const WatchAnime: React.FC = () => {
           {showHLSPlayer && hlsPlayerSrc ? (
             <HLSPlayer
               priorityCategory="anime"
+              autoFallbackGuard={autoFallbackGuard}
               src={hlsPlayerSrc}
               autoPlay={true}
               controls={true}
@@ -1808,6 +1809,7 @@ const WatchAnime: React.FC = () => {
               src={embedUrl}
               className="w-full h-full border-0"
               allowFullScreen
+              referrerPolicy={(embedUrl || '').toLowerCase().includes('ezplayer') ? 'no-referrer' : undefined}
               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
             ></iframe>
           ) : null}

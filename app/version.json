@@ -1,13 +1,13 @@
 {
-  "version": "2.5.5",
-  "buildNumber": 14,
+  "version": "2.5.12",
+  "buildNumber": 21,
   "apkUrl": "https://raw.githubusercontent.com/movixcorp/MovixOpenSource/main/app/movix-android.apk",
-  "apkSizeBytes": 72101334,
-  "apkSha256": "9f719ef70f0dbd5e0842c8648633ae4b2681be9b0ba4eeeea97eb02ce13b82b5",
-  "mandatory": true,
-  "releasedAt": "2026-07-29T11:55:28.799Z",
+  "apkSizeBytes": 72228150,
+  "apkSha256": "4f37a2bbb1c12c5842e9b1f65d45788ef2c920da6932e9010fe34236c961f291",
+  "mandatory": false,
+  "releasedAt": "2026-08-11T15:56:00.472Z",
   "releaseNotes": {
-    "fr": "Correction du proxy Bravo sur Android pour les sous-titres VTT/SRT.\nCorrection de l'extraction Fsvid et Vidzy pour le nouveau format Base64/XOR.",
-    "en": "Fixed the Bravo proxy on Android for VTT/SRT subtitles.\nFixed Fsvid and Vidzy extraction for the new Base64/XOR format."
+    "fr": "Correction de la lecture Android avec un User-Agent compatible pour tous les flux proxifiés.",
+    "en": "Fixed Android playback with a compatible user agent for every proxied stream."
   }
 }

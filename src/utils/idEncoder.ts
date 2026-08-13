@@ -2,40 +2,6 @@ const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 const BASE = ALPHABET.length;
 
 /**
- * Encodes bytes to Base62 using the specified alphabet
- * @param e - Array of bytes to encode
- * @returns Base62 encoded string
- */
-function encodeBytesToBase62(e: Uint8Array): string {
-  // Treat input as a big-endian base-256 big integer and long-divide by 62.
-  // Avoids BigInt so it runs on Safari <14 and other engines without BigInt.
-  if (e.length === 0) return ALPHABET[0];
-
-  let digits: number[] = Array.from(e);
-  const out: number[] = [];
-  let nonZero = false;
-  for (let i = 0; i < digits.length; i++) if (digits[i] !== 0) { nonZero = true; break; }
-  if (!nonZero) return ALPHABET[0];
-
-  while (digits.length > 0) {
-    const quotient: number[] = [];
-    let remainder = 0;
-    for (let i = 0; i < digits.length; i++) {
-      const acc = remainder * 256 + digits[i];
-      const q = Math.floor(acc / BASE);
-      remainder = acc % BASE;
-      if (quotient.length > 0 || q > 0) quotient.push(q);
-    }
-    out.push(remainder);
-    digits = quotient;
-  }
-
-  let r = "";
-  for (let i = out.length - 1; i >= 0; i--) r += ALPHABET[out[i]];
-  return r;
-}
-
-/**
  * Decodes a Base62 string back to bytes
  * @param e - Base62 encoded string
  * @returns Uint8Array of decoded bytes
@@ -66,38 +32,13 @@ function decodeBase62ToBytes(e: string): Uint8Array {
 }
 
 /**
- * Generates a random string of specified length using the Base62 alphabet
- * @param length - Length of the random string
- * @returns Random string
- */
-function generateRandomString(length: number): string {
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += ALPHABET.charAt(Math.floor(Math.random() * ALPHABET.length));
-  }
-  return result;
-}
-
-/**
- * Encodes a TMDB ID using Base62 with a random suffix
- * @param tmdbId - The TMDB ID to encode
- * @returns Encoded string with format: [base62_id][random_suffix]
+ * Formats a TMDB ID for use in frontend URLs.
+ * Historical encoded IDs remain supported by getTmdbId().
+ * @param tmdbId - The TMDB ID to format
+ * @returns The plain TMDB ID
  */
 export function encodeId(tmdbId: string | number): string {
-  const id = String(tmdbId);
-  
-  // Convert ID string to bytes
-  const encoder = new TextEncoder();
-  const bytes = encoder.encode(id);
-  
-  // Encode to Base62
-  const base62Id = encodeBytesToBase62(bytes);
-  
-  // Generate random suffix (30 characters to match example length)
-  const randomSuffix = generateRandomString(30);
-  
-  // Combine Base62 ID with random suffix
-  return base62Id + randomSuffix;
+  return String(tmdbId);
 }
 
 /**
@@ -141,7 +82,7 @@ export function decodeId(encodedId: string): string | null {
         if (/^\d+$/.test(originalId)) {
           return originalId;
         }
-      } catch (error) {
+      } catch {
         // Continue trying shorter base62 parts
         continue;
       }

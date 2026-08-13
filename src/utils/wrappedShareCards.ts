@@ -3,6 +3,7 @@
  * Données primitives en entrée (pas de dépendance aux types de page).
  */
 import { drawRoundedRectPath, wrapCanvasText, loadCanvasImage, ensureShareFonts, drawSeededStickers, mulberry32, FONT_STACK, DISPLAY_FONT } from './wrappedCanvas';
+import { DEFAULT_PUBLIC_DOMAIN } from '../i18n/currentDomain';
 
 export interface WrappedShareCardData {
     year: number;
@@ -160,7 +161,7 @@ export async function generatePosterShareImage(data: WrappedShareCardData): Prom
     center(`${data.uniqueTitles} TITRES  ·  ${data.totalSessions} SESSIONS  ·  ${data.watchTimeLabel}`, 1492);
     ctx.fillStyle = 'rgba(255,255,255,0.38)';
     ctx.font = `600 24px ${FONT_STACK}`;
-    center('movix.date', 1556);
+    center(DEFAULT_PUBLIC_DOMAIN, 1556);
 
     return toBlob(canvas);
 }
@@ -305,7 +306,7 @@ export async function generateTicketShareImage(data: WrappedShareCardData): Prom
     }
     ctx.fillStyle = inkSoft;
     ctx.font = `700 24px ${FONT_STACK}`;
-    centerInTicket('movix.date', ty + th - 66);
+    centerInTicket(DEFAULT_PUBLIC_DOMAIN, ty + th - 66);
 
     return toBlob(canvas);
 }

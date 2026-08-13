@@ -32,6 +32,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, X, Loader2, Volume1, Cast, Airplay, Settings, ArrowLeft, ExternalLink } from 'lucide-react';
 import { isExtensionAvailable, fetchFromExtension } from '../utils/extensionProxy';
 import { isLiveTvSourceEnabled, type LiveTvSourceKey } from '../utils/extractionPrefs';
+import type { VavooChannelVariant } from '../utils/vavooChannelGroups';
 import { isLowLatencyEnabled } from '../utils/lowLatencyPref';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
@@ -259,6 +260,7 @@ interface Stream {
     };
     _isEmbed?: boolean;
     _embedPath?: string;
+    _directPlay?: boolean; // Play the raw URL as-is: no proxy, no extension loader (Vavoo)
     originalUrl?: string; // Original unproxied URL for extension use (Wiflix streams)
     referer?: string;
     userAgent?: string;
@@ -290,6 +292,10 @@ interface LiveTVPlayerProps {
     channelId: string;
     channelName: string;
     channelPoster?: string;
+    // Vavoo: the grouped channel's server/quality variants. Switching one calls
+    // onSelectVavooVariant(id) — the parent swaps channelId and the player refetches.
+    vavooVariants?: VavooChannelVariant[];
+    onSelectVavooVariant?: (variantId: string) => void;
     onClose: () => void;
 }
 
@@ -357,6 +363,8 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     channelId,
     channelName,
     channelPoster,
+    vavooVariants,
+    onSelectVavooVariant,
     onClose,
 }) => {
     const { t } = useTranslation();
@@ -653,11 +661,29 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
     const API_BASE = import.meta.env.VITE_MAIN_API || 'http://localhost:25565';
     const isLiveTvChannel = channelId.startsWith('livetv_') || channelId.startsWith('daddylive_');
 
-    const fetchChannelPayload = useCallback(async (requestOptions: StreamRequestOptions = {}) => {
-        const isLinkzy = channelId.startsWith('linkzy');
-        const isMatch = channelId.startsWith('match');
+    // Lock the background page scroll while the player is open (embed iframe or
+    // video). Scroll inside the iframe still works — it's cross-origin and
+    // unaffected by locking the host page's body/html overflow.
+    useEffect(() => {
+        const prevBodyOverflow = document.body.style.overflow;
+        const prevHtmlOverflow = document.documentElement.style.overflow;
+        document.body.style.overflow = 'hidden';
+        document.documentElement.style.overflow = 'hidden';
+        const lenis = (window as Window & { lenis?: { stop: () => void; start: () => void } }).lenis;
+        lenis?.stop();
+        return () => {
+            document.body.style.overflow = prevBodyOverflow;
+            document.documentElement.style.overflow = prevHtmlOverflow;
+            lenis?.start();
+        };
+    }, []);
 
-        if (isExtensionAvailable() && !isLinkzy && !isMatch) {
+    const fetchChannelPayload = useCallback(async (requestOptions: StreamRequestOptions = {}) => {
+        const isNorthlive = channelId.startsWith('northlive');
+        const isMatch = channelId.startsWith('match');
+        const isVavoo = channelId.startsWith('vavoo');
+
+        if (isExtensionAvailable() && !isNorthlive && !isMatch && !isVavoo) {
             const srcKey = channelId.split('_')[0] as LiveTvSourceKey;
             if (!isLiveTvSourceEnabled(srcKey)) {
                 const disabledError = new Error(t('liveTV.sourceDisabledByUser', { source: srcKey })) as Error & { isDisabledByUser?: boolean };
@@ -800,13 +826,13 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                 let data: any;
                 let loaded = false;
 
-                // Fix: Linkzy et Matches doivent toujours passer par l'API locale, même si l'extension est présente
-                const isLinkzy = channelId.startsWith('linkzy');
+                // northlive et Matches doivent toujours passer par l'API locale, même si l'extension est présente
+                const isNorthlive = channelId.startsWith('northlive');
                 const isMatch = channelId.startsWith('match');
 
                 for (let attempt = 0; attempt < MAX_404_RETRIES && !loaded; attempt++) {
                     try {
-                        if (isExtensionAvailable() && !isLinkzy && !isMatch) {
+                        if (isExtensionAvailable() && !isNorthlive && !isMatch) {
                             const srcKey2 = channelId.split('_')[0] as LiveTvSourceKey;
                             if (!isLiveTvSourceEnabled(srcKey2)) {
                                 const disabledError = new Error(t('liveTV.sourceDisabledByUser', { source: srcKey2 })) as Error & { isDisabledByUser?: boolean };
@@ -935,28 +961,28 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         const isHttp = streamUrl.startsWith('http://');
         if (!streamUrl) return;
 
+        // Direct-play streams (Vavoo source): play the raw URL as-is, never proxy
+        // or route through the extension, even if the URL matches a proxy heuristic.
+        const forceDirect = currentStream._directPlay === true;
+
         // Vavoo streams typically contain "sunshine" signature or require headers that need proxy (when no extension)
-        const isVavooStream = streamUrl.includes('/sunshine/') ||
-            (streams && streams[currentStreamIndex]?.behaviorHints?.notWebReady === true);
+        const isVavooStream = !forceDirect && (streamUrl.includes('/sunshine/') ||
+            (streams && streams[currentStreamIndex]?.behaviorHints?.notWebReady === true));
 
         // Check if this is a Wiflix stream (has originalUrl from backend, or lansdrud.space/livetvde.net domain)
         const isWiflixStream = !!currentStream.originalUrl || streamUrl.includes('lansdrud.space') || streamUrl.includes('livetvde.net');
-
-        // Check if this is a Linkzy stream
-        const isLinkzyStream = streamUrl.includes('linkzy') || (currentStream?.title?.toLowerCase().includes('linkzy'));
 
         // Check if URL is already proxied (to prevent double-proxying)
         const isAlreadyProxied = streamUrl.includes('proxiesembed') || streamUrl.includes('/proxy?url=');
 
         const extensionAvailable = isExtensionAvailable();
-        // Linkzy streams should behave as if extension is missing (use proxy if needed, or direct)
-        const effectiveExtensionAvailable = isLinkzyStream ? false : extensionAvailable;
+        const effectiveExtensionAvailable = extensionAvailable;
 
         const isPageHttps = window.location.protocol === 'https:';
 
         // Determine if extension will handle this stream (via Blob proxy)
         // Wiflix streams with extension should use originalUrl (unproxied) + ExtensionLoader
-        const extensionHandlesStream = effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
+        const extensionHandlesStream = !forceDirect && effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
 
         // Force REMOTE proxy (proxiesembed) ONLY if:
         // 1. FamilyRestream/TF1 (always use remote proxy for these)
@@ -968,7 +994,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         // NOTE: If URL is already proxied, don't add another layer!
 
         const shouldForceProxy =
-            !isAlreadyProxied && !isWiflixStream && (
+            !forceDirect && !isAlreadyProxied && !isWiflixStream && (
                 isFamilyRestream ||
                 isTF1Stream ||
                 useProxy ||
@@ -980,7 +1006,6 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             streamUrl,
             isVavooStream,
             isWiflixStream,
-            isLinkzyStream,
             isAlreadyProxied,
             isHttp,
             extensionAvailable,
@@ -1152,7 +1177,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             // Use ExtensionLoader for HTTP streams, Vavoo streams, or Wiflix streams when extension is available
             // This routes ALL network requests through the extension (blob proxy)
-            const useExtensionLoader = effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
+            const useExtensionLoader = !forceDirect && effectiveExtensionAvailable && (isHttp || isVavooStream || isWiflixStream);
             if (useExtensionLoader) {
                 hlsConfig.loader = ExtensionLoader;
                 console.log("HLS: Using ExtensionLoader (Blob Proxy) for HTTP/Vavoo/Wiflix stream");
@@ -1702,6 +1727,22 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
         resetPauseState();
     };
 
+    const hasVavooVariants = !!onSelectVavooVariant && (vavooVariants?.length ?? 0) > 1;
+
+    const formatVavooVariantLabel = (variant: VavooChannelVariant): string => {
+        const parts: string[] = [];
+        if (variant.quality && variant.quality !== 'Standard') parts.push(variant.quality);
+        if (variant.server) parts.push(`${t('liveTV.server')} ${variant.server.toUpperCase()}`);
+        return parts.join(' · ') || t('liveTV.vavooStandardQuality');
+    };
+
+    const handleVavooVariantSelect = (variantId: string) => {
+        setShowSettings(false);
+        if (variantId === channelId) return;
+        // The parent swaps channelId; the fetch effect resets state and reloads.
+        onSelectVavooVariant?.(variantId);
+    };
+
     const handleLiveTvSourceSelect = useCallback((index: number) => {
         setShowSettings(false);
         setSelectedSourceIndex(index);
@@ -1874,7 +1915,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className={`fixed inset-0 z-[12000] flex items-center justify-center ${isEmbedStream ? 'bg-black/80 p-4 backdrop-blur-md sm:p-6' : 'bg-black'} ${shouldHideCursor ? 'cursor-none' : ''}`}
+            className={`fixed inset-0 z-[12000] flex items-center justify-center bg-black ${shouldHideCursor ? 'cursor-none' : ''}`}
             ref={containerRef}
             onMouseMove={isEmbedStream ? undefined : handleMouseMove}
             onClick={isEmbedStream ? undefined : handleMouseMove}
@@ -1918,29 +1959,37 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             {/* Video or Iframe */}
             {isEmbedStream ? (
-                <div className="relative w-full max-w-5xl">
-                    {/* Header bar (controls) above the centered iframe */}
+                <>
+                    {/* Fullscreen iframe — fills the whole screen on PC and mobile */}
+                    <iframe
+                        src={activeEmbedUrl}
+                        className="absolute inset-0 h-full w-full border-0"
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                        allowFullScreen
+                    />
+
+                    {/* Floating control bar overlaid on top of the iframe */}
                     {hasActiveStream && !error && (
-                        <div className="mb-3 flex items-center justify-between gap-3">
+                        <div
+                            className="pointer-events-none absolute inset-x-0 top-0 z-50 flex items-center justify-between gap-2 bg-gradient-to-b from-black/70 via-black/30 to-transparent px-3 pb-6 sm:px-4"
+                            style={{ paddingTop: 'max(0.5rem, env(safe-area-inset-top))' }}
+                        >
                             <button
                                 onClick={onClose}
-                                className="flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                className="pointer-events-auto flex items-center gap-2 rounded-lg bg-black/50 px-3 py-2 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/70"
                             >
                                 <ArrowLeft size={18} />
                                 <span className="hidden sm:inline">{t('common.back')}</span>
                             </button>
 
-                            <div className="min-w-0 text-center">
-                                <p className="text-[11px] uppercase tracking-[0.22em] text-red-400">Embed</p>
-                                <p className="truncate text-sm font-semibold text-white">
-                                    {activeStream?.title || channelName}
-                                </p>
-                            </div>
+                            <p className="min-w-0 flex-1 truncate text-center text-sm font-semibold text-white/90">
+                                {activeStream?.title || channelName}
+                            </p>
 
-                            <div className="flex items-center gap-2">
+                            <div className="pointer-events-auto flex items-center gap-1.5">
                                 <button
                                     onClick={() => window.open(activeEmbedUrl, '_blank', 'noopener,noreferrer')}
-                                    className="rounded-lg bg-white/10 p-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                    className="rounded-lg bg-black/50 p-2 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/70"
                                     title={t('watch.openInNewPage')}
                                 >
                                     <ExternalLink size={18} />
@@ -1949,17 +1998,16 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                                 {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
                                     <button
                                         onClick={() => setShowSettings(true)}
-                                        className="flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                        className="rounded-lg bg-black/50 p-2 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/70"
                                         title={t('watch.sources')}
                                     >
                                         <Settings size={18} />
-                                        <span className="hidden sm:inline">{t('watch.sources')}</span>
                                     </button>
                                 )}
 
                                 <button
                                     onClick={() => { void toggleFullscreen(); }}
-                                    className="rounded-lg bg-white/10 p-2 text-white shadow-lg transition-colors hover:bg-white/20"
+                                    className="rounded-lg bg-black/50 p-2 text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/70"
                                     title={isFullscreen ? t('watchParty.exitFullscreen') : t('watchParty.fullscreen')}
                                 >
                                     {isFullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
@@ -1967,17 +2015,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                             </div>
                         </div>
                     )}
-
-                    {/* Centered 16:9 iframe card */}
-                    <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
-                        <iframe
-                            src={activeEmbedUrl}
-                            className="absolute inset-0 h-full w-full border-0"
-                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                            allowFullScreen
-                        />
-                    </div>
-                </div>
+                </>
             ) : (
                 <video
                     ref={videoRef}
@@ -2304,7 +2342,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
                         {/* Right controls */}
                         <div className="flex items-center gap-2">
                             {/* Settings gear (server selector) — only if >1 server */}
-                            {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
+                            {(streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
                                 <motion.div
                                     whileHover={{ scale: 1.1 }}
                                     whileTap={{ scale: 0.9 }}
@@ -2373,7 +2411,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
             {/* Settings panel — slide-in right (server selector) */}
             <AnimatePresence>
-                {showSettings && (streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0)) && (
+                {showSettings && (streams.length > 1 || (isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
                     <motion.div
                         key="settings-panel"
                         initial={{ opacity: 0, width: 0 }}
@@ -2398,6 +2436,40 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
                         {/* Server list */}
                         <div className="flex-1 overflow-y-auto p-2 space-y-4" data-lenis-prevent>
+                            {hasVavooVariants && (
+                                <div>
+                                    <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">{t('liveTV.vavooServers')}</p>
+                                    <div className="space-y-1">
+                                        {vavooVariants!.map((variant) => {
+                                            const isActive = variant.id === channelId;
+
+                                            return (
+                                                <button
+                                                    key={variant.id}
+                                                    onClick={() => handleVavooVariantSelect(variant.id)}
+                                                    className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-colors cursor-pointer ${
+                                                        isActive ? 'bg-red-600/20 text-red-400' : 'text-gray-300 hover:bg-white/5'
+                                                    }`}
+                                                >
+                                                    <div className="flex items-center gap-2">
+                                                        {isActive && (
+                                                            <span className="w-2 h-2 bg-red-500 rounded-full flex-shrink-0" />
+                                                        )}
+                                                        <span className={isActive ? '' : 'ml-4'}>
+                                                            {formatVavooVariantLabel(variant)}
+                                                        </span>
+                                                        {isActive && <span className="ml-auto text-red-400">✓</span>}
+                                                    </div>
+                                                    <p className={`mt-1 text-xs ${isActive ? 'text-red-300/80' : 'text-gray-500'} ${isActive ? '' : 'ml-4'}`}>
+                                                        {variant.originalName}
+                                                    </p>
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            )}
+
                             {isLiveTvChannel && sourceOptions.length > 0 && (
                                 <div>
                                     <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">{t('watch.sources')}</p>
@@ -2435,7 +2507,7 @@ const LiveTVPlayer: React.FC<LiveTVPlayerProps> = ({
 
                             {streams.length > 1 && (
                                 <div>
-                                    {isLiveTvChannel && sourceOptions.length > 0 && (
+                                    {((isLiveTvChannel && sourceOptions.length > 0) || hasVavooVariants) && (
                                         <p className="px-2 pb-2 text-[11px] font-medium uppercase tracking-[0.2em] text-gray-500">Flux</p>
                                     )}
                                     <div className="space-y-1">

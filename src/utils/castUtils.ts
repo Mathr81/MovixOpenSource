@@ -104,6 +104,7 @@ export interface CastMediaInfo {
  */
 export interface CastSubtitleTrack {
   url: string;       // Direct WebVTT URL accessible from the receiver's network
+  contentType?: string;
   language: string;  // BCP-47 code (e.g. 'fr', 'en', 'es')
   label: string;     // Human-readable name shown in the receiver's track menu
 }
@@ -287,7 +288,7 @@ export const prepareCastMediaInfo = (
       }] : undefined
     },
     customData: {
-      currentTime: currentTime
+      currentTime: currentTime,
     }
   };
 
@@ -586,8 +587,6 @@ export const getAvailableCastOptions = (videoElement?: HTMLVideoElement): {
 /**
  * Initialize Chromecast API
  */
-const DEFAULT_CAST_APP_ID = 'CC1AD845';
-
 const getCastFrameworkContext = () => {
   const castFramework = (window as any).cast?.framework;
   if (!castFramework?.CastContext || !(window as any).chrome?.cast?.AutoJoinPolicy) {
@@ -597,18 +596,27 @@ const getCastFrameworkContext = () => {
   return castFramework.CastContext.getInstance();
 };
 
+const getDefaultCastReceiverApplicationId = (): string => {
+  return (window as any).chrome?.cast?.media?.DEFAULT_MEDIA_RECEIVER_APP_ID || '';
+};
+
 export const initializeCastApi = (): Promise<boolean> => {
   return new Promise((resolve) => {
-    if (typeof window === 'undefined' || !(window as any).chrome?.cast?.isAvailable) {
+    if (
+      typeof window === 'undefined'
+      || !(window as any).chrome?.cast?.isAvailable
+      || !getDefaultCastReceiverApplicationId()
+    ) {
       resolve(false);
       return;
     }
 
     try {
       const castContext = getCastFrameworkContext();
+      const receiverApplicationId = getDefaultCastReceiverApplicationId();
       if (castContext) {
         castContext.setOptions({
-          receiverApplicationId: DEFAULT_CAST_APP_ID,
+          receiverApplicationId,
           autoJoinPolicy: (window as any).chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
         });
         console.log('Cast Framework initialized successfully');
@@ -616,8 +624,7 @@ export const initializeCastApi = (): Promise<boolean> => {
         return;
       }
 
-      const applicationID = DEFAULT_CAST_APP_ID;
-      const sessionRequest = new (window as any).chrome.cast.SessionRequest(applicationID);
+      const sessionRequest = new (window as any).chrome.cast.SessionRequest(receiverApplicationId);
       const apiConfig = new (window as any).chrome.cast.ApiConfig(
         sessionRequest,
         () => {
@@ -727,9 +734,19 @@ export const getHLSContentTypes = (_url: string): string[] => [
  * Get candidate content types for a given media URL — HLS gets multiple,
  * other formats get exactly one.
  */
-const getCastContentTypes = (mediaUrl: string): string[] => {
+const getCastContentTypes = (mediaUrl: string, explicitContentType?: string): string[] => {
+  const normalizedExplicitType = explicitContentType?.trim().toLowerCase();
+  if (normalizedExplicitType === 'video/mp4') return ['video/mp4'];
+  if (normalizedExplicitType === 'text/html') return ['text/html'];
+  const hlsContentTypes = getHLSContentTypes(mediaUrl);
+  if (normalizedExplicitType && hlsContentTypes.some(type => type.toLowerCase() === normalizedExplicitType)) {
+    return [
+      explicitContentType!,
+      ...hlsContentTypes.filter(type => type !== explicitContentType),
+    ];
+  }
   const mediaType = detectMediaType(mediaUrl);
-  if (mediaType === 'm3u8') return getHLSContentTypes(mediaUrl);
+  if (mediaType === 'm3u8') return hlsContentTypes;
   if (mediaType === 'mp4')  return ['video/mp4'];
   if (mediaType === 'html') return ['text/html'];
   return ['application/x-mpegURL'];
@@ -753,8 +770,9 @@ export const loadMediaOnCastWithFallback = async (
   subtitles: CastSubtitleTrack[] = [],
   enableSubtitlesInitially: boolean = false,
   streamType: string = 'BUFFERED',
+  explicitContentType?: string,
 ): Promise<void> => {
-  const contentTypes = getCastContentTypes(mediaUrl);
+  const contentTypes = getCastContentTypes(mediaUrl, explicitContentType);
   const baseMediaInfo = prepareCastMediaInfo(mediaUrl, title, poster, currentTime, streamType);
 
   // Attach external subtitle tracks if any. The Default Media Receiver only
@@ -767,7 +785,7 @@ export const loadMediaOnCastWithFallback = async (
       const tracks = subtitles.map((sub, idx) => {
         const track = new castMediaApi.Track(idx + 1, castMediaApi.TrackType?.TEXT ?? 'TEXT');
         track.trackContentId = sub.url;
-        track.trackContentType = 'text/vtt';
+        track.trackContentType = sub.contentType || 'text/vtt';
         track.subtype = castMediaApi.TextTrackType?.SUBTITLES ?? 'SUBTITLES';
         track.name = sub.label;
         track.language = sub.language;

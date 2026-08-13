@@ -347,7 +347,7 @@ const SharedListsCatalogPage: React.FC = () => {
               <div className="flex flex-col xl:flex-row gap-4 xl:items-center xl:justify-between">
                 <div className="flex-1">
                   <div className="relative">
-                    <Search className="w-4 h-4 text-white/35 absolute left-3 top-1/2 -translate-y-1/2" />
+          <Search className="w-4 h-4 text-white opacity-[0.35] absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
@@ -361,7 +361,7 @@ const SharedListsCatalogPage: React.FC = () => {
                   <Select value={sortBy} onValueChange={(value) => setSortBy(value as SharedListSort)}>
                     <SelectTrigger className="min-w-[220px] bg-black/60 border-white/15 hover:border-white/20 focus:ring-indigo-500/50">
                       <div className="flex items-center gap-2 min-w-0">
-                        <ArrowUpDown className="w-4 h-4 text-white/35 shrink-0" />
+          <ArrowUpDown className="w-4 h-4 text-white opacity-[0.35] shrink-0" />
                         <SelectValue placeholder={sortOptions.find((option) => option.key === sortBy)?.label || t('lists.sortRecent')} />
                       </div>
                     </SelectTrigger>

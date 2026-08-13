@@ -149,7 +149,14 @@ const Search: React.FC = () => {
         loadingProviders,
         sortBy,
         setSortBy,
+        ensureFiltersLoaded,
     } = useSearch();
+
+    // Perf : les genres + providers TMDB ne sont plus chargés au boot de l'app,
+    // mais à la demande au premier montage de la page Search
+    useEffect(() => {
+        ensureFiltersLoaded();
+    }, [ensureFiltersLoaded]);
 
     // Scroll to results top after page change finishes loading
     useEffect(() => {
@@ -595,7 +602,7 @@ const Search: React.FC = () => {
                             <form onSubmit={handleSubmit} className="space-y-4">
                                 <div className="relative">
                                     <div className="flex bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl overflow-hidden">
-                                        <SearchIcon size={20} className="self-center ml-4 text-white/40 shrink-0" />
+                        <SearchIcon size={20} className="self-center ml-4 text-white opacity-40 shrink-0" />
                                         <input
                                             ref={searchInputRef}
                                             type="text"
@@ -643,7 +650,7 @@ const Search: React.FC = () => {
                                             >
                                                 {loadingAutocomplete ? (
                                                     <div className="flex items-center justify-center p-4">
-                                                        <Loader className="w-5 h-5 text-white/40 animate-spin" />
+                                    <Loader className="w-5 h-5 text-white opacity-40 animate-spin" />
                                                         <span className="ml-2 text-sm text-white/40">{t('search.searching')}</span>
                                                     </div>
                                                 ) : (
@@ -839,7 +846,7 @@ const Search: React.FC = () => {
                                             </div>
                                             {loadingProviders ? (
                                                 <div className="flex items-center gap-2 py-4">
-                                                    <Loader className="w-4 h-4 text-white/40 animate-spin" />
+                                            <Loader className="w-4 h-4 text-white opacity-40 animate-spin" />
                                                     <span className="text-sm text-white/40">{t('search.searching')}</span>
                                                 </div>
                                             ) : (
@@ -929,7 +936,7 @@ const Search: React.FC = () => {
                                                         >
                                                             {loadingKeywordSuggestions ? (
                                                                 <div className="flex items-center justify-center p-4">
-                                                                    <Loader className="w-5 h-5 text-white/40 animate-spin" />
+                                <Loader className="w-5 h-5 text-white opacity-40 animate-spin" />
                                                                     <span className="ml-2 text-sm text-white/40">{t('search.searching')}</span>
                                                                 </div>
                                                             ) : keywordSuggestions.length > 0 ? (
@@ -941,7 +948,7 @@ const Search: React.FC = () => {
                                                                             onClick={() => handleSelectKeyword(keyword)}
                                                                             className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left"
                                                                         >
-                                                                            <Tag size={16} className="text-white/40" />
+                                    <Tag size={16} className="text-white opacity-40" />
                                                                             <span className="text-sm font-medium">{keyword.name}</span>
                                                                         </button>
                                                                     ))}
@@ -1017,7 +1024,7 @@ const Search: React.FC = () => {
                                                             >
                                                                 {loadingSuggestions ? (
                                                                     <div className="flex items-center justify-center p-4">
-                                                                        <Loader className="w-5 h-5 text-white/40 animate-spin" />
+                                    <Loader className="w-5 h-5 text-white opacity-40 animate-spin" />
                                                                         <span className="ml-2 text-sm text-white/40">{t('search.searching')}</span>
                                                                     </div>
                                                                 ) : (
@@ -1037,7 +1044,7 @@ const Search: React.FC = () => {
                                                                                     />
                                                                                 ) : (
                                                                                     <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center">
-                                                                                        <User size={16} className="text-white/40" />
+                                                <User size={16} className="text-white opacity-40" />
                                                                                     </div>
                                                                                 )}
                                                                                 <div className="flex-1">
@@ -1045,7 +1052,7 @@ const Search: React.FC = () => {
                                                                                     <div className="text-xs text-white/40">{person.known_for_department}</div>
                                                                                 </div>
                                                                                 <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-                                                                                    <ExternalLink size={14} className="text-white/40" />
+                                                <ExternalLink size={14} className="text-white opacity-40" />
                                                                                 </div>
                                                                             </div>
                                                                         ))}
@@ -1095,7 +1102,7 @@ const Search: React.FC = () => {
                                                             >
                                                                 {loadingSuggestions ? (
                                                                     <div className="flex items-center justify-center p-4">
-                                                                        <Loader className="w-5 h-5 text-white/40 animate-spin" />
+                                    <Loader className="w-5 h-5 text-white opacity-40 animate-spin" />
                                                                         <span className="ml-2 text-sm text-white/40">{t('search.searching')}</span>
                                                                     </div>
                                                                 ) : (
@@ -1115,7 +1122,7 @@ const Search: React.FC = () => {
                                                                                     />
                                                                                 ) : (
                                                                                     <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center">
-                                                                                        <User size={16} className="text-white/40" />
+                                                <User size={16} className="text-white opacity-40" />
                                                                                     </div>
                                                                                 )}
                                                                                 <div className="flex-1">
@@ -1123,7 +1130,7 @@ const Search: React.FC = () => {
                                                                                     <div className="text-xs text-white/40">{person.known_for_department}</div>
                                                                                 </div>
                                                                                 <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-                                                                                    <ExternalLink size={14} className="text-white/40" />
+                                                <ExternalLink size={14} className="text-white opacity-40" />
                                                                                 </div>
                                                                             </div>
                                                                         ))}

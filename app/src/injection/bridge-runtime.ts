@@ -124,18 +124,25 @@ export function buildBridgeRuntime(): string {
       throw new Error('Native WebView fetch unavailable');
     }
 
+    var upstreamHeaders = {};
+    var originalHeaders = details.headers || {};
+    for (var upstreamKey in originalHeaders) {
+      if (!/^(?:accept|range)$/i.test(upstreamKey)) {
+        upstreamHeaders[upstreamKey] = originalHeaders[upstreamKey];
+      }
+    }
+
     var openResponse = await bridgeRequest({
       type: 'GM_OPEN_MEDIA_PROXY',
       url: details.url,
       method: (details.method || 'GET').toUpperCase(),
-      headers: details.headers || {}
+      headers: upstreamHeaders
     });
     if (!openResponse.success || typeof openResponse.value !== 'string') {
       throw new Error(openResponse.error || 'Local media proxy unavailable');
     }
 
     var localHeaders = {};
-    var originalHeaders = details.headers || {};
     for (var key in originalHeaders) {
       if (/^(?:accept|range)$/i.test(key)) {
         localHeaders[key] = originalHeaders[key];
@@ -259,6 +266,19 @@ export function buildBridgeRuntime(): string {
     };
   }
 
+  async function GM_openMediaProxy(details) {
+    var openResponse = await bridgeRequest({
+      type: 'GM_OPEN_MEDIA_PROXY',
+      url: details.url,
+      method: (details.method || 'GET').toUpperCase(),
+      headers: details.headers || {}
+    });
+    if (!openResponse.success || typeof openResponse.value !== 'string') {
+      throw new Error(openResponse.error || 'Local media proxy unavailable');
+    }
+    return openResponse.value;
+  }
+
   // --- GM_getValue / GM_setValue / GM_deleteValue ---
   // Version synchrone avec cache local + sync async vers le natif
   var _storageCache = {};
@@ -296,6 +316,7 @@ export function buildBridgeRuntime(): string {
 
   // --- Exposition globale ---
   window.GM_xmlhttpRequest = GM_xmlhttpRequest;
+  window.GM_openMediaProxy = GM_openMediaProxy;
   window.GM_getValue = GM_getValue;
   window.GM_setValue = GM_setValue;
   window.GM_deleteValue = GM_deleteValue;
@@ -303,6 +324,7 @@ export function buildBridgeRuntime(): string {
   // GM.* API (Greasemonkey 4+ compat)
   window.GM = {
     xmlHttpRequest: GM_xmlhttpRequest,
+    openMediaProxy: GM_openMediaProxy,
     getValue: function(key, defaultValue) {
       return Promise.resolve(GM_getValue(key, defaultValue));
     },

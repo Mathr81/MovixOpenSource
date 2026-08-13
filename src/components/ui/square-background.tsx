@@ -32,6 +32,14 @@ const OFFSCREEN_COORD = -1000;
 const HALO_SIZE = 400;
 const HALO_HALF_SIZE = HALO_SIZE / 2;
 const HALO_HIDDEN_TRANSLATE = -1200;
+// Borne le backing store du canvas grille à N hauteurs de viewport au lieu de
+// toute la hauteur scrollable du container (potentiellement plusieurs
+// milliers de px sur une page comme Home). Le canvas est repositionné par
+// translation CSS pendant le scroll (cf. updateCanvasWindow) ; la grille étant
+// un motif périodique, un repositionnement aligné sur un multiple de la
+// taille de cellule ne laisse aucune couture visible.
+const CANVAS_HEIGHT_VIEWPORT_MULTIPLIER = 3;
+const RESIZE_REDRAW_DEBOUNCE_MS = 150;
 
 export const SquareBackground: React.FC<SquareBackgroundProps> = ({
     children,
@@ -177,10 +185,38 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
             }
         };
 
+        // Rect du container mis en cache : rafraîchi uniquement via scroll/resize
+        // (rAF-throttlé plus bas), jamais lu directement dans handlePointerMove
+        // (qui peut tirer des dizaines de fois/seconde) — évite un layout read
+        // forcé à chaque mouvement de souris sur toute la page.
+        let containerRect = { top: 0, left: 0, width: 0, height: 0 };
+        const refreshContainerRect = () => {
+            const r = container.getBoundingClientRect();
+            containerRect = { top: r.top, left: r.left, width: r.width, height: r.height };
+        };
+
+        // Fenêtrage du canvas (cf. CANVAS_HEIGHT_VIEWPORT_MULTIPLIER) : le
+        // backing store ne couvre qu'une portion de la hauteur totale du
+        // container sur les pages très longues, et se déplace par translation
+        // CSS pendant le scroll au lieu de couvrir toute la page.
+        let windowTop = 0;
+        let windowHeight = 0;
+
+        const computeWindowHeight = (containerHeight: number) => {
+            const maxHeight = Math.max(1, Math.round(window.innerHeight * CANVAS_HEIGHT_VIEWPORT_MULTIPLIER));
+            return Math.max(1, Math.min(Math.round(containerHeight), maxHeight));
+        };
+
+        const isWindowed = () => windowHeight < Math.round(containerRect.height);
+
+        const applyCanvasTransform = () => {
+            canvas.style.transform = windowTop ? `translateY(${windowTop}px)` : '';
+        };
+
         const syncSize = () => {
-            const { width, height } = container.getBoundingClientRect();
-            const nextWidth = Math.max(1, Math.round(width));
-            const nextHeight = Math.max(1, Math.round(height));
+            const nextWidth = Math.max(1, Math.round(containerRect.width));
+            windowHeight = computeWindowHeight(containerRect.height);
+            const nextHeight = windowHeight;
 
             if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
                 canvas.width = nextWidth;
@@ -196,6 +232,72 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
                     ctx.drawImage(gridCanvas, 0, 0);
                 }
             }
+        };
+
+        // Repeint la fenêtre depuis le motif de base déjà en cache (pas de
+        // régénération : dimensions/couleur inchangées, seule la position
+        // affichée bouge) — utilisé après un repositionnement de fenêtre.
+        const paintGridFromCache = () => {
+            const width = canvas.width;
+            const height = canvas.height;
+            if (width <= 0 || height <= 0) return;
+            const cell = squareSizeRef.current;
+            const numCols = Math.ceil(width / cell);
+            const numRows = Math.ceil(height / cell);
+            const gridCanvas = drawBaseGrid(width, height, cell, numCols, numRows);
+            if (gridCanvas) {
+                ctx.clearRect(0, 0, width, height);
+                ctx.drawImage(gridCanvas, 0, 0);
+            }
+            state.dirtyCells = [];
+        };
+
+        // Repositionne la fenêtre canvas pour qu'elle couvre le viewport
+        // visible + marge, alignée sur un multiple de squareSize pour que la
+        // grille (motif périodique) ne saute pas visuellement. Appelé au plus
+        // une fois par frame (throttle rAF côté scroll/resize) et ne repeint
+        // que quand un repositionnement est réellement nécessaire.
+        const updateCanvasWindow = () => {
+            if (!isWindowed()) {
+                if (windowTop !== 0) {
+                    windowTop = 0;
+                    applyCanvasTransform();
+                }
+                return;
+            }
+
+            const cell = squareSizeRef.current;
+            const containerHeight = containerRect.height;
+            const viewportTopInContainer = -containerRect.top;
+            const viewportBottomInContainer = viewportTopInContainer + window.innerHeight;
+            const margin = window.innerHeight * 0.25;
+
+            const withinWindow =
+                viewportTopInContainer >= windowTop + margin &&
+                viewportBottomInContainer <= windowTop + windowHeight - margin;
+
+            if (withinWindow) return;
+
+            const idealTop = viewportTopInContainer - (windowHeight - window.innerHeight) / 2;
+            const maxTop = Math.max(0, containerHeight - windowHeight);
+            const clampedTop = Math.min(maxTop, Math.max(0, idealTop));
+            const nextWindowTop = Math.round(clampedTop / cell) * cell;
+
+            if (nextWindowTop === windowTop) return;
+
+            windowTop = nextWindowTop;
+            applyCanvasTransform();
+
+            // La grille de base est un motif périodique invariant par
+            // translation : pas besoin de la régénérer. Les interactions en
+            // cours (cellule survolée, particules en fondu) référencent des
+            // coordonnées locales à l'ancienne fenêtre — on les réinitialise
+            // plutôt que de les remapper (particules déjà en fondu, impact
+            // visuel négligeable).
+            state.neighbors = [];
+            state.currentRow = -2;
+            state.currentCol = -2;
+            paintGridFromCache();
         };
 
         const getGridMetrics = () => {
@@ -350,9 +452,12 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
         };
 
         const handlePointerMove = (e: PointerEvent) => {
-            const rect = container.getBoundingClientRect();
-            state.mouseX = e.clientX - rect.left;
-            state.mouseY = e.clientY - rect.top;
+            // Rect en cache (cf. refreshContainerRect) au lieu d'un
+            // getBoundingClientRect() par mouvement de souris : cet handler
+            // peut tirer des dizaines de fois/seconde, un layout read à chaque
+            // fois serait un forced reflow répété sur toute la page.
+            state.mouseX = e.clientX - containerRect.left;
+            state.mouseY = (e.clientY - containerRect.top) - windowTop;
             scheduleRender();
         };
 
@@ -378,14 +483,15 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
                 return;
             }
 
-            const rect = container.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-            if (mouseX < 0 || mouseX > rect.width || mouseY < 0 || mouseY > rect.height) return;
+            // Rect en cache + compensation de la fenêtre canvas (cf.
+            // handlePointerMove) plutôt qu'un getBoundingClientRect() direct.
+            const mouseX = e.clientX - containerRect.left;
+            const mouseY = (e.clientY - containerRect.top) - windowTop;
+            if (mouseX < 0 || mouseX > canvas.width || mouseY < 0 || mouseY > canvas.height) return;
 
             const cell = squareSizeRef.current;
-            const numCols = Math.ceil(rect.width / cell);
-            const numRows = Math.ceil(rect.height / cell);
+            const numCols = Math.ceil(canvas.width / cell);
+            const numRows = Math.ceil(canvas.height / cell);
             const col = Math.max(0, Math.min(numCols - 1, Math.floor(mouseX / cell)));
             const row = Math.max(0, Math.min(numRows - 1, Math.floor(mouseY / cell)));
 
@@ -429,9 +535,39 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
                 }
             }, { threshold: 0.01 });
 
+        // rAF-throttle du rafraîchissement du rect : au plus une fois par
+        // frame pendant un scroll/resize, jamais par event brut.
+        let rectRafId = 0;
+        const scheduleRectRefresh = () => {
+            if (rectRafId) return;
+            rectRafId = requestAnimationFrame(() => {
+                rectRafId = 0;
+                refreshContainerRect();
+                // No-op si les dimensions n'ont pas changé (guard interne) :
+                // couvre le cas resize fenêtre (innerHeight change le calcul du
+                // cap) sans coût significatif pendant un simple scroll.
+                syncSize();
+                updateCanvasWindow();
+            });
+        };
+
+        // Debounce (~150ms) : sur Home, les LazySection montent des rows en
+        // rafale pendant le scroll, ce qui fait grandir le container et
+        // déclenche le ResizeObserver en rafale. Sans debounce, chaque tick
+        // relance un resize + repaint complet de la grille pendant le scroll —
+        // exactement le moment où on veut le moins de travail main-thread.
+        let resizeDebounceId: number | undefined;
         const resizeObserver = new ResizeObserver(() => {
-            syncSize();
-            renderOnce();
+            if (resizeDebounceId !== undefined) {
+                window.clearTimeout(resizeDebounceId);
+            }
+            resizeDebounceId = window.setTimeout(() => {
+                resizeDebounceId = undefined;
+                refreshContainerRect();
+                syncSize();
+                updateCanvasWindow();
+                renderOnce();
+            }, RESIZE_REDRAW_DEBOUNCE_MS);
         });
 
         // Force un repaint complet de la grille au mount / quand l'effet
@@ -456,7 +592,9 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
             state.dirtyCells = [];
         };
 
+        refreshContainerRect();
         syncSize();
+        updateCanvasWindow();
         forceFullPaint();
         renderOnce();
 
@@ -466,15 +604,29 @@ export const SquareBackground: React.FC<SquareBackgroundProps> = ({
         container.addEventListener('pointerleave', handlePointerLeave);
         container.addEventListener('pointerdown', handlePointerDown);
         document.addEventListener('visibilitychange', handleVisibilityChange);
+        // Repositionne la fenêtre canvas pendant le scroll (throttlé rAF) ;
+        // resize fenêtre = window.innerHeight change, ce qui affecte le calcul
+        // de windowHeight/windowTop indépendamment du ResizeObserver (qui, lui,
+        // observe la boîte du container, pas le viewport).
+        window.addEventListener('scroll', scheduleRectRefresh, { passive: true });
+        window.addEventListener('resize', scheduleRectRefresh, { passive: true });
 
         return () => {
             cancelScheduledFrame();
+            if (rectRafId) {
+                cancelAnimationFrame(rectRafId);
+            }
+            if (resizeDebounceId !== undefined) {
+                window.clearTimeout(resizeDebounceId);
+            }
             resizeObserver.disconnect();
             viewportObserver?.disconnect();
             container.removeEventListener('pointermove', handlePointerMove);
             container.removeEventListener('pointerleave', handlePointerLeave);
             container.removeEventListener('pointerdown', handlePointerDown);
             document.removeEventListener('visibilitychange', handleVisibilityChange);
+            window.removeEventListener('scroll', scheduleRectRefresh);
+            window.removeEventListener('resize', scheduleRectRefresh);
         };
     }, [showCanvas, squareSize, borderColor]);
 

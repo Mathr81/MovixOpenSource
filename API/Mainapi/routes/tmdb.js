@@ -13,6 +13,8 @@ const path = require('path');
 const fsp = require('fs').promises;
 const { CACHE_DIR, generateCacheKey } = require('../utils/cacheManager');
 const { fetchTmdbDetails, searchTmdb } = require('../utils/tmdbCache');
+const { acquireRedisLock } = require('../utils/redisLock');
+const { COFLIX_ENABLED } = require('./coflix');
 const {
   applyCloneUrlsToPlayerLinks,
   syncCloneLinksForPlayerLinks
@@ -64,6 +66,60 @@ function configure(deps) {
   if (deps.extractSeriesInfo) extractSeriesInfo = deps.extractSeriesInfo;
   if (deps.mergeSeriesParts) mergeSeriesParts = deps.mergeSeriesParts;
   if (deps.cleanTvCacheData) cleanTvCacheData = deps.cleanTvCacheData;
+}
+
+function hasPlayableCoflixResult(data, type) {
+  if (!data || typeof data !== 'object') return false;
+
+  if (type === 'movie') {
+    return Array.isArray(data.player_links) && data.player_links.length > 0;
+  }
+
+  if (type === 'tv') {
+    return Array.isArray(data.current_episode?.player_links) &&
+      data.current_episode.player_links.length > 0;
+  }
+
+  return false;
+}
+
+async function saveCoflixCachePreservingPlayable(cacheKey, type, candidate) {
+  const candidateIsPlayable = hasPlayableCoflixResult(candidate, type);
+  const shouldPreserveLatestCache = (latestCache) => {
+    if (!hasPlayableCoflixResult(latestCache, type)) {
+      return false;
+    }
+
+    if (!candidateIsPlayable) {
+      return true;
+    }
+
+    const latestRefreshedAt = Number(latestCache._coflixRefreshedAt) || 0;
+    const candidateRefreshedAt = Number(candidate?._coflixRefreshedAt) || 0;
+    return latestRefreshedAt > candidateRefreshedAt;
+  };
+  const lock = await acquireRedisLock(`coflix-cache-write:${cacheKey}`, {
+    ttl: 10,
+    retries: 20,
+    retryDelay: 50,
+  });
+
+  if (!lock) {
+    console.warn(`[COFLIX CACHE] Ecriture ignoree sans verrou pour ${cacheKey}`);
+    return false;
+  }
+
+  try {
+    const latestCache = await getFromCacheNoExpiration(CACHE_DIR.COFLIX, cacheKey);
+    if (shouldPreserveLatestCache(latestCache)) {
+      return false;
+    }
+
+    await saveToCache(CACHE_DIR.COFLIX, cacheKey, candidate);
+    return true;
+  } finally {
+    await lock.release();
+  }
 }
 
 function getCloneScope(type, id, season, episode) {
@@ -315,6 +371,7 @@ router.get('/tmdb/:type/:id', async (req, res) => {
   try {
     // 1. Verifier le cache sans expiration (stale-while-revalidate)
     const cachedData = await getFromCacheNoExpiration(CACHE_DIR.COFLIX, cacheKey);
+    const hasPlayableCachedData = hasPlayableCoflixResult(cachedData, type);
     let dataReturned = false;
     if (cachedData) {
       const cachedDataWithClones = await applyCloneUrlsToTmdbResult(cachedData, type, id, season, episode);
@@ -325,7 +382,12 @@ router.get('/tmdb/:type/:id', async (req, res) => {
       (async () => {
         try {
           const cachedCloneSync = await syncCloneUrlsOnTmdbResult(cachedDataWithClones, type, id, season, episode);
-          await saveToCache(CACHE_DIR.COFLIX, cacheKey, cachedCloneSync);
+          await saveCoflixCachePreservingPlayable(cacheKey, type, cachedCloneSync);
+
+          // Coflix desactive : pas de refresh background
+          if (!COFLIX_ENABLED) {
+            return;
+          }
 
           // Verifier si le dernier vrai refresh Coflix date de plus de 2h
           const refreshedAt = cachedCloneSync._coflixRefreshedAt || 0;
@@ -343,6 +405,15 @@ router.get('/tmdb/:type/:id', async (req, res) => {
     // 3. Fonction pour recuperer les donnees fraiches et mettre a jour le cache
     const updateCache = async () => {
       try {
+        // Coflix desactive : pas de fetch frais, et on ne pollue pas le cache
+        // avec des "Contenu non disponible" qui persisteraient au réveil.
+        if (!COFLIX_ENABLED) {
+          if (!dataReturned) {
+            res.status(200).json({ message: 'Contenu non disponible', tmdb_id: id });
+          }
+          return;
+        }
+
         // Verifier que le type est valide
         if (type !== 'movie' && type !== 'tv') {
           if (!dataReturned) {
@@ -437,7 +508,9 @@ router.get('/tmdb/:type/:id', async (req, res) => {
             tmdb_details: tmdbDetails,
             _coflixRefreshedAt: Date.now(),
           };
-          await saveToCache(CACHE_DIR.COFLIX, cacheKey, unavailableResult);
+          if (!hasPlayableCachedData) {
+            await saveCoflixCachePreservingPlayable(cacheKey, type, unavailableResult);
+          }
           if (!dataReturned) {
             res.status(200).json(filterEmmmmbedReaders(unavailableResult));
           }
@@ -475,8 +548,8 @@ router.get('/tmdb/:type/:id', async (req, res) => {
         const isEmptyResult = (type === 'movie' && (!result.player_links || result.player_links.length === 0)) ||
           (type === 'tv' && (!result.seasons || result.seasons.length === 0));
 
-        if (!isEmptyResult || !dataReturned) {
-          await saveToCache(CACHE_DIR.COFLIX, cacheKey, result);
+        if (!isEmptyResult || !hasPlayableCachedData) {
+          await saveCoflixCachePreservingPlayable(cacheKey, type, result);
         }
 
         // Si les donnees n'avaient pas ete retournees initialement, les retourner maintenant

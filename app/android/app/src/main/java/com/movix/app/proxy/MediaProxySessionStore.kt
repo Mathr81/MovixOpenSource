@@ -1,13 +1,43 @@
 package com.movix.app.proxy
 
+import android.util.Base64
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.Base64
+import java.util.Collections
 
-internal data class MediaProxyTarget(
+internal class MediaProxyTarget(
     val upstreamUrl: String,
     val method: String,
-    val headers: Map<String, String>,
+    headers: Map<String, String>,
+) {
+    val headers: Map<String, String> =
+        Collections.unmodifiableMap(LinkedHashMap(headers))
+
+    override fun toString(): String {
+        return "MediaProxyTarget(method=$method, headers=${headers.keys}, redacted=true)"
+    }
+}
+
+internal class MediaProxyPreparedResponse(
+    val statusCode: Int,
+    val statusMessage: String,
+    headers: Map<String, String>,
+    body: ByteArray,
+    val finalUrl: String,
+) {
+    val headers: Map<String, String> =
+        Collections.unmodifiableMap(LinkedHashMap(headers))
+    val body: ByteArray = body.copyOf()
+
+    override fun toString(): String {
+        return "MediaProxyPreparedResponse(statusCode=$statusCode, bytes=${body.size}, redacted=true)"
+    }
+}
+
+internal data class MediaProxySessionRegistration(
+    val sessionId: String,
+    val resourceId: String,
+    val localUrl: String,
 )
 
 internal class MediaProxySessionStore(
@@ -18,11 +48,27 @@ internal class MediaProxySessionStore(
     private val maxSessions: Int = DEFAULT_MAX_SESSIONS,
     private val maxResourcesPerSession: Int = DEFAULT_MAX_RESOURCES,
 ) {
-    private data class Session(
+    private data class Resource(
+        val target: MediaProxyTarget,
+        var preparedResponse: MediaProxyPreparedResponse? = null,
+        var persistentPreparedResponse: Boolean = false,
+    )
+
+    private data class ResourceKey(
+        val upstreamUrl: String,
+        val method: String,
         val headers: Map<String, String>,
-        val resources: LinkedHashMap<String, MediaProxyTarget> = linkedMapOf(),
-        val resourceIdsByUrl: MutableMap<String, String> = mutableMapOf(),
+    )
+
+    private data class Session(
+        val access: MediaProxySessionAccess,
+        val headers: Map<String, String>,
+        val profile: CastMediaProfile?,
+        val root: MediaProxyTarget,
+        val resources: LinkedHashMap<String, Resource> = linkedMapOf(),
+        val resourceIdsByKey: MutableMap<ResourceKey, String> = mutableMapOf(),
         var lastAccessAt: Long,
+        var graceExpiresAt: Long? = null,
     )
 
     private val lock = Any()
@@ -33,7 +79,48 @@ internal class MediaProxySessionStore(
         method: String,
         headers: Map<String, String>,
         port: Int,
-    ): String = synchronized(lock) {
+    ): String = createSession(
+        upstreamUrl = upstreamUrl,
+        method = method,
+        headers = headers,
+        port = port,
+        access = MediaProxySessionAccess.loopback(),
+        profile = null,
+        preparedResponse = null,
+    ).localUrl
+
+    fun createCast(
+        upstreamUrl: String,
+        method: String,
+        headers: Map<String, String>,
+        port: Int,
+        access: MediaProxySessionAccess,
+        profile: CastMediaProfile,
+        preparedResponse: MediaProxyPreparedResponse? = null,
+    ): MediaProxySessionRegistration {
+        require(access.mode == MediaProxyMode.CAST_LAN) {
+            "Cast session access required"
+        }
+        return createSession(
+            upstreamUrl,
+            method,
+            headers,
+            port,
+            access,
+            profile,
+            preparedResponse,
+        )
+    }
+
+    private fun createSession(
+        upstreamUrl: String,
+        method: String,
+        headers: Map<String, String>,
+        port: Int,
+        access: MediaProxySessionAccess,
+        profile: CastMediaProfile?,
+        preparedResponse: MediaProxyPreparedResponse?,
+    ): MediaProxySessionRegistration = synchronized(lock) {
         cleanupExpiredLocked()
         while (sessions.size >= maxSessions) {
             val oldestId = sessions.minByOrNull { it.value.lastAccessAt }?.key ?: break
@@ -42,18 +129,24 @@ internal class MediaProxySessionStore(
 
         val sessionId = uniqueSessionIdLocked()
         val resourceId = tokenFactory()
-        val normalizedMethod = method.uppercase()
-        val copiedHeaders = headers.toMap()
-        val root = MediaProxyTarget(upstreamUrl, normalizedMethod, copiedHeaders)
-        val session = Session(headers = copiedHeaders, lastAccessAt = now())
-        session.resources[resourceId] = root
-        session.resourceIdsByUrl[upstreamUrl] = resourceId
+        val copiedHeaders = immutableHeaders(headers)
+        val root = MediaProxyTarget(upstreamUrl, method.uppercase(), copiedHeaders)
+        val session = Session(
+            access = access,
+            headers = copiedHeaders,
+            profile = profile,
+            root = root,
+            lastAccessAt = now(),
+        )
+        session.resources[resourceId] = Resource(root, preparedResponse)
+        session.resourceIdsByKey[
+            ResourceKey(upstreamUrl, root.method, root.headers)
+        ] = resourceId
         sessions[sessionId] = session
-        MediaProxyPolicy.buildLoopbackUrl(
-            port,
-            processSecret,
+        MediaProxySessionRegistration(
             sessionId,
             resourceId,
+            buildLocalUrl(access, port, sessionId, resourceId),
         )
     }
 
@@ -61,18 +154,41 @@ internal class MediaProxySessionStore(
         sessionId: String,
         upstreamUrl: String,
         port: Int,
-    ): String = synchronized(lock) {
+    ): String = registerResource(sessionId, upstreamUrl, port).localUrl
+
+    fun registerResource(
+        sessionId: String,
+        upstreamUrl: String,
+        port: Int,
+        method: String = "GET",
+        preparedResponse: MediaProxyPreparedResponse? = null,
+        headers: Map<String, String>? = null,
+    ): MediaProxySessionRegistration = synchronized(lock) {
         cleanupExpiredLocked()
         val session = sessions[sessionId]
             ?: throw IllegalArgumentException("Unknown media proxy session")
         session.lastAccessAt = now()
-        val existingId = session.resourceIdsByUrl[upstreamUrl]
+        val normalizedMethod = method.uppercase()
+        val resourceHeaders = immutableHeaders(
+            headers?.let(MediaProxyPolicy::sanitizeRequestHeaders) ?: session.headers,
+        )
+        val resourceKey = ResourceKey(
+            upstreamUrl,
+            normalizedMethod,
+            resourceHeaders,
+        )
+        val existingId = session.resourceIdsByKey[resourceKey]
         if (existingId != null) {
-            return@synchronized MediaProxyPolicy.buildLoopbackUrl(
-                port,
-                processSecret,
+            if (preparedResponse != null) {
+                session.resources[existingId]?.let { resource ->
+                    resource.preparedResponse = preparedResponse
+                    resource.persistentPreparedResponse = false
+                }
+            }
+            return@synchronized MediaProxySessionRegistration(
                 sessionId,
                 existingId,
+                buildLocalUrl(session.access, port, sessionId, existingId),
             )
         }
         require(session.resources.size < maxResourcesPerSession) {
@@ -80,18 +196,71 @@ internal class MediaProxySessionStore(
         }
 
         val resourceId = uniqueResourceIdLocked(session)
-        session.resources[resourceId] = MediaProxyTarget(
-            upstreamUrl = upstreamUrl,
-            method = "GET",
-            headers = session.headers,
+        session.resources[resourceId] = Resource(
+            target = MediaProxyTarget(
+                upstreamUrl = upstreamUrl,
+                method = normalizedMethod,
+                headers = resourceHeaders,
+            ),
+            preparedResponse = preparedResponse,
         )
-        session.resourceIdsByUrl[upstreamUrl] = resourceId
-        MediaProxyPolicy.buildLoopbackUrl(
-            port,
-            processSecret,
+        session.resourceIdsByKey[resourceKey] = resourceId
+        MediaProxySessionRegistration(
             sessionId,
             resourceId,
+            buildLocalUrl(session.access, port, sessionId, resourceId),
         )
+    }
+
+    fun registerResourceAlias(
+        sessionId: String,
+        upstreamUrl: String,
+        port: Int,
+        method: String = "GET",
+        preparedResponse: MediaProxyPreparedResponse? = null,
+        headers: Map<String, String>? = null,
+    ): MediaProxySessionRegistration = synchronized(lock) {
+        cleanupExpiredLocked()
+        val session = sessions[sessionId]
+            ?: throw IllegalArgumentException("Unknown media proxy session")
+        session.lastAccessAt = now()
+        require(session.resources.size < maxResourcesPerSession) {
+            "Media proxy session resource limit reached"
+        }
+        val normalizedMethod = method.uppercase()
+        val resourceHeaders = immutableHeaders(
+            headers?.let(MediaProxyPolicy::sanitizeRequestHeaders) ?: session.headers,
+        )
+        val resourceId = uniqueResourceIdLocked(session)
+        session.resources[resourceId] = Resource(
+            target = MediaProxyTarget(
+                upstreamUrl = upstreamUrl,
+                method = normalizedMethod,
+                headers = resourceHeaders,
+            ),
+            preparedResponse = preparedResponse,
+        )
+        MediaProxySessionRegistration(
+            sessionId,
+            resourceId,
+            buildLocalUrl(session.access, port, sessionId, resourceId),
+        )
+    }
+
+    fun setPersistentPreparedResponse(
+        sessionId: String,
+        resourceId: String,
+        preparedResponse: MediaProxyPreparedResponse,
+    ) = synchronized(lock) {
+        cleanupExpiredLocked()
+        val session = sessions[sessionId]
+            ?.takeIf { it.access.mode == MediaProxyMode.CAST_LAN }
+            ?: throw IllegalArgumentException("Unknown Cast media proxy session")
+        val resource = session.resources[resourceId]
+            ?: throw IllegalArgumentException("Unknown Cast media proxy resource")
+        session.lastAccessAt = now()
+        resource.preparedResponse = preparedResponse
+        resource.persistentPreparedResponse = true
     }
 
     fun resolve(
@@ -100,21 +269,138 @@ internal class MediaProxySessionStore(
         resourceId: String,
     ): MediaProxyTarget? = synchronized(lock) {
         if (!constantTimeEquals(processSecret, suppliedSecret)) return@synchronized null
+        resolveLocked(MediaProxyMode.LOOPBACK, sessionId, resourceId)
+    }
+
+    fun resolveRootForCast(
+        suppliedSecret: String,
+        sessionId: String,
+        resourceId: String,
+    ): MediaProxyTarget? = synchronized(lock) {
+        if (!constantTimeEquals(processSecret, suppliedSecret)) return@synchronized null
+        cleanupExpiredLocked()
+        val session = sessions[sessionId]
+            ?.takeIf { it.access.mode == MediaProxyMode.LOOPBACK }
+            ?: return@synchronized null
+        if (!session.resources.containsKey(resourceId)) return@synchronized null
+        session.lastAccessAt = now()
+        session.root
+    }
+
+    fun resolveCast(sessionId: String, resourceId: String): MediaProxyTarget? =
+        synchronized(lock) {
+            resolveLocked(MediaProxyMode.CAST_LAN, sessionId, resourceId)
+        }
+
+    fun access(sessionId: String): MediaProxySessionAccess? = synchronized(lock) {
+        cleanupExpiredLocked()
+        sessions[sessionId]?.access
+    }
+
+    fun profile(sessionId: String): CastMediaProfile? = synchronized(lock) {
+        cleanupExpiredLocked()
+        sessions[sessionId]?.profile
+    }
+
+    fun consumePreparedResponse(
+        sessionId: String,
+        resourceId: String,
+    ): MediaProxyPreparedResponse? = synchronized(lock) {
         cleanupExpiredLocked()
         val session = sessions[sessionId] ?: return@synchronized null
-        val target = session.resources[resourceId] ?: return@synchronized null
+        val resource = session.resources[resourceId] ?: return@synchronized null
         session.lastAccessAt = now()
-        target
+        val prepared = resource.preparedResponse
+        if (!resource.persistentPreparedResponse) {
+            resource.preparedResponse = null
+        }
+        prepared
+    }
+
+    fun peekPreparedResponse(
+        sessionId: String,
+        resourceId: String,
+    ): MediaProxyPreparedResponse? = synchronized(lock) {
+        cleanupExpiredLocked()
+        val session = sessions[sessionId] ?: return@synchronized null
+        val resource = session.resources[resourceId] ?: return@synchronized null
+        session.lastAccessAt = now()
+        resource.preparedResponse
+    }
+
+    fun invalidate(sessionId: String): Boolean = synchronized(lock) {
+        sessions.remove(sessionId) != null
+    }
+
+    fun invalidateAll(mode: MediaProxyMode) = synchronized(lock) {
+        sessions.entries.removeAll { it.value.access.mode == mode }
+    }
+
+    fun replaceAfterAcceptedLoad(oldSessionId: String, graceMs: Long) =
+        synchronized(lock) {
+            require(graceMs >= 0L) { "Invalid replacement grace" }
+            sessions[oldSessionId]?.let {
+                it.graceExpiresAt = now() + graceMs
+            }
+        }
+
+    fun cleanupExpired() = synchronized(lock) {
+        cleanupExpiredLocked()
+    }
+
+    fun describe(sessionId: String): String? = synchronized(lock) {
+        cleanupExpiredLocked()
+        sessions[sessionId]?.let {
+            "MediaProxySession(mode=${it.access.mode}, resources=${it.resources.size}, " +
+                "headerNames=${it.headers.keys}, redacted=true)"
+        }
+    }
+
+    private fun resolveLocked(
+        mode: MediaProxyMode,
+        sessionId: String,
+        resourceId: String,
+    ): MediaProxyTarget? {
+        cleanupExpiredLocked()
+        val session = sessions[sessionId]
+            ?.takeIf { it.access.mode == mode }
+            ?: return null
+        val target = session.resources[resourceId]?.target ?: return null
+        session.lastAccessAt = now()
+        return target
     }
 
     private fun cleanupExpiredLocked() {
-        val cutoff = now() - idleTtlMs
+        val current = now()
+        val cutoff = current - idleTtlMs
         val iterator = sessions.iterator()
         while (iterator.hasNext()) {
-            if (iterator.next().value.lastAccessAt < cutoff) {
-                iterator.remove()
-            }
+            val session = iterator.next().value
+            val graceExpired = session.graceExpiresAt?.let { current > it } == true
+            val idleExpired = session.graceExpiresAt == null && session.lastAccessAt < cutoff
+            if (graceExpired || idleExpired) iterator.remove()
         }
+    }
+
+    private fun buildLocalUrl(
+        access: MediaProxySessionAccess,
+        port: Int,
+        sessionId: String,
+        resourceId: String,
+    ): String = when (access.mode) {
+        MediaProxyMode.LOOPBACK -> MediaProxyPolicy.buildLoopbackUrl(
+            port,
+            processSecret,
+            sessionId,
+            resourceId,
+        )
+
+        MediaProxyMode.CAST_LAN -> MediaProxyPolicy.buildCastUrl(
+            access.bindAddress,
+            port,
+            sessionId,
+            resourceId,
+        )
     }
 
     private fun uniqueSessionIdLocked(): String {
@@ -136,13 +422,16 @@ internal class MediaProxySessionStore(
     companion object {
         private const val DEFAULT_IDLE_TTL_MS = 30L * 60L * 1_000L
         private const val DEFAULT_MAX_SESSIONS = 512
-        private const val DEFAULT_MAX_RESOURCES = 4_096
+        private const val DEFAULT_MAX_RESOURCES = 8_192
         private val secureRandom = SecureRandom()
 
         private fun randomToken(): String {
             val bytes = ByteArray(18)
             secureRandom.nextBytes(bytes)
-            return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+            return Base64.encodeToString(
+                bytes,
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+            )
         }
 
         private fun constantTimeEquals(expected: String, supplied: String): Boolean {
@@ -150,6 +439,10 @@ internal class MediaProxySessionStore(
                 expected.toByteArray(Charsets.UTF_8),
                 supplied.toByteArray(Charsets.UTF_8),
             )
+        }
+
+        private fun immutableHeaders(input: Map<String, String>): Map<String, String> {
+            return Collections.unmodifiableMap(LinkedHashMap(input))
         }
     }
 }

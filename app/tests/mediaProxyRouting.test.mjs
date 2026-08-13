@@ -51,6 +51,29 @@ test('matches protected headers case-insensitively', async () => {
   }), true);
 });
 
+test('routes Seek media but not its extraction API', async () => {
+  const { isLocalMediaProxyCandidate: shouldUseMediaProxy } =
+    await loadRoutingModule();
+
+  assert.equal(shouldUseMediaProxy({
+    url: 'https://185.237.106.181/v4/token/master.m3u8?v=1',
+    method: 'GET',
+    headers: {
+      Origin: 'https://movix1.embedseek.com',
+      Referer: 'https://movix1.embedseek.com/',
+    },
+  }), true);
+
+  assert.equal(shouldUseMediaProxy({
+    url: 'https://movix1.embedseek.com/api/v1/video?id=ug3i',
+    method: 'GET',
+    headers: {
+      Origin: 'https://movix1.embedseek.com',
+      Referer: 'https://movix1.embedseek.com/',
+    },
+  }), false);
+});
+
 test('keeps extraction pages, APIs, posts, and unprotected media on GM_FETCH', async () => {
   const { isLocalMediaProxyCandidate } = await loadRoutingModule();
 

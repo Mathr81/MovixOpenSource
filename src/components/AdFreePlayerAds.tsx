@@ -5,7 +5,7 @@ import { Play, ShieldAlert, Settings, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAdFreePopup } from "../context/AdFreePopupContext";
 import { getAdPopupMode, subscribeToAdPopupModeChanges, type AdPopupMode } from "../utils/adPopupMode";
-import { getAdTargetUrls } from "../utils/adAdultMode";
+import { getAdTargetUrls, isAdultAdsEnabled, subscribeToAdultAdsChanges } from "../utils/adAdultMode";
 import { SCRIPT_AD_MODE_ENABLED, loadAdScript } from "../utils/adScriptMode";
 
 interface AdFreePlayerAdsProps {
@@ -38,6 +38,7 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
   const [hasClicked, setHasClicked] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [popupMode, setPopupMode] = useState<AdPopupMode>(() => getAdPopupMode());
+  const [adultAdsOn, setAdultAdsOn] = useState<boolean>(() => isAdultAdsEnabled());
   const autoFiredRef = useRef(false);
   const scriptAdFiredRef = useRef(false);
   const scriptAcceptTimeoutRef = useRef<number | null>(null);
@@ -47,6 +48,7 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
   const scriptAdMode = popupMode === 'normal' && SCRIPT_AD_MODE_ENABLED;
 
   useEffect(() => subscribeToAdPopupModeChanges(setPopupMode), []);
+  useEffect(() => subscribeToAdultAdsChanges(setAdultAdsOn), []);
 
   useEffect(() => {
     // Reset des gardes quand le popup disparaît, pour laisser le suivant se déclencher.
@@ -283,6 +285,27 @@ const AdFreePlayerAds: React.FC<AdFreePlayerAdsProps> = ({
               {descriptionText}
             </DialogPrimitive.Description>
           </div>
+
+          {/* Avertissement contenu adulte (visible seulement si pubs +18 actives) */}
+          {!hasClicked && adultAdsOn && (
+            <div className="mx-4 sm:mx-6 mb-2">
+              <div className="text-left bg-red-950/70 border-2 border-red-500 p-3 sm:p-4 rounded-lg shadow-lg">
+                <p className="text-red-300 font-bold text-sm sm:text-base leading-snug">
+                  {t("adBlocker.adultAdsWarning")}
+                </p>
+                <p className="text-red-200/90 text-xs sm:text-sm mt-1.5">
+                  {t("adBlocker.adultAdsDisablePrefix")}
+                  <Link
+                    to="/settings#intermission"
+                    className="text-red-300 hover:text-red-100 underline font-semibold"
+                  >
+                    {t("adBlocker.adultAdsSettingsLink")}
+                  </Link>
+                  {t("adBlocker.adultAdsDisableSuffix")}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Encadré avertissement */}
           {!hasClicked && (

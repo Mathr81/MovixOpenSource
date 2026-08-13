@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { getFrembedBase } from '../utils/frembedConfig';
 
 interface VideoPlayerProps {
   movieId: string;
@@ -27,7 +28,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ movieId, nextMovie }) => {
 
   return (
     <iframe
-      src={`https://frembed.click/api/film.php?id=${movieId}`}
+      src={`${getFrembedBase()}/api/film.php?id=${movieId}`}
       width="100%"
       height="500px"
       frameBorder="0"

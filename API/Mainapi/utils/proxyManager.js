@@ -5,6 +5,8 @@
  */
 
 const axios = require("axios");
+const cluster = require("node:cluster");
+const crypto = require("node:crypto");
 const http = require("http");
 const https = require("https");
 const { SocksProxyAgent } = require("socks-proxy-agent");
@@ -64,6 +66,12 @@ https.globalAgent.maxFreeSockets = 32;
 // === PROXY CONFIGURATION FLAGS ===
 const ENABLE_DARKINO_PROXY = true; // Passe \u00e0 false pour d\u00e9sactiver le proxy pour Darkino
 const ENABLE_COFLIX_PROXY = true; // Passe \u00e0 false pour d\u00e9sactiver le proxy pour Coflix
+// Origine Coflix utilis\u00e9e comme Referer/Origin des requ\u00eates LecteurVideo
+// (le token JWT du player est \u00e9mis par Coflix ; lecteurvideo.com valide le Referer).
+// Overridable via COFLIX_BASE_URL pour suivre les rotations de domaine.
+const COFLIX_ORIGIN = (
+  process.env.COFLIX_BASE_URL || "https://coflix.esq"
+).replace(/\/$/, "");
 const ENABLE_FRENCH_STREAM_PROXY = true; // Active/d\u00e9sactive le proxy pour French-Stream
 const ENABLE_LECTEURVIDEO_PROXY = true; // Active/d\u00e9sactive le proxy pour LecteurVideo
 const ENABLE_FSTREAM_PROXY = true; // Active/d\u00e9sactive le proxy pour FStream
@@ -578,7 +586,7 @@ async function makeRequestWithCorsFallback(targetUrl, options = {}) {
 //  - 'worker' : preuve POSITIVE d'un blocage Cloudflare du worker lui-meme
 //    (page "error code: 1015"/1027, "You are being rate limited", limite
 //    journaliere). Roter vers un autre worker (bucket de limite distinct) aide.
-//  - 'site'   : tout le reste -> 429 forwarde depuis coflix.band (rate-limit
+//  - 'site'   : tout le reste -> 429 forwarde depuis le site Coflix (rate-limit
 //    global). Defaut volontaire : sans preuve d'un 1015, on ne rote pas et on
 //    ne martele pas l'upstream.
 function classifyCloudflare429(body) {
@@ -689,7 +697,7 @@ async function makeCoflixRequest(targetUrl, options = {}) {
       error.coflixUrl = cleanTargetUrl;
       error.coflixProxy = `${proxy.host}:${proxy.port}`;
 
-      // 429 = coflix.band rate-limit. Une autre IP ProxyScrape = bucket distinct
+      // 429 = rate-limit du site Coflix. Une autre IP ProxyScrape = bucket distinct
       // -> on rote. Le flag coupe le spam de log par titre si tout est limite.
       if (statusCode === 429) {
         error.coflixSiteRateLimited = true;
@@ -725,6 +733,13 @@ let cycleTLSInstance = null;
 let cycleTLSInitializing = false;
 const cycleTLSWaiters = [];
 
+function cycleTlsInitOptions(workerId = cluster.worker?.id ?? 0) {
+  const normalizedWorkerId = Number.isSafeInteger(workerId) && workerId >= 0 ? workerId : 0;
+  const port = 9119 + normalizedWorkerId;
+  if (port > 65535) throw new RangeError("identifiant worker CycleTLS invalide");
+  return { port };
+}
+
 async function getCycleTLS() {
   if (cycleTLSInstance) return cycleTLSInstance;
   if (cycleTLSInitializing) {
@@ -732,7 +747,7 @@ async function getCycleTLS() {
   }
   cycleTLSInitializing = true;
   try {
-    cycleTLSInstance = await initCycleTLS();
+    cycleTLSInstance = await initCycleTLS(cycleTlsInitOptions());
     cycleTLSInitializing = false;
     for (const waiter of cycleTLSWaiters) waiter(cycleTLSInstance);
     cycleTLSWaiters.length = 0;
@@ -825,8 +840,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
         ja3: CHROME_JA3,
         userAgent: CHROME_UA,
         headers: {
-          Referer: "https://coflix.trade/",
-          Origin: "https://coflix.trade",
+          Referer: `${COFLIX_ORIGIN}/`,
+          Origin: COFLIX_ORIGIN,
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "fr-FR,fr;q=0.9",
@@ -875,8 +890,8 @@ async function makeLecteurVideoRequest(targetUrl, options = {}) {
           userAgent: CHROME_UA,
           proxy: proxyUrl,
           headers: {
-            Referer: "https://coflix.trade/",
-            Origin: "https://coflix.trade",
+            Referer: `${COFLIX_ORIGIN}/`,
+            Origin: COFLIX_ORIGIN,
             Accept:
               "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9",
@@ -1272,15 +1287,25 @@ const { acquireRedisLock } = require("./redisLock");
 
 const PROXY_ROTATION_REDIS_PREFIX = "proxyscrape:rotation:v1";
 const PROXY_RATE_LIMIT_REDIS_PREFIX = "proxyscrape:rate-limit:v1";
+const KISSKH_METADATA_PROXY_OPTIONS = Object.freeze({
+  poolName: "KISSKH_METADATA",
+  minIntervalMs: 1000,
+  digestIdentity: true,
+  maxCandidates: 1000,
+});
 const proxyRateLimitState = new Map();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildProxyRateLimitKey(poolName, proxy) {
+function buildProxyRateLimitKey(poolName, proxy, digestIdentity = false) {
   if (!proxy || !proxy.host || !proxy.port) return null;
-  return `${PROXY_RATE_LIMIT_REDIS_PREFIX}:${poolName}:${proxy.type || "proxy"}:${proxy.host}:${proxy.port}:${proxy.auth || ""}`;
+  const identity = `${String(proxy.type || "proxy").toLowerCase()}:${String(proxy.host).trim().toLowerCase()}:${Number(proxy.port)}:${proxy.auth || ""}`;
+  const suffix = digestIdentity
+    ? crypto.createHash("sha256").update(identity).digest("hex")
+    : identity;
+  return `${PROXY_RATE_LIMIT_REDIS_PREFIX}:${poolName}:${suffix}`;
 }
 
 function reserveLocalRateLimitedProxy(proxyKey, minIntervalMs) {
@@ -1296,7 +1321,7 @@ function reserveLocalRateLimitedProxy(proxyKey, minIntervalMs) {
   return true;
 }
 
-async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs) {
+async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs, digestIdentity = false) {
   if (!proxy) return false;
 
   const safeIntervalMs = Math.max(0, Math.floor(Number(minIntervalMs) || 0));
@@ -1304,7 +1329,7 @@ async function reserveRateLimitedProxy(poolName, proxy, minIntervalMs) {
     return true;
   }
 
-  const proxyKey = buildProxyRateLimitKey(poolName, proxy);
+  const proxyKey = buildProxyRateLimitKey(poolName, proxy, digestIdentity);
   if (!proxyKey) {
     return false;
   }
@@ -1396,6 +1421,7 @@ async function pickNextRateLimitedProxy(pool, options = {}) {
     minIntervalMs = 0,
     waitTimeoutMs = 0,
     retryDelayMs = 25,
+    digestIdentity = false,
   } = options;
 
   const safeMinIntervalMs = Math.max(0, Math.floor(Number(minIntervalMs) || 0));
@@ -1416,6 +1442,7 @@ async function pickNextRateLimitedProxy(pool, options = {}) {
         poolName,
         proxy,
         safeMinIntervalMs,
+        digestIdentity,
       );
       if (reserved) {
         return proxy;
@@ -1434,6 +1461,76 @@ async function pickNextRateLimitedProxy(pool, options = {}) {
 async function pickNextSocks5Proxy(options = {}) {
   const proxy = await pickNextRateLimitedProxy(PROXIES, {
     poolName: "SOCKS5_PROXIES",
+    ...options,
+  });
+  return proxy || null;
+}
+
+async function getKisskhProxyCandidates(options = {}) {
+  const requestedLimit = options.maxCandidates === undefined
+    ? KISSKH_METADATA_PROXY_OPTIONS.maxCandidates
+    : Number(options.maxCandidates);
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit <= 0) {
+    throw new TypeError("maxCandidates KissKH invalide");
+  }
+
+  const poolSnapshot = PROXIES.slice();
+  if (poolSnapshot.length === 0) return [];
+  const scanLimit = Math.min(
+    poolSnapshot.length,
+    requestedLimit,
+    KISSKH_METADATA_PROXY_OPTIONS.maxCandidates,
+  );
+  const startIndex = await reserveProxyWindow(
+    KISSKH_METADATA_PROXY_OPTIONS.poolName,
+    poolSnapshot.length,
+    1,
+  );
+  const candidates = [];
+  const seen = new Set();
+  for (let offset = 0; offset < scanLimit; offset += 1) {
+    const proxy = poolSnapshot[(startIndex + offset) % poolSnapshot.length];
+    const identity = buildProxyRateLimitKey(
+      KISSKH_METADATA_PROXY_OPTIONS.poolName,
+      proxy,
+      KISSKH_METADATA_PROXY_OPTIONS.digestIdentity,
+    );
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    candidates.push(proxy);
+  }
+  return candidates;
+}
+
+function isKisskhProxyConfigured() {
+  return KISSKH_PROXY_CONFIGURATION_PRESENT;
+}
+
+function reserveKisskhProxy(proxy, options = {}) {
+  const requestedInterval = Math.floor(Number(options.minIntervalMs) || 0);
+  const minIntervalMs = Math.max(
+    KISSKH_METADATA_PROXY_OPTIONS.minIntervalMs,
+    requestedInterval,
+  );
+  return reserveRateLimitedProxy(
+    KISSKH_METADATA_PROXY_OPTIONS.poolName,
+    proxy,
+    minIntervalMs,
+    KISSKH_METADATA_PROXY_OPTIONS.digestIdentity,
+  );
+}
+
+async function pickNextKisskhProxy(options = {}) {
+  const candidates = await getKisskhProxyCandidates(options);
+  for (const proxy of candidates) {
+    if (await reserveKisskhProxy(proxy, options)) return proxy;
+  }
+  return null;
+}
+
+async function pickDedicatedSocks5Proxy(options = {}) {
+  const proxy = await pickNextRateLimitedProxy(DEDICATED_SOCKS5_PROXIES, {
+    poolName: "DEDICATED_SOCKS5",
     ...options,
   });
   return proxy || null;
@@ -1656,6 +1753,10 @@ const PROXYSCRAPE_ACCOUNT_ID = (
 const PROXYSCRAPE_ENABLED = Boolean(
   PROXYSCRAPE_API_TOKEN && PROXYSCRAPE_ACCOUNT_ID,
 );
+const KISSKH_PROXY_CONFIGURATION_PRESENT = Boolean(
+  PROXYSCRAPE_API_TOKEN || PROXYSCRAPE_ACCOUNT_ID ||
+  String(process.env.SOCKS5_PROXIES || "").trim(),
+);
 const PROXY_POOL_REDIS_TTL_SECONDS = 60 * 60;
 const PROXYSCRAPE_ACCOUNT_BASE_URL = "https://api.proxyscrape.com";
 const PROXYSCRAPE_ACCOUNT_PATH =
@@ -1683,6 +1784,12 @@ const PROXIES = dedupeProxyEntries(
     : parseProxyPayload(process.env.SOCKS5_PROXIES, "socks5")
   )
     .map((entry) => sanitizeProxyEntry(entry, "socks5"))
+    .filter(Boolean),
+);
+
+const DEDICATED_SOCKS5_PROXIES = dedupeProxyEntries(
+  parseProxyPayload(process.env.SOCKS5_PROXIES, "socks5")
+    .map((entry) => sanitizeProxyEntry(entry, "socks5h"))
     .filter(Boolean),
 );
 
@@ -1782,7 +1889,9 @@ function buildProxyScrapeCandidates(protocol) {
       params: {
         type: "getproxies",
         protocol,
-        format: "normal",
+        format: "credentials",
+        credential_format: 2,
+        status: "online",
       },
       label: `v4 account ${accountPath}`,
     },
@@ -2453,10 +2562,17 @@ module.exports = {
   // Agent helpers
   pickRandomProxyOrNone,
   pickRandomProxy,
+  pickProxyscrapeCandidates,
   pickNextSocks5Proxy,
+  getKisskhProxyCandidates,
+  isKisskhProxyConfigured,
+  reserveKisskhProxy,
+  pickNextKisskhProxy,
+  pickDedicatedSocks5Proxy,
   getProxyAgent,
   getDarkinoHttpProxyAgent,
 
   // Cleanup
+  cycleTlsInitOptions,
   shutdownCycleTLS,
 };

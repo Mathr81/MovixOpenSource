@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Movix</string>
+    <string name="pip_rewind_10">Reculer de 10 secondes</string>
+    <string name="pip_play">Lecture</string>
+    <string name="pip_pause">Pause</string>
+    <string name="pip_forward_10">Avancer de 10 secondes</string>
 </resources>

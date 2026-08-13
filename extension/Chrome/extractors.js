@@ -49,7 +49,7 @@ const caches = {
     sibnet: new TTLCache(500, 7200000),
     uqload: new TTLCache(500, 7200000),
     doodstream: new TTLCache(500, 3600000),
-    seekstreaming: new TTLCache(500, 7200000),
+    seekstreaming: new TTLCache(500, 300000),
 };
 
 // ===== Utility Functions =====
@@ -311,7 +311,8 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         if (
             !candidate ||
             candidate.length > MAX_MEDIA_URL_LENGTH ||
-            !candidate.toLowerCase().includes('.m3u8')
+            !candidate.toLowerCase().includes('.m3u8') ||
+            candidate.toLowerCase().includes('troll')
         ) {
             return null;
         }
@@ -346,6 +347,96 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         }
         return parsed.href;
     };
+
+    // Replay the decoder described by the player without evaluating remote JS.
+    // Seed, step, mask, variable names, payload, and reverse order all come
+    // from the current page, so provider-side parameter rotations keep working.
+    const parseRollingParameters = (expression, indexName, mask) => {
+        let expr = String(expression || '').replace(/\s+/g, '');
+        if (!expr.startsWith('+') && !expr.startsWith('-')) {
+            expr = '+' + expr;
+        }
+        const terms = expr.match(/[-+][^+-]+/g) || [];
+        let seed = 0;
+        let step = 0;
+
+        let hostnameSum = 0;
+        if (/location(?:\.hostname|\[['"]hostname['"]\])?/.test(script) || script.includes('charCodeAt')) {
+            try {
+                const parsed = new URL(embedUrl);
+                const hostname = parsed.hostname || '';
+                for (let i = 0; i < hostname.length; i++) {
+                    hostnameSum = (hostnameSum + hostname.charCodeAt(i)) & mask;
+                }
+            } catch {
+                hostnameSum = 0;
+            }
+        }
+
+        const indexToken = indexName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const indexReg = new RegExp(`\\b${indexToken}\\b`);
+
+        for (const term of terms) {
+            const sign = term.startsWith('-') ? -1 : 1;
+            const t = term.slice(1).replace(/^[()]+|[()]+$/g, '');
+            if (indexReg.test(t)) {
+                const parts = t.split('*');
+                if (parts.length === 1) {
+                    step += sign * 1;
+                } else if (parts.length === 2) {
+                    const numPart = parts[0] === indexName ? parts[1] : parts[0];
+                    step += sign * parseInt(numPart, 10);
+                }
+            } else if (/^(?:0[xX][0-9a-fA-F]+|\d+)$/.test(t)) {
+                seed += sign * parseInt(t, 10);
+            } else if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+                seed += sign * hostnameSum;
+            }
+        }
+
+        return { seed, step };
+    };
+
+    const unifiedRollingXorPattern =
+        /(?:var\s+)?(?<rawBytes>[A-Za-z_$][\w$]*)\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)(?:\s*,\s*(?<bytes>[A-Za-z_$][\w$]*)\s*=\s*\k<rawBytes>\.split\(\s*["']["']\s*\)\s*\.reverse\(\s*\)\s*\.join\(\s*["']["']\s*\))?[\s\S]{0,512}?for\s*\(\s*var\s+(?<index>[A-Za-z_$][\w$]*)\s*=\s*0\s*;\s*\k<index>\s*<\s*(?:[A-Za-z_$][\w$]*)\.length\s*;\s*\k<index>\+\+\s*\)\s*\{[\s\S]{0,512}?(?:var\s+)?(?<key>[A-Za-z_$][\w$]*)\s*=\s*\(\s*(?<keyExpression>[\s\S]{1,128}?)\s*\)\s*&\s*(?<mask0>0[xX][0-9a-fA-F]+|\d+)\s*;[\s\S]{0,512}?(?<output>[A-Za-z_$][\w$]*)\s*\+=\s*String\.fromCharCode\(\s*(?:[A-Za-z_$][\w$]*)\.charCodeAt\(\s*\k<index>\s*\)\s*\^\s*\k<key>\s*\)[\s\S]{0,256}?\}\s*return\b[\s\S]{1,512}?\)\s*\(\s*["'](?<payload>[A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
+
+    for (const match of String(script || '').matchAll(unifiedRollingXorPattern)) {
+        const groups = match.groups || {};
+        const mask = Number(groups.mask0);
+        const parameters = parseRollingParameters(groups.keyExpression || '', groups.index || '', mask);
+        if (
+            !parameters ||
+            !Number.isSafeInteger(parameters.seed) ||
+            !Number.isSafeInteger(parameters.step) ||
+            !Number.isSafeInteger(mask) ||
+            mask < 0 ||
+            mask > 255
+        ) continue;
+        const payload = groups.payload || '';
+        const normalizedPayload = payload.replace(/-/g, '+').replace(/_/g, '/');
+        if (!payload || normalizedPayload.length % 4 === 1) continue;
+        const paddedPayload = normalizedPayload.padEnd(
+            normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+            '=',
+        );
+        try {
+            const rawDecoded = atob(paddedPayload);
+            const byteArray = Array.from(rawDecoded, c => c.charCodeAt(0));
+            if (groups.bytes) byteArray.reverse();
+            const decodedBytes = Uint8Array.from(
+                byteArray,
+                (byteVal, index) => byteVal ^ ((parameters.seed + index * parameters.step) & mask),
+            );
+            const matchIndex = match.index || 0;
+            const matchTail = script.substring(matchIndex);
+            if (!groups.bytes && /\.reverse\(\s*\)\s*\.join/.test(matchTail.substring(0, 500))) {
+                decodedBytes.reverse();
+            }
+            const decoded = new TextDecoder('utf-8', { fatal: false }).decode(decodedBytes);
+            const candidate = normalizeCandidate(decoded);
+            if (candidate) return candidate;
+        } catch {}
+    }
 
     const xorPattern =
         /var\s+[A-Za-z_$][\w$]*\s*=\s*\[([0-9,\s]+)\]\s*,\s*[A-Za-z_$][\w$]*\s*=\s*atob\(\s*[A-Za-z_$][\w$]*\s*\)[\s\S]{0,2000}?\}\)\s*\(\s*["']([A-Za-z0-9+/_=-]{1,32768})["']\s*\)/g;
@@ -395,6 +486,85 @@ function extractM3u8UrlFromDecodedScript(script, embedUrl) {
         if (candidate) return candidate;
     }
     return null;
+}
+
+function extractFsvidVidzyM3u8FromHtml(html, embedUrl) {
+    const direct = extractM3u8UrlFromDecodedScript(html, embedUrl);
+    if (direct) return direct;
+
+    const decoded = decodePackedScriptFromHtml(html);
+    return decoded ? extractM3u8UrlFromDecodedScript(decoded, embedUrl) : null;
+}
+
+function normalizeFsvidVidzyEmbedUrl(rawUrl, provider) {
+    if (provider !== 'fsvid' && provider !== 'vidzy') return null;
+    try {
+        const parsed = new URL(String(rawUrl || '').trim());
+        if (
+            parsed.protocol !== 'https:' ||
+            parsed.username ||
+            parsed.password ||
+            (parsed.port && parsed.port !== '443') ||
+            !parsed.hostname ||
+            !/\/embed(?:[-/])/i.test(parsed.pathname)
+        ) return null;
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeFsvidVidzyMediaUrl(rawCandidate, embedUrl, provider) {
+    if (!normalizeFsvidVidzyEmbedUrl(embedUrl, provider)) return null;
+    const candidate = String(rawCandidate || '')
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/gi, '&')
+        .trim()
+        .replace(/\\+$/, '');
+    if (
+        !candidate ||
+        candidate.length > 16384 ||
+        !candidate.toLowerCase().includes('.m3u8') ||
+        candidate.toLowerCase().includes('troll')
+    ) return null;
+    try {
+        const parsed = /^https:\/\//i.test(candidate)
+            ? new URL(candidate)
+            : new URL(candidate, embedUrl);
+        if (
+            parsed.protocol !== 'https:' ||
+            parsed.username ||
+            parsed.password ||
+            (parsed.port && parsed.port !== '443') ||
+            !parsed.hostname ||
+            !parsed.pathname.toLowerCase().includes('.m3u8') ||
+            parsed.href.length > 16384
+        ) return null;
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+async function extractFsvidVidzyM3u8(html, embedUrl, provider) {
+    const staticCandidate = normalizeFsvidVidzyMediaUrl(
+        extractFsvidVidzyM3u8FromHtml(html, embedUrl),
+        embedUrl,
+        provider,
+    );
+    if (staticCandidate) return staticCandidate;
+    if (!globalThis.MovixQuickJS?.extractPlayerM3u8) return null;
+    try {
+        const dynamicCandidate = await globalThis.MovixQuickJS.extractPlayerM3u8(
+            html,
+            embedUrl,
+            provider,
+        );
+        return normalizeFsvidVidzyMediaUrl(dynamicCandidate, embedUrl, provider);
+    } catch (error) {
+        console.warn(`[EXT-${provider.toUpperCase()}] QuickJS fallback failed:`, error);
+        return null;
+    }
 }
 
 function extractUqloadMediaUrl(html) {
@@ -609,22 +779,24 @@ async function extractVoe(voeUrl) {
 async function extractFsvid(fsvidUrl) {
     console.log(`[EXT-FSVID] Extracting from: ${fsvidUrl}`);
 
-    if (!fsvidUrl || !fsvidUrl.toLowerCase().includes('fsvid')) {
+    const embedUrl = normalizeFsvidVidzyEmbedUrl(fsvidUrl, 'fsvid');
+    if (!embedUrl) {
         console.warn('[EXT-FSVID] Invalid URL, skipping');
         return { success: false, error: 'Fsvid: Invalid URL' };
     }
 
-    const cacheKey = md5Hash(fsvidUrl);
+    const cacheKey = md5Hash(embedUrl);
     const cached = caches.fsvid.get(cacheKey);
-    if (cached) {
+    const cachedMediaUrl = normalizeFsvidVidzyMediaUrl(cached?.m3u8Url, embedUrl, 'fsvid');
+    if (cached && cachedMediaUrl) {
         console.log('[EXT-FSVID] Cache hit');
-        return { ...cached, fromCache: true };
+        return { ...cached, m3u8Url: cachedMediaUrl, fromCache: true };
     }
 
     try {
         // Fsvid requires referer from one of the allowed streaming sites
         // (not from fsvid.lol itself - it returns "Veuillez utiliser une URL valide" otherwise)
-        const FSVID_REFERERS = ['https://fs12.lol/', 'https://french-stream.one/', 'https://fstream.info/'];
+        const FSVID_REFERERS = ['https://fsmirror46.lol/', 'https://fs12.lol/', 'https://french-stream.one/'];
 
         const headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -639,7 +811,7 @@ async function extractFsvid(fsvidUrl) {
 
         let resp;
         try {
-            resp = await fetch(fsvidUrl, { headers, signal: controller.signal });
+            resp = await fetch(embedUrl, { headers, signal: controller.signal });
         } finally {
             clearTimeout(timer);
         }
@@ -652,47 +824,11 @@ async function extractFsvid(fsvidUrl) {
 
         const html = await resp.text();
         console.log(`[EXT-FSVID] HTML length: ${html.length}`);
-
-        // Check if the page has packed script
-        const hasEval = html.includes(PACKER_MARKER);
-        console.log(`[EXT-FSVID] Contains eval packer: ${hasEval}`);
-
-        if (!hasEval) {
-            // Try to find m3u8 directly in page (some fsvid pages have it in plain)
-            const directM3u8 = html.match(/["'](https?:\/\/[^"']*\.m3u8[^"']*)["']/);
-            if (directM3u8) {
-                console.log(`[EXT-FSVID] Found direct M3U8 (no packer needed): ${directM3u8[1]}`);
-                const m3u8Url = directM3u8[1].replace(/\\\//g, '/');
-                const result = { m3u8Url, success: true, source: 'fsvid' };
-                caches.fsvid.set(cacheKey, result);
-                return result;
-            }
-            console.error('[EXT-FSVID] No eval packer and no direct M3U8 found');
-            console.log('[EXT-FSVID] HTML snippet (first 500 chars):', html.substring(0, 500));
-            return { success: false, error: 'Fsvid: No packed script found' };
-        }
-
-        // Pass full HTML to decodePackedScriptFromHtml (handles escaped quotes)
-        const deobfuscated = decodePackedScriptFromHtml(html);
-        if (!deobfuscated) {
-            console.error('[EXT-FSVID] Deobfuscation returned null');
-            // Log area around eval for debugging
-            const evalIdx = html.indexOf(PACKER_MARKER);
-            if (evalIdx !== -1) {
-                console.log('[EXT-FSVID] Packer snippet:', html.substring(evalIdx, evalIdx + 200));
-            }
-            return { success: false, error: 'Fsvid: Deobfuscation failed' };
-        }
-
-        console.log(`[EXT-FSVID] Deobfuscated length: ${deobfuscated.length}`);
-        console.log('[EXT-FSVID] Deobfuscated snippet:', deobfuscated.substring(0, 300));
-
-        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, fsvidUrl);
+        const m3u8Url = await extractFsvidVidzyM3u8(html, embedUrl, 'fsvid');
 
         if (!m3u8Url) {
-            console.error('[EXT-FSVID] No M3U8 URL found in deobfuscated script');
-            console.log('[EXT-FSVID] Full deobfuscated:', deobfuscated);
-            return { success: false, error: 'Fsvid: M3U8 not found in script' };
+            console.error('[EXT-FSVID] No safe M3U8 URL found in page');
+            return { success: false, error: 'Fsvid: M3U8 not found in page' };
         }
 
         console.log(`[EXT-FSVID] Final M3U8 URL: ${m3u8Url}`);
@@ -716,9 +852,15 @@ async function extractFsvid(fsvidUrl) {
 async function extractVidzy(vidzyUrl) {
     console.log(`[EXT-VIDZY] Extracting from: ${vidzyUrl}`);
 
-    const cacheKey = md5Hash(vidzyUrl);
+    const embedUrl = normalizeFsvidVidzyEmbedUrl(vidzyUrl, 'vidzy');
+    if (!embedUrl) return { success: false, error: 'Vidzy: Invalid URL' };
+
+    const cacheKey = md5Hash(embedUrl);
     const cached = caches.vidzy.get(cacheKey);
-    if (cached) return { ...cached, fromCache: true };
+    const cachedMediaUrl = normalizeFsvidVidzyMediaUrl(cached?.m3u8Url, embedUrl, 'vidzy');
+    if (cached && cachedMediaUrl) {
+        return { ...cached, m3u8Url: cachedMediaUrl, fromCache: true };
+    }
 
     try {
         const controller = new AbortController();
@@ -730,18 +872,17 @@ async function extractVidzy(vidzyUrl) {
             'user-agent': 'Mozilla/5.0 Chrome/140.0.0.0'
         };
 
-        const resp = await fetch(vidzyUrl, { headers, signal: controller.signal });
-        clearTimeout(timer);
+        let resp;
+        try {
+            resp = await fetch(embedUrl, { headers, signal: controller.signal });
+        } finally {
+            clearTimeout(timer);
+        }
         if (!resp.ok) return { success: false, error: `Vidzy: HTTP ${resp.status}` };
         const html = await resp.text();
+        const m3u8Url = await extractFsvidVidzyM3u8(html, embedUrl, 'vidzy');
 
-        // Pass full HTML to decodePackedScriptFromHtml (handles escaped quotes)
-        const deobfuscated = decodePackedScriptFromHtml(html);
-        if (!deobfuscated) return { success: false, error: 'Vidzy: Deobfuscation failed' };
-
-        const m3u8Url = extractM3u8UrlFromDecodedScript(deobfuscated, vidzyUrl);
-
-        if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in script' };
+        if (!m3u8Url) return { success: false, error: 'Vidzy: M3U8 not found in page' };
 
         const result = { m3u8Url, success: true, source: 'vidzy' };
         caches.vidzy.set(cacheKey, result);
@@ -952,8 +1093,11 @@ async function extractDoodStream(doodUrl) {
         const passMatch = html.match(/\/pass_md5\/[\w-]+\/(?<token>[\w-]+)/);
         if (!passMatch) {
             clearTimeout(timer);
-            console.error('[EXT-DOODSTREAM] pass_md5 pattern not found');
-            return { success: false, error: 'DoodStream: pass_md5 not found' };
+            return {
+                success: false,
+                error: 'DoodStream: File was deleted',
+                reason: 'deleted',
+            };
         }
 
         const parsedUrl = new URL(doodUrl);
@@ -991,92 +1135,185 @@ async function extractDoodStream(doodUrl) {
 }
 
 /**
- * Extract HLS URL from SeekStreaming (embed4me / embedseek) embed
+ * Extract HLS URL from a SeekStreaming root-fragment embed
  */
-async function extractSeekStreaming(seekUrl) {
-    console.log(`[EXT-SEEKSTREAMING] Extracting from: ${seekUrl}`);
+const SEEKSTREAMING_USER_AGENT =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 
-    // Extract video ID
-    let videoId = null;
-    const decoded = decodeURIComponent(seekUrl);
-
-    if (decoded.includes('#')) {
-        videoId = decoded.split('#').pop().trim();
-    } else if (decoded.toLowerCase().includes('/embed/')) {
-        videoId = decoded.replace(/\/$/, '').split('/').pop().trim();
-    } else {
+function safelyDecodeSeekStreamingUrl(value) {
+    let decoded = String(value || '').trim();
+    for (let index = 0; index < 2; index += 1) {
         try {
-            const parsed = new URL(decoded);
-            if (parsed.hash) videoId = parsed.hash.replace('#', '').trim();
-            else if (parsed.pathname && parsed.pathname !== '/') {
-                videoId = parsed.pathname.replace(/\/$/, '').split('/').pop().trim();
-            }
-        } catch { }
+            const next = decodeURIComponent(decoded);
+            if (next === decoded) break;
+            decoded = next;
+        } catch {
+            return null;
+        }
     }
+    return decoded;
+}
 
-    if (!videoId) {
-        return { success: false, error: 'SeekStreaming: Could not extract video ID' };
+function parseSeekStreamingEmbedUrl(input) {
+    const decoded = safelyDecodeSeekStreamingUrl(input);
+    if (!decoded || /[\u0000-\u001f\u007f]/.test(decoded)) return null;
+    try {
+        const url = new URL(decoded);
+        if (
+            !['http:', 'https:'].includes(url.protocol) ||
+            url.username ||
+            url.password ||
+            url.pathname !== '/' ||
+            url.search
+        ) return null;
+        const videoId = url.hash.slice(1);
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId)) return null;
+        const origin = url.origin;
+        return {
+            embedUrl: `${origin}/#${videoId}`,
+            hostname: url.hostname.toLowerCase(),
+            videoId,
+            origin,
+            referer: `${origin}/`,
+            cacheKey: `${url.hostname.toLowerCase()}:${videoId}`,
+        };
+    } catch {
+        return null;
     }
+}
 
-    const cacheKey = md5Hash(videoId);
+function selectSeekStreamingPlaybackSource(data) {
+    if (!data || typeof data !== 'object') return null;
+    for (const kind of ['source', 'master', 'masterUrl']) {
+        const rawUrl = data[kind];
+        if (typeof rawUrl !== 'string') continue;
+        try {
+            const url = new URL(rawUrl);
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+            return { kind, url: url.href };
+        } catch {
+            continue;
+        }
+    }
+    return null;
+}
+
+function selectSeekStreamingPlaybackSources(data) {
+    if (!data || typeof data !== 'object') return [];
+    const candidates = [];
+    const seen = new Set();
+    const add = (kind, rawUrl) => {
+        if (typeof rawUrl !== 'string') return;
+        try {
+            const url = new URL(rawUrl);
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return;
+            if (seen.has(url.href)) return;
+            seen.add(url.href);
+            candidates.push({ kind, url: url.href });
+        } catch {
+            // Ignore invalid playback candidates.
+        }
+    };
+
+    add('cfNative', data.cfNative);
+    const source = selectSeekStreamingPlaybackSource(data);
+    if (source) add('source', source.url);
+    return candidates;
+}
+
+function getSeekStreamingRequestHeaders(embedUrl) {
+    const parsed = typeof embedUrl === 'object' && embedUrl?.origin
+        ? embedUrl
+        : parseSeekStreamingEmbedUrl(embedUrl);
+    if (!parsed) return null;
+    return { Origin: parsed.origin, Referer: parsed.referer };
+}
+
+function getSeekStreamingPlaybackRulePattern(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+        const pathSegments = parsed.pathname.split('/').filter(Boolean);
+        const directorySegments = parsed.pathname.endsWith('/')
+            ? pathSegments
+            : pathSegments.slice(0, -1);
+        const mediaTypeIndex = directorySegments.length - 2;
+        const mediaType = directorySegments[mediaTypeIndex];
+        const videoId = directorySegments[mediaTypeIndex + 1];
+        const v4Index = directorySegments.indexOf('v4');
+        if (
+            v4Index !== -1 &&
+            mediaTypeIndex > v4Index &&
+            /^[a-z0-9_-]+$/i.test(mediaType || '') &&
+            /^[a-z0-9_-]+$/i.test(videoId || '')
+        ) {
+            return `*://*/${mediaType}/${videoId}/*`;
+        }
+        const slash = parsed.pathname.lastIndexOf('/');
+        const directory = slash >= 0 ? parsed.pathname.slice(0, slash + 1) : '/';
+        return `*://${parsed.host}${directory}*`;
+    } catch {
+        return null;
+    }
+}
+
+async function extractSeekStreaming(seekUrl) {
+    const parsed = parseSeekStreamingEmbedUrl(seekUrl);
+    if (!parsed) {
+        return { success: false, error: 'SeekStreaming: invalid embed URL' };
+    }
+    const cacheKey = md5Hash(parsed.cacheKey);
     const cached = caches.seekstreaming.get(cacheKey);
     if (cached) return { ...cached, fromCache: true };
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
     try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-
-        // Determine API domain from URL
-        let apiDomain = 'lpayer.embed4me.com';
-        try {
-            apiDomain = new URL(decoded).host;
-        } catch { }
-
-        const apiUrl = `https://${apiDomain}/api/v1/video?id=${videoId}&w=1920&h=1080&r=`;
+        const apiUrl = new URL('/api/v1/video', parsed.origin);
+        apiUrl.search = new URLSearchParams({
+            id: parsed.videoId,
+            w: '1920',
+            h: '1080',
+            r: '',
+        }).toString();
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': SEEKSTREAMING_USER_AGENT,
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Referer': `https://${apiDomain}/`,
-            'Origin': `https://${apiDomain}`,
+            ...getSeekStreamingRequestHeaders(parsed),
         };
-
-        const resp = await fetch(apiUrl, { headers, signal: controller.signal });
-        clearTimeout(timer);
-        if (!resp.ok) return { success: false, error: `SeekStreaming: API HTTP ${resp.status}` };
-        const encryptedText = await resp.text();
-
-        // Decrypt AES-CBC response
-        const decryptedRaw = await decryptAesCbc(encryptedText, SEEKSTREAMING_AES_KEY_RAW, SEEKSTREAMING_AES_IV_RAW);
-        if (!decryptedRaw) {
-            return { success: false, error: 'SeekStreaming: AES decryption failed' };
+        const response = await fetch(apiUrl.href, { headers, signal: controller.signal });
+        if (!response.ok) {
+            return { success: false, error: `SeekStreaming: API HTTP ${response.status}` };
         }
-
-        const data = JSON.parse(decryptedRaw);
-        const cfUrl = data.cf || '';
-        const sourceUrl = data.source || '';
-
-        if (!cfUrl && !sourceUrl) {
-            return { success: false, error: 'SeekStreaming: No video source found' };
+        const decryptedRaw = await decryptAesCbc(
+            await response.text(),
+            SEEKSTREAMING_AES_KEY_RAW,
+            SEEKSTREAMING_AES_IV_RAW,
+        );
+        const selected = selectSeekStreamingPlaybackSources(JSON.parse(decryptedRaw));
+        if (selected.length === 0) {
+            return { success: false, error: 'SeekStreaming: no direct source found' };
         }
-
-        // Prefer CF (CDN) URL
-        const videoUrl = cfUrl || sourceUrl;
         const result = {
-            hlsUrl: videoUrl,
+            hlsUrl: selected[0].url,
+            hlsCandidates: selected,
             success: true,
             source: 'seekstreaming',
-            // Also provide both URLs
-            cfUrl: cfUrl || undefined,
-            ipUrl: sourceUrl || undefined,
+            origin: parsed.origin,
+            referer: parsed.referer,
         };
-
         caches.seekstreaming.set(cacheKey, result);
         return result;
-
-    } catch (e) {
-        console.error('[EXT-SEEKSTREAMING] Error:', e);
-        return { success: false, error: e.message || 'SeekStreaming extraction failed' };
+    } catch (error) {
+        return {
+            success: false,
+            error: error?.name === 'AbortError'
+                ? 'SeekStreaming: upstream timeout'
+                : 'SeekStreaming extraction failed',
+        };
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -1099,10 +1336,7 @@ const EMBED_PATTERNS = {
         return lower.includes('d0000d.com') || lower.includes('doodstream.com') || lower.includes('dood.')
             || lower.includes('myvidplay.com') || lower.includes('dsvplay.com') || lower.includes('doply.net');
     },
-    seekstreaming: url => {
-        const lower = url.toLowerCase();
-        return lower.includes('embedseek.com') || lower.includes('embed4me.com') || lower.includes('seekstreaming');
-    },
+    seekstreaming: url => Boolean(parseSeekStreamingEmbedUrl(url)),
 };
 
 const EXTRACT_FN = {
@@ -1210,7 +1444,7 @@ async function extractAll(sources) {
  */
 async function setupHeadersForService(type, url, referer) {
     // Fsvid needs different referers:
-    // - Embed page (fsvid.lol/embed-xxx) → fs12.lol (required by fsvid to serve content)
+    // - Embed page (fsvid.lol/embed-xxx) → fsmirror46.lol (required by fsvid to serve content)
     // - CDN/M3U8 (s1.fsvid.lol, s2.fsvid.lol, etc.) → fsvid.lol (required by CDN)
     let fsvidHeaders;
     let uqloadHeaders;
@@ -1218,9 +1452,9 @@ async function setupHeadersForService(type, url, referer) {
         try {
             const hostname = new URL(url).hostname;
             // CDN subdomains (s1.fsvid.lol, s2.fsvid.lol, etc.) need fsvid.lol referer
-            // Embed pages (fsvid.lol) need fs12.lol referer
+            // Embed pages (fsvid.lol) need the current mirror referer
             if (hostname === 'fsvid.lol') {
-                fsvidHeaders = { 'Referer': 'https://fs12.lol/', 'Origin': 'https://fs12.lol' };
+                fsvidHeaders = { 'Referer': 'https://fsmirror46.lol/', 'Origin': 'https://fsmirror46.lol' };
             } else {
                 fsvidHeaders = { 'Referer': 'https://fsvid.lol/', 'Origin': 'https://fsvid.lol' };
             }
@@ -1236,6 +1470,10 @@ async function setupHeadersForService(type, url, referer) {
             return null;
         }
     }
+    const seekHeaders = type === 'seekstreaming'
+        ? getSeekStreamingRequestHeaders(referer || url)
+        : null;
+    if (type === 'seekstreaming' && !seekHeaders) return null;
 
     const headerMap = {
         voe: { 'Referer': 'https://voe.sx/', 'Origin': 'https://voe.sx' },
@@ -1245,8 +1483,9 @@ async function setupHeadersForService(type, url, referer) {
         sibnet: { 'Referer': 'https://video.sibnet.ru/', 'Origin': 'https://video.sibnet.ru' },
         uqload: uqloadHeaders,
         doodstream: { 'Referer': referer || 'https://d0000d.com/', 'Origin': referer ? new URL(referer).origin : 'https://d0000d.com' },
-        seekstreaming: { 'Referer': referer || 'https://lpayer.embed4me.com/', 'Origin': referer ? new URL(referer).origin : 'https://lpayer.embed4me.com' },
+        seekstreaming: seekHeaders,
         cinep: { 'Referer': 'https://purstream.mx/', 'Origin': 'https://purstream.mx' },
+        kisskh: { 'Referer': 'https://kisskh.nl/', 'Origin': 'https://kisskh.nl' },
     };
 
     const hdrs = headerMap[type];
@@ -1256,9 +1495,12 @@ async function setupHeadersForService(type, url, referer) {
         const parsedUrl = new URL(url);
         // Sibnet redirects to CDN subdomains (e.g. dv97.sibnet.ru),
         // so we use a wildcard pattern to cover all subdomains.
-        const domainPattern = type === 'sibnet'
-            ? '*://*.sibnet.ru/*'
-            : `*://${parsedUrl.hostname}/*`;
+        const domainPattern = type === 'seekstreaming'
+            ? getSeekStreamingPlaybackRulePattern(url)
+            : (type === 'sibnet'
+                ? '*://*.sibnet.ru/*'
+                : `*://${parsedUrl.hostname}/*`);
+        if (!domainPattern) return null;
         return { domainPattern, headers: hdrs };
     } catch (e) {
         console.error(`[EXT-EXTRACT] Failed to setup headers for ${type}:`, e);

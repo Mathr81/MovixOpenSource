@@ -10,7 +10,7 @@ import {
   TouchableOpacity,
   Image,
   Animated,
-  DeviceEventEmitter,
+  AppState,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { WebViewNavigation } from 'react-native-webview';
@@ -20,7 +20,8 @@ import WebViewBrowser, { type WebViewBrowserRef } from '../components/WebViewBro
 import BrowserToolbar from '../components/BrowserToolbar';
 import MiniPill from '../components/MiniPill';
 import MirrorErrorScreen from '../components/MirrorErrorScreen';
-import { startCastShimEventForwarding } from '../services/bridge';
+import { setLocalPlaybackAwake } from '../services/playbackAwake';
+import { setPictureInPicturePlaybackActive } from '../services/pictureInPicture';
 import { useBrowserUIPrefs } from '../hooks/useBrowserUIPrefs';
 import { useAddress } from '../context/AddressContext';
 import SettingsScreen from './SettingsScreen';
@@ -29,7 +30,6 @@ export default function BrowserScreen() {
   const insets = useSafeAreaInsets();
   const webViewRef = useRef<WebViewBrowserRef>(null);
   const [isVideoPlaying, setIsVideoPlaying] = useState(false);
-  const [isAndroidPip, setIsAndroidPip] = useState(false);
   const { prefs: uiPrefs } = useBrowserUIPrefs();
   const { config, isLoading, refresh } = useAddress();
 
@@ -51,6 +51,7 @@ export default function BrowserScreen() {
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [webViewReady, setWebViewReady] = useState(false);
   const splashFade = useRef(new Animated.Value(1)).current;
+  const [isPictureInPictureActive, setIsPictureInPictureActive] = useState(false);
 
   const activeUrl = urlChain[mirrorIndex] ?? '';
 
@@ -79,41 +80,24 @@ export default function BrowserScreen() {
   }, [canGoBack, settingsVisible]);
 
   useEffect(() => {
-    const unsub = startCastShimEventForwarding(webViewRef);
-    return unsub;
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        webViewRef.current?.refreshCastShimStatus();
+      }
+    });
+    return () => subscription.remove();
+  }, [activeUrl]);
+
+  useEffect(() => () => {
+    setPictureInPicturePlaybackActive(false);
+    setLocalPlaybackAwake(false);
   }, []);
 
-  // Android : pilotage de la fenêtre Picture-in-Picture.
-  //  - PIP_MODE_CHANGED : masque la barre de paramètres (MiniPill/toolbar) tant
-  //    que la fenêtre flottante est affichée.
-  //  - PIP_CONTROL : relaie les appuis sur les boutons play/pause de la fenêtre
-  //    PiP vers l'élément <video> du lecteur web.
-  useEffect(() => {
-    if (Platform.OS !== 'android') return;
-
-    const modeSub = DeviceEventEmitter.addListener(
-      'PIP_MODE_CHANGED',
-      (e: { inPip?: boolean }) => setIsAndroidPip(!!e?.inPip),
-    );
-    const controlSub = DeviceEventEmitter.addListener(
-      'PIP_CONTROL',
-      (e: { control?: string }) => {
-        if (e?.control === 'play') {
-          webViewRef.current?.injectJavaScript(
-            'try{window.__movixActiveVideo&&window.__movixActiveVideo.play();}catch(e){} true;',
-          );
-        } else if (e?.control === 'pause') {
-          webViewRef.current?.injectJavaScript(
-            'try{window.__movixActiveVideo&&window.__movixActiveVideo.pause();}catch(e){} true;',
-          );
-        }
-      },
-    );
-
-    return () => {
-      modeSub.remove();
-      controlSub.remove();
-    };
+  const onPictureInPictureModeChange = useCallback((active: boolean) => {
+    if (active) {
+      setSettingsVisible(false);
+    }
+    setIsPictureInPictureActive(active);
   }, []);
 
   const onMediaPlayback = useCallback((playing: boolean) => {
@@ -186,7 +170,8 @@ export default function BrowserScreen() {
   // (la fenêtre flottante ne doit afficher que la WebView, sans la barre de
   // paramètres ni le padding de status bar).
   const immersive =
-    (Platform.OS === 'ios' && isVideoPlaying && !settingsVisible) || isAndroidPip;
+    (Platform.OS === 'ios' && isVideoPlaying && !settingsVisible) ||
+    isPictureInPictureActive;
 
   return (
     <View style={[styles.container, { paddingTop: immersive ? 0 : insets.top }]}>
@@ -202,6 +187,7 @@ export default function BrowserScreen() {
             onError={onWebViewError}
             onLoadEnd={onWebViewLoadEnd}
             onMediaPlayback={onMediaPlayback}
+            onPictureInPictureModeChange={onPictureInPictureModeChange}
           />
         </View>
       )}
@@ -210,7 +196,7 @@ export default function BrowserScreen() {
         <MirrorErrorScreen telegramUrl={config.telegramUrl} onRetry={onRetry} />
       )}
 
-      {!toolbarHidden && showWebView && !immersive && (
+      {!isPictureInPictureActive && !toolbarHidden && showWebView && !immersive && (
         <View style={{ paddingBottom: insets.bottom }}>
           <BrowserToolbar
             canGoBack={canGoBack}
@@ -231,7 +217,7 @@ export default function BrowserScreen() {
 
       {showWebView && (
         <Modal
-          visible={settingsVisible}
+          visible={!isPictureInPictureActive && settingsVisible}
           animationType="slide"
           onRequestClose={closeSettings}>
           <View style={[styles.modalContainer, { paddingTop: insets.top }]}>
@@ -247,7 +233,7 @@ export default function BrowserScreen() {
         </Modal>
       )}
 
-      {navBarHidden && showWebView && !immersive && (
+      {!isPictureInPictureActive && navBarHidden && showWebView && !immersive && (
         <MiniPill onPress={() => setSettingsVisible(true)} />
       )}
 

@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSocialPreviewResponse } from '../functions/_lib/socialPreview.js';
+import { registerGracefulShutdown } from './gracefulShutdown.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -62,6 +63,8 @@ app.get('*', async (c) => {
 });
 
 const port = Number(process.env.PORT) || 3001;
-serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
+const server = serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
   console.log(`[server] Movix Hono → http://0.0.0.0:${info.port}`);
 });
+
+registerGracefulShutdown(server);

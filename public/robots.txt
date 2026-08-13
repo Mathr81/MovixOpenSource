@@ -28,4 +28,4 @@ Allow: /
 User-agent: *
 Allow: /
 
-Sitemap: https://movix.cash/sitemap-index.xml
+Sitemap: __MOVIX_SITE_URL__/sitemap.xml

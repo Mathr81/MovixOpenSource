@@ -6,6 +6,7 @@ const { BIP32Factory } = require('bip32');
 
 const { invalidateVipCache } = require('../checkVip');
 const { fetchAddressTxs, fetchTipHeight } = require('./chainExplorer');
+const vipPaygate = require('./vipPaygate');
 
 bitcoin.initEccLib(ecc);
 
@@ -30,7 +31,6 @@ const VIP_PAYMENT_METHOD_ENUM_SQL = "ENUM('btc', 'ltc', 'paygate_hosted', 'autob
 const DEFAULT_SUPPORT_TELEGRAM_URL = 'https://t.me/movix_site';
 const FINAL_STATUSES = new Set(['delivered', 'cancelled']);
 const DEFAULT_EXPIRATION_MINUTES = 210;
-const PAYGATE_DEFAULT_DOMAIN = 'checkout.paygate.to';
 const DEFAULT_PAYGATE_MIN_PAID_RATIO = 0.60;
 const DEFAULT_PAYGATE_MIN_AMOUNT_EUR = 6.25;
 const DEFAULT_PAYGATE_MIN_PACK_EUR = 7;
@@ -81,8 +81,6 @@ const EXTENDED_KEY_FORMATS = {
     Ltub: { bip32Public: 0x019da462, defaultAddressType: 'legacy' }
   }
 };
-
-const PAYGATE_PRICE_CONVERT_COINS = new Set(['polygon_pol', 'eth', 'bep20_bnb']);
 
 function parseNumber(value, fallback = 0) {
   const parsed = Number(value);
@@ -214,10 +212,9 @@ function normalizeAddressType(addressType, fallback) {
 }
 
 function getPaygateCheckoutDomain() {
-  return String(process.env.VIP_PAYGATE_DOMAIN || PAYGATE_DEFAULT_DOMAIN)
-    .trim()
-    .replace(/^https?:\/\//i, '')
-    .replace(/\/+$/, '');
+  return String(
+    process.env.VIP_PAYGATE_DOMAIN || vipPaygate.PAYGATE_DEFAULT_CHECKOUT_HOST
+  ).trim();
 }
 
 function getPaygatePayoutWallet() {
@@ -274,71 +271,41 @@ function getPaygateBranding() {
 }
 
 function getPaygateCallbackBaseUrl(context = {}) {
-  const envBaseUrl = normalizeBaseUrl(process.env.VIP_PAYGATE_CALLBACK_BASE_URL);
-  if (envBaseUrl) {
-    return envBaseUrl;
-  }
-
-  return normalizeBaseUrl(context.callbackBaseUrl);
-}
-
-function buildPaygateCallbackUrl(publicId, callbackNonce, context = {}) {
-  const callbackBaseUrl = getPaygateCallbackBaseUrl(context);
-  if (!callbackBaseUrl) {
-    throw new Error('VIP PayGate callback URL introuvable');
-  }
-
-  const query = new URLSearchParams({
-    publicId,
-    nonce: callbackNonce
+  const configured = normalizeBaseUrl(process.env.VIP_PAYGATE_CALLBACK_BASE_URL);
+  const isProduction = process.env.NODE_ENV === 'production';
+  const candidate = configured || (isProduction ? '' : normalizeBaseUrl(context.callbackBaseUrl));
+  return vipPaygate.normalizeCallbackBaseUrl(candidate, {
+    requireHttps: isProduction
   });
-
-  return `${callbackBaseUrl}/api/vip/paygate/callback?${query.toString()}`;
-}
-
-function buildPaygateCheckoutUrl({ trackingAddress, amountEur, payerEmail, branding = {} }) {
-  const domain = getPaygateCheckoutDomain();
-  if (!domain) {
-    throw new Error('VIP PayGate domain manquant');
-  }
-
-  const queryParts = [
-    `address=${String(trackingAddress || '').trim()}`,
-    `amount=${roundFiat(amountEur).toFixed(2)}`,
-    `email=${encodeURIComponent(String(payerEmail || '').trim())}`,
-    'currency=EUR'
-  ];
-
-  if (branding.logo) queryParts.push(`logo=${encodeURIComponent(branding.logo)}`);
-  if (branding.background) queryParts.push(`background=${encodeURIComponent(branding.background)}`);
-  if (branding.theme) queryParts.push(`theme=${encodeURIComponent(branding.theme)}`);
-  if (branding.button) queryParts.push(`button=${encodeURIComponent(branding.button)}`);
-
-  return `https://${domain}/pay.php?${queryParts.join('&')}`;
 }
 
 function resolvePaygateCheckoutUrl(invoice) {
-  if (!invoice) {
-    return null;
-  }
+  return invoice?.paygate_checkout_url || null;
+}
 
-  const trackingAddress = String(invoice.paygate_tracking_address || invoice.payment_address || '').trim();
-  const payerEmail = normalizeEmailAddress(invoice.paygate_payer_email);
+function getPaygateClient(overrides = {}) {
+  return overrides.paygateClient || vipPaygate.createPaygateClient();
+}
 
-  if (!trackingAddress || !payerEmail) {
-    return invoice.paygate_checkout_url || null;
-  }
+function logPaygateFailure(operation, error, reference = null) {
+  console.error('VIP PayGate operation failed', {
+    operation,
+    reference,
+    code: error?.code || 'PAYGATE_INTERNAL_ERROR',
+    upstreamStatus: error?.upstreamStatus || error?.response?.status || null
+  });
+}
 
-  try {
-    return buildPaygateCheckoutUrl({
-      trackingAddress,
-      amountEur: getPaygateCheckoutAmountEur(invoice.amount_eur),
-      payerEmail,
-      branding: getPaygateBranding()
-    });
-  } catch (error) {
-    return invoice.paygate_checkout_url || null;
-  }
+function mapPaygateServiceError(error, operation, reference = null) {
+  logPaygateFailure(operation, error, reference);
+  const statusCode = Number(error?.statusCode);
+  const mapped = createVipInvoiceError(
+    'Service PayGate temporairement indisponible',
+    statusCode >= 500 && statusCode <= 599 ? statusCode : 502
+  );
+  mapped.code = error?.code || 'PAYGATE_INTERNAL_ERROR';
+  mapped.upstreamStatus = error?.upstreamStatus || error?.response?.status || null;
+  return mapped;
 }
 
 function getStartDerivationIndex(coin) {
@@ -460,101 +427,10 @@ async function buildPricingSnapshot(coin, amountEur) {
 }
 
 async function fetchPaygateConvertedUsd(amount, fromCurrency = 'eur') {
-  const response = await axios.get(
-    'https://api.paygate.to/control/convert.php',
-    {
-      params: {
-        value: roundFiat(amount).toFixed(2),
-        from: String(fromCurrency || 'eur').trim().toLowerCase()
-      },
-      timeout: 15000
-    }
-  );
-
-  const usdAmount = parseNumber(response.data?.value_coin);
-  if (!usdAmount) {
-    throw new Error('Impossible de convertir le montant via PayGate');
+  if (String(fromCurrency).trim().toLowerCase() !== 'eur') {
+    throw new Error('Conversion PayGate non supportée');
   }
-
-  return roundFiat(usdAmount);
-}
-
-async function fetchPaygateTemporaryWallet(callbackUrl) {
-  const payoutWallet = getPaygatePayoutWallet();
-  if (!payoutWallet) {
-    throw new Error('VIP_PAYGATE_SETTLEMENT_WALLET manquant');
-  }
-
-  const response = await axios.get(
-    'https://api.paygate.to/control/wallet.php',
-    {
-      params: {
-        address: payoutWallet,
-        callback: callbackUrl
-      },
-      timeout: 15000
-    }
-  );
-
-  const trackingAddress = String(response.data?.address_in || '').trim();
-  const temporaryWalletAddress = String(response.data?.polygon_address_in || '').trim();
-  const callbackUrlFromGateway = String(response.data?.callback_url || '').trim();
-  const ipnToken = String(response.data?.ipn_token || '').trim();
-
-  if (!trackingAddress) {
-    throw new Error('PayGate n\'a pas retourné d\'adresse de suivi');
-  }
-
-  return {
-    trackingAddress,
-    temporaryWalletAddress: temporaryWalletAddress || null,
-    callbackUrl: callbackUrlFromGateway || null,
-    ipnToken: ipnToken || null
-  };
-}
-
-// Poll officiel PayGate (payment-status.php) via l'ipn_token retourné par
-// wallet.php. Filet de sécurité quand le callback GET de PayGate n'atteint
-// jamais notre serveur (WAF, timeout, outage) — sinon l'invoice reste bloquée
-// en awaiting_payment alors que le paiement est passé.
-async function fetchPaygatePaymentStatus(ipnToken) {
-  const response = await axios.get(
-    'https://api.paygate.to/control/payment-status.php',
-    {
-      params: { ipn_token: ipnToken },
-      timeout: 15000
-    }
-  );
-
-  return response.data || {};
-}
-
-async function normalizePaygatePaidUsdValue(receivedCoin, paidValue) {
-  const rawValue = parseNumber(paidValue);
-  if (!rawValue) {
-    return 0;
-  }
-
-  const normalizedCoin = String(receivedCoin || '').trim().toLowerCase();
-  if (!PAYGATE_PRICE_CONVERT_COINS.has(normalizedCoin)) {
-    return roundFiat(rawValue);
-  }
-
-  try {
-    const coinPath = normalizedCoin.replace('_', '/');
-    const response = await axios.get(
-      `https://api.paygate.to/crypto/${coinPath}/info.php`,
-      { timeout: 15000 }
-    );
-    const usdPrice = parseNumber(response.data?.prices?.USD);
-    if (!usdPrice) {
-      return roundFiat(rawValue);
-    }
-
-    return roundFiat(rawValue * usdPrice);
-  } catch (error) {
-    return roundFiat(rawValue);
-  }
+  return vipPaygate.createPaygateClient().convertEurToUsd(amount);
 }
 
 function buildQrPayload(coin, address, amountCryptoExpected) {
@@ -727,6 +603,9 @@ async function deliverInvoiceIfReady(pool, invoiceId, actorType = 'system', acto
     }
 
     const invoice = rows[0];
+    if (isPaygatePaymentMethod(getInvoicePaymentMethod(invoice))) {
+      requireValidPaygateInvoiceAmountUsd(invoice);
+    }
     if (invoice.status === 'delivered' && invoice.vip_key_value) {
       await connection.commit();
       return invoice;
@@ -769,7 +648,6 @@ async function deliverInvoiceIfReady(pool, invoiceId, actorType = 'system', acto
       'Clé VIP livrée automatiquement.',
       {
         reason,
-        keyValue,
         vipYears,
         durationMonths: totalMonths,
         durationLabel
@@ -958,6 +836,7 @@ function serializeAdminInvoice(invoice) {
   return {
     ...serializePublicInvoice(invoice),
     id: parseNumber(invoice.id),
+    callbackUrl: null,
     derivationIndex: parseNumber(invoice.derivation_index, -1) >= 0
       ? parseNumber(invoice.derivation_index)
       : null,
@@ -972,7 +851,6 @@ function serializeAdminInvoice(invoice) {
     createdIpHash: invoice.created_ip_hash || null,
     payerEmail: invoice.paygate_payer_email || invoice.payblis_payer_email || null,
     temporaryWalletAddress: invoice.paygate_temporary_wallet_address || null,
-    callbackUrl: invoice.paygate_callback_url || null,
     paidCoin: invoice.paygate_paid_coin || null,
     paidValue: invoice.paygate_paid_value !== null && invoice.paygate_paid_value !== undefined
       ? roundFiat(invoice.paygate_paid_value)
@@ -1032,6 +910,101 @@ async function listUserVipInvoices(pool, auth, options = {}) {
   return normalizedRows.map(serializePublicInvoice);
 }
 
+async function recordPaygateUnpaidReconciliation(
+  pool,
+  invoiceId,
+  expectedIpnToken,
+  options = {}
+) {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT * FROM vip_invoices WHERE id = ? FOR UPDATE',
+      [invoiceId]
+    );
+    const invoice = rows[0];
+    if (!invoice) {
+      throw createPaygateCallbackError('PAYGATE_INVOICE_NOT_FOUND', 404);
+    }
+    const isStillEligible = (
+      isPaygatePaymentMethod(getInvoicePaymentMethod(invoice))
+      && !FINAL_STATUSES.has(invoice.status)
+      && invoice.status !== 'paid'
+      && invoice.paygate_ipn_token === expectedIpnToken
+    );
+    if (!isStillEligible) {
+      await connection.commit();
+      return invoice;
+    }
+    requireValidPaygateInvoiceAmountUsd(invoice);
+
+    await logVipInvoiceEvent(
+      connection,
+      invoice.id,
+      'invoice_paygate_admin_reconciliation_unpaid',
+      'Réconciliation PayGate administrateur: paiement non détecté.',
+      { previousStatus: invoice.status, result: 'unpaid' },
+      options.actorType || 'admin',
+      options.actorId || null
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  return fetchInvoiceById(pool, invoiceId);
+}
+
+async function reconcilePaygateInvoiceStatus(pool, invoice, options = {}) {
+  if (
+    !invoice
+    || !isPaygatePaymentMethod(getInvoicePaymentMethod(invoice))
+    || FINAL_STATUSES.has(invoice.status)
+    || !invoice.paygate_ipn_token
+  ) {
+    return invoice;
+  }
+
+  const paygateClient = getPaygateClient(options);
+  const status = await paygateClient.fetchPaymentStatus(invoice.paygate_ipn_token);
+  if (status.status === 'unpaid') {
+    return recordPaygateUnpaidReconciliation(
+      pool,
+      invoice.id,
+      invoice.paygate_ipn_token,
+      options
+    );
+  }
+
+  const paidUsd = await paygateClient.convertPaymentToUsd({
+    coin: status.coin,
+    valueCoin: status.valueCoin
+  });
+  return applyPaygatePaymentObservation(
+    pool,
+    invoice.id,
+    {
+      coin: status.coin,
+      paidUsd,
+      valueCoin: status.valueCoin,
+      txidIn: null,
+      txidOut: status.txidOut
+    },
+    {
+      source: 'admin_reconciliation',
+      eventType: 'invoice_paygate_admin_reconciliation_paid',
+      actorType: options.actorType || 'admin',
+      actorId: options.actorId || null,
+      reason: 'paygate_admin_reconciliation',
+      deliverInvoice: options.deliverInvoice
+    }
+  );
+}
+
 async function refreshInvoiceStatus(pool, invoiceInput, options = {}) {
   const invoice = invoiceInput?.id ? invoiceInput : await fetchInvoiceById(pool, invoiceInput);
   if (!invoice) {
@@ -1081,69 +1054,22 @@ async function refreshInvoiceStatus(pool, invoiceInput, options = {}) {
   }
 
   if (isPaygatePaymentMethod(paymentMethod)) {
-    // Fallback officiel PayGate: si le callback n'est jamais arrivé, on
-    // interroge payment-status.php avec l'ipn_token stocké à la création.
-    // Couvre aussi les invoices expirées côté Movix mais payées côté PayGate.
-    if (invoice.status !== 'paid' && invoice.paygate_ipn_token) {
-      try {
-        const statusPayload = await fetchPaygatePaymentStatus(invoice.paygate_ipn_token);
-        if (String(statusPayload?.status || '').trim().toLowerCase() === 'paid') {
-          return markPaygateInvoicePaidFromStatusPoll(pool, invoice, statusPayload, {
-            actorType: options.actorType || 'system',
-            actorId: options.actorId || null
-          });
-        }
-      } catch (error) {
-        // Non-fatal — poll de secours, le callback reste la voie principale.
-      }
-    }
-
-    const isExpired = fromSqlDateTime(invoice.expires_at)?.getTime() < Date.now();
-    const shouldExpire = invoice.status === 'awaiting_payment' && isExpired;
-
-    if (shouldExpire) {
-      await pool.execute(
-        `UPDATE vip_invoices
-          SET status = 'expired',
-              next_check_at = DATE_ADD(NOW(), INTERVAL 25 SECOND),
-              updated_at = NOW()
-          WHERE id = ?`,
-        [invoice.id]
-      );
-
-      await logVipInvoiceEvent(
+    if (invoice.status === 'paid') {
+      const deliver = options.deliverInvoice || deliverInvoiceIfReady;
+      return deliver(
         pool,
         invoice.id,
-        'invoice_status_updated',
-        STATUS_REASONS.expired,
-        {
-          from: invoice.status,
-          to: 'expired'
-        },
-        options.actorType || 'system',
-        options.actorId || null
-      );
-    } else {
-      // 60s (pas 25s): payment-status.php est doc'd "casual basis only",
-      // on espace les polls PayGate pour éviter le rate limit.
-      await pool.execute(
-        'UPDATE vip_invoices SET next_check_at = DATE_ADD(NOW(), INTERVAL 60 SECOND), updated_at = NOW() WHERE id = ?',
-        [invoice.id]
-      );
-    }
-
-    const refreshedInvoice = await fetchInvoiceById(pool, invoice.id);
-    if (refreshedInvoice?.status === 'paid') {
-      return deliverInvoiceIfReady(
-        pool,
-        refreshedInvoice.id,
         options.actorType || 'system',
         options.actorId || null,
-        'paygate_callback'
+        'paygate_paid_recovery'
       );
     }
 
-    return refreshedInvoice;
+    if (options.allowPaygateReconciliation === true) {
+      return reconcilePaygateInvoiceStatus(pool, invoice, options);
+    }
+
+    return expireAwaitingInvoiceIfOverdue(pool, invoice);
   }
 
   if (isAutoBuyPaymentMethod(rawPaymentMethod)) {
@@ -1440,79 +1366,122 @@ async function createPaygateVipInvoice(pool, payload, context = {}) {
   }
 
   const publicId = `inv_${crypto.randomBytes(12).toString('hex')}`;
+  const callbackReference = crypto.randomBytes(24).toString('hex');
   const callbackNonce = crypto.randomBytes(24).toString('hex');
-  const callbackUrl = buildPaygateCallbackUrl(publicId, callbackNonce, context);
-  const checkoutAmountEur = getPaygateCheckoutAmountEur(pack.amountEur);
-  const amountUsd = await fetchPaygateConvertedUsd(checkoutAmountEur, 'eur');
-  const paygateWallet = await fetchPaygateTemporaryWallet(callbackUrl);
-  const expiresAt = new Date(Date.now() + (Math.max(1, parseNumber(process.env.VIP_INVOICE_EXPIRATION_MINUTES, DEFAULT_EXPIRATION_MINUTES)) * 60 * 1000));
-  const giftToken = recipientMode === 'gift' ? `gift_${crypto.randomBytes(16).toString('hex')}` : null;
-  const createdIpHash = hashIp(context.ipAddress);
-  const auth = context.auth || null;
-  const checkoutUrl = buildPaygateCheckoutUrl({
-    trackingAddress: paygateWallet.trackingAddress,
-    amountEur: checkoutAmountEur,
-    payerEmail: normalizedEmail,
-    branding: getPaygateBranding()
-  });
 
-  const [insertResult] = await pool.execute(
-    `INSERT INTO vip_invoices
-      (public_id, payment_method, status, coin, pack_eur, amount_eur, amount_usd, amount_crypto_expected,
-       amount_crypto_received, vip_years, recipient_mode, payment_address, address_type,
-       derivation_index, confirmations, required_confirmations, tx_hash, qr_payload, gift_token,
-       gift_sealed, gift_unsealed_at, gift_unseal_count, gift_unsealed_by_ip_hash,
-       vip_key_value, created_by_user_id, created_by_user_type, created_by_session_id,
-       created_ip_hash, expires_at, next_check_at, paygate_tracking_address, paygate_temporary_wallet_address,
-       paygate_callback_url, paygate_callback_nonce, paygate_checkout_url, paygate_payer_email,
-       paygate_ipn_token, paygate_paid_coin, paygate_paid_value, paygate_paid_txid, created_at, updated_at)
-      VALUES (?, 'paygate_hosted', 'awaiting_payment', NULL, ?, ?, ?, 0, 0, ?, ?, ?, NULL,
-        -1, 0, 0, NULL, '', ?, 1, NULL, 0, NULL, NULL, ?, ?, ?, ?, ?, NOW(),
-        ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NOW(), NOW())`,
-    [
-      publicId,
-      pack.amountEur,
-      checkoutAmountEur,
-      amountUsd,
-      pack.vipYears,
-      recipientMode,
-      paygateWallet.trackingAddress,
-      giftToken,
-      auth?.userId || null,
-      auth?.userType || null,
-      auth?.sessionId || null,
-      createdIpHash,
-      toSqlDateTime(expiresAt),
-      paygateWallet.trackingAddress,
-      paygateWallet.temporaryWalletAddress,
-      paygateWallet.callbackUrl || callbackUrl,
-      callbackNonce,
-      checkoutUrl,
-      normalizedEmail,
-      paygateWallet.ipnToken
-    ]
-  );
-
-  await logVipInvoiceEvent(
-    pool,
-    insertResult.insertId,
-    'invoice_created',
-    'Invoice VIP PayGate créée.',
-    {
-      paymentMethod: 'paygate_hosted',
-      packEur: pack.amountEur,
-      checkoutAmountEur,
-      amountUsd,
-      vipYears: pack.vipYears,
-      recipientMode,
+  try {
+    const callbackUrl = vipPaygate.buildPaygateCallbackUrl({
+      baseUrl: getPaygateCallbackBaseUrl(context),
+      reference: callbackReference,
+      nonce: callbackNonce,
+      requireHttps: process.env.NODE_ENV === 'production'
+    });
+    const checkoutAmountEur = getPaygateCheckoutAmountEur(pack.amountEur);
+    const paygateClient = getPaygateClient(context);
+    const amountUsd = vipPaygate.normalizePaygateInvoiceUsd(
+      await paygateClient.convertEurToUsd(checkoutAmountEur)
+    );
+    const paygateWallet = await paygateClient.createWallet({
+      settlementWallet: getPaygatePayoutWallet(),
+      callbackUrl
+    });
+    const checkoutUrl = vipPaygate.buildPaygateCheckoutUrl({
+      checkoutAddress: paygateWallet.checkoutAddress,
+      amountEur: checkoutAmountEur,
       payerEmail: normalizedEmail,
-      trackingAddress: paygateWallet.trackingAddress
-    },
-    auth ? 'user' : 'guest',
-    auth?.userId || null
-  );
+      branding: getPaygateBranding(),
+      checkoutHost: getPaygateCheckoutDomain()
+    });
+    const expiresAt = new Date(Date.now() + (
+      Math.max(
+        1,
+        parseNumber(
+          process.env.VIP_INVOICE_EXPIRATION_MINUTES,
+          DEFAULT_EXPIRATION_MINUTES
+        )
+      ) * 60 * 1000
+    ));
+    const giftToken = recipientMode === 'gift'
+      ? `gift_${crypto.randomBytes(16).toString('hex')}`
+      : null;
+    const createdIpHash = hashIp(context.ipAddress);
+    const auth = context.auth || null;
+    const connection = await pool.getConnection();
+    let insertId;
 
-  return fetchInvoiceById(pool, insertResult.insertId);
+    try {
+      await connection.beginTransaction();
+      const [insertResult] = await connection.execute(
+        `INSERT INTO vip_invoices
+          (public_id, payment_method, status, pack_eur, amount_eur, amount_usd,
+           amount_crypto_expected, amount_crypto_received, vip_years, recipient_mode,
+           payment_address, derivation_index, confirmations, required_confirmations,
+           qr_payload, gift_token, gift_sealed, gift_unseal_count,
+           created_by_user_id, created_by_user_type, created_by_session_id,
+           created_ip_hash, expires_at, next_check_at,
+           paygate_callback_reference, paygate_tracking_address,
+           paygate_temporary_wallet_address, paygate_callback_url,
+           paygate_callback_nonce, paygate_checkout_url, paygate_payer_email,
+           paygate_ipn_token, created_at, updated_at)
+          VALUES
+          (?, 'paygate_hosted', 'awaiting_payment', ?, ?, ?, 0, 0, ?, ?, ?,
+           -1, 0, 0, '', ?, 1, 0, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?,
+           NOW(), NOW())`,
+        [
+          publicId,
+          pack.amountEur,
+          checkoutAmountEur,
+          amountUsd,
+          pack.vipYears,
+          recipientMode,
+          paygateWallet.checkoutAddress,
+          giftToken,
+          auth?.userId || null,
+          auth?.userType || null,
+          auth?.sessionId || null,
+          createdIpHash,
+          toSqlDateTime(expiresAt),
+          callbackReference,
+          paygateWallet.checkoutAddress,
+          paygateWallet.temporaryWalletAddress,
+          paygateWallet.callbackUrl,
+          callbackNonce,
+          checkoutUrl,
+          normalizedEmail,
+          paygateWallet.ipnToken
+        ]
+      );
+      insertId = insertResult.insertId;
+
+      await logVipInvoiceEvent(
+        connection,
+        insertId,
+        'invoice_created',
+        'Invoice VIP PayGate créée.',
+        {
+          paymentMethod: 'paygate_hosted',
+          packEur: pack.amountEur,
+          checkoutAmountEur,
+          amountUsd,
+          vipYears: pack.vipYears,
+          recipientMode
+        },
+        auth ? 'user' : 'guest',
+        auth?.userId || null
+      );
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    return fetchInvoiceById(pool, insertId);
+  } catch (error) {
+    if (error?.message === 'Adresse email invalide pour PayGate') throw error;
+    throw mapPaygateServiceError(error, 'create_invoice', callbackReference);
+  }
 }
 
 async function createPayblisVipInvoice(pool, { pack, recipientMode, payerEmail, auth }, context) {
@@ -1623,39 +1592,119 @@ async function createPayblisVipInvoice(pool, { pack, recipientMode, payerEmail, 
   return fetchInvoiceById(pool, insertResult.insertId);
 }
 
-async function handlePaygateCallback(pool, payload = {}) {
-  const publicId = String(payload.publicId || payload.public_id || '').trim();
-  const callbackNonce = String(payload.nonce || '').trim();
-  const paidCoin = String(payload.coin || '').trim().toLowerCase() || null;
-  const paidTxid = String(payload.txid_out || payload.txid || '').trim() || null;
-  const rawPaidValue = payload.value_coin;
+function createPaygateCallbackError(code, statusCode) {
+  const error = createVipInvoiceError('Callback PayGate invalide', statusCode);
+  error.code = code;
+  return error;
+}
 
-  if (!publicId) {
-    throw createVipInvoiceError('publicId PayGate manquant');
+function requireValidPaygateInvoiceAmountUsd(invoice) {
+  try {
+    return vipPaygate.normalizePaygateInvoiceUsd(invoice?.amount_usd);
+  } catch {
+    throw createPaygateCallbackError('PAYGATE_INVOICE_AMOUNT_INVALID', 409);
   }
-  if (!callbackNonce) {
-    throw createVipInvoiceError('nonce PayGate manquant', 403);
-  }
+}
 
+async function fetchPaygateInvoiceForCallback(pool, callback) {
+  const [rows] = callback.reference
+    ? await pool.execute(
+      `SELECT * FROM vip_invoices
+        WHERE paygate_callback_reference = ?
+          AND payment_method = 'paygate_hosted'
+        LIMIT 1`,
+      [callback.reference]
+    )
+    : await pool.execute(
+      `SELECT * FROM vip_invoices
+        WHERE public_id = ?
+          AND paygate_callback_reference IS NULL
+          AND payment_method = 'paygate_hosted'
+        LIMIT 1`,
+      [callback.publicId]
+    );
+  if (!rows[0]) {
+    throw createPaygateCallbackError('PAYGATE_CALLBACK_AUTH_FAILED', 403);
+  }
+  return rows[0];
+}
+
+function assertPaygateCallbackBinding(invoice, callback) {
+  if (!isPaygatePaymentMethod(getInvoicePaymentMethod(invoice))) {
+    throw createPaygateCallbackError('PAYGATE_CALLBACK_METHOD_MISMATCH', 409);
+  }
+  if (!vipPaygate.safeComparePaygateNonce(
+    invoice.paygate_callback_nonce,
+    callback.nonce
+  )) {
+    throw createPaygateCallbackError('PAYGATE_CALLBACK_AUTH_FAILED', 403);
+  }
+  const expectedAddress = String(
+    invoice.paygate_temporary_wallet_address || ''
+  ).trim().toLowerCase();
+  if (!expectedAddress || expectedAddress !== callback.addressIn) {
+    throw createPaygateCallbackError('PAYGATE_CALLBACK_ADDRESS_MISMATCH', 403);
+  }
+}
+
+const PAYGATE_PAYMENT_NEEDS_PRICING = Symbol('paygate_payment_needs_pricing');
+
+async function applyPaygatePaymentObservation(pool, invoiceId, payment, options = {}) {
   const connection = await pool.getConnection();
+  let shouldDeliver = false;
   try {
     await connection.beginTransaction();
-
     const [rows] = await connection.execute(
-      'SELECT * FROM vip_invoices WHERE public_id = ? FOR UPDATE',
-      [publicId]
+      'SELECT * FROM vip_invoices WHERE id = ? FOR UPDATE',
+      [invoiceId]
     );
-
-    if (rows.length === 0) {
-      throw createVipInvoiceError('Invoice PayGate introuvable', 404);
-    }
-
     const invoice = rows[0];
-    if (!isPaygatePaymentMethod(getInvoicePaymentMethod(invoice))) {
-      throw createVipInvoiceError('Cette invoice n\'utilise pas PayGate', 409);
+    if (!invoice) {
+      throw createPaygateCallbackError('PAYGATE_INVOICE_NOT_FOUND', 404);
     }
-    if (!invoice.paygate_callback_nonce || invoice.paygate_callback_nonce !== callbackNonce) {
-      throw createVipInvoiceError('Nonce PayGate invalide', 403);
+    if (typeof options.validateInvoice === 'function') {
+      options.validateInvoice(invoice);
+    }
+    const invoiceAmountUsd = requireValidPaygateInvoiceAmountUsd(invoice);
+
+    const existingTxidIn = String(invoice.paygate_paid_txid_in || '').toLowerCase();
+    const existingTxidOut = String(invoice.paygate_paid_txid || '').toLowerCase();
+    const existingCoin = String(invoice.paygate_paid_coin || '').toLowerCase();
+    if (existingTxidIn && payment.txidIn && existingTxidIn !== payment.txidIn) {
+      throw createPaygateCallbackError('PAYGATE_TXID_CHANGED', 409);
+    }
+    if (existingTxidOut && payment.txidOut && existingTxidOut !== payment.txidOut) {
+      throw createPaygateCallbackError('PAYGATE_TXID_OUT_CHANGED', 409);
+    }
+    if (existingCoin && payment.coin && existingCoin !== payment.coin) {
+      throw createPaygateCallbackError('PAYGATE_COIN_CHANGED', 409);
+    }
+    if (payment.txidIn) {
+      const [owners] = await connection.execute(
+        `SELECT id FROM vip_invoices
+          WHERE paygate_paid_txid_in = ?
+            AND id <> ?
+          LIMIT 1`,
+        [payment.txidIn, invoice.id]
+      );
+      if (owners.length > 0) {
+        throw createPaygateCallbackError('PAYGATE_TXID_ALREADY_USED', 409);
+      }
+    }
+
+    if (payment.txidIn && !existingTxidIn && invoice.status !== 'cancelled') {
+      const [claimResult] = await connection.execute(
+        `UPDATE vip_invoices
+          SET paygate_paid_txid_in = ?
+          WHERE id = ?
+            AND paygate_paid_txid_in IS NULL
+            AND status <> 'cancelled'`,
+        [payment.txidIn, invoice.id]
+      );
+      if (parseNumber(claimResult?.affectedRows, 0) !== 1) {
+        throw createPaygateCallbackError('PAYGATE_STATE_CONFLICT', 409);
+      }
+      invoice.paygate_paid_txid_in = payment.txidIn;
     }
 
     if (invoice.status === 'delivered' || invoice.status === 'cancelled') {
@@ -1663,169 +1712,197 @@ async function handlePaygateCallback(pool, payload = {}) {
       return invoice;
     }
 
-    const paidValue = await normalizePaygatePaidUsdValue(paidCoin, rawPaidValue);
-    const minimumPaidAmount = roundFiat(parseNumber(invoice.amount_usd) * getPaygateMinPaidRatio());
-    const nextStatus = paidValue >= minimumPaidAmount && paidValue > 0 ? 'paid' : 'partial_payment';
-    const shouldMarkPaidAt = nextStatus === 'paid' && !invoice.paid_at;
+    if (invoice.status === 'paid') {
+      shouldDeliver = true;
+      await connection.commit();
+    } else {
+      const allowedStatuses = new Set([
+        'awaiting_payment',
+        'partial_payment',
+        'expired'
+      ]);
+      if (!allowedStatuses.has(invoice.status)) {
+        await connection.commit();
+        return invoice;
+      }
 
-    await connection.execute(
-      `UPDATE vip_invoices
-        SET status = ?,
-            tx_hash = COALESCE(?, tx_hash),
-            paid_at = CASE WHEN ? THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
-            paygate_paid_coin = ?,
-            paygate_paid_value = ?,
-            paygate_paid_txid = ?,
-            next_check_at = DATE_ADD(NOW(), INTERVAL 25 SECOND),
-            updated_at = NOW()
-        WHERE id = ?`,
-      [
-        nextStatus,
-        paidTxid,
-        shouldMarkPaidAt ? 1 : 0,
-        paidCoin,
-        paidValue,
-        paidTxid,
-        invoice.id
-      ]
-    );
+      const previousValue = parseNumber(invoice.paygate_paid_value, 0);
+      const previousValueCoin = roundCrypto(invoice.amount_crypto_received);
+      if (previousValue > 0 && previousValueCoin <= 0) {
+        throw createPaygateCallbackError('PAYGATE_PAYMENT_BASELINE_MISSING', 409);
+      }
 
-    await logVipInvoiceEvent(
-      connection,
-      invoice.id,
-      'invoice_paygate_callback',
-      nextStatus === 'paid'
-        ? 'Callback PayGate validé, invoice marquée comme payée.'
-        : 'Callback PayGate reçu avec montant insuffisant.',
-      {
-        previousStatus: invoice.status,
-        nextStatus,
-        paidCoin,
-        paidValue,
-        paidTxid,
-        minimumPaidAmount
-      },
-      'gateway',
-      'paygate'
-    );
+      const observedValueCoin = roundCrypto(payment.valueCoin);
+      if (observedValueCoin <= previousValueCoin) {
+        await connection.commit();
+        return invoice;
+      }
 
-    await connection.commit();
+      if (payment.paidUsd === undefined || payment.paidUsd === null) {
+        await connection.commit();
+        return PAYGATE_PAYMENT_NEEDS_PRICING;
+      }
+      const paidUsd = Number(payment.paidUsd);
+      if (!Number.isFinite(paidUsd) || paidUsd <= 0) {
+        throw createPaygateCallbackError('PAYGATE_CONVERSION_INVALID', 502);
+      }
+      const nextPaidValue = Math.max(previousValue, paidUsd);
+      const minimumPaidAmount = roundFiat(
+        invoiceAmountUsd * getPaygateMinPaidRatio()
+      );
+      const nextStatus = nextPaidValue >= minimumPaidAmount
+        ? 'paid'
+        : 'partial_payment';
+      const shouldMarkPaidAt = nextStatus === 'paid' && !invoice.paid_at;
+      const [updateResult] = await connection.execute(
+        `UPDATE vip_invoices
+          SET status = ?,
+              tx_hash = COALESCE(tx_hash, ?),
+              paid_at = CASE
+                WHEN ? THEN COALESCE(paid_at, NOW())
+                ELSE paid_at
+              END,
+              paygate_paid_coin = ?,
+              paygate_paid_value = ?,
+              amount_crypto_received = ?,
+              paygate_paid_txid_in = COALESCE(paygate_paid_txid_in, ?),
+              paygate_paid_txid = COALESCE(paygate_paid_txid, ?),
+              next_check_at = CASE
+                WHEN ? = 'paid' THEN NULL
+                ELSE DATE_ADD(NOW(), INTERVAL 60 SECOND)
+              END,
+              updated_at = NOW()
+          WHERE id = ?
+            AND status IN ('awaiting_payment', 'partial_payment', 'expired')`,
+        [
+          nextStatus,
+          payment.txidOut,
+          shouldMarkPaidAt ? 1 : 0,
+          payment.coin,
+          nextPaidValue,
+          observedValueCoin,
+          payment.txidIn || null,
+          payment.txidOut,
+          nextStatus,
+          invoice.id
+        ]
+      );
+      if (parseNumber(updateResult?.affectedRows, 0) !== 1) {
+        throw createPaygateCallbackError('PAYGATE_STATE_CONFLICT', 409);
+      }
+
+      await logVipInvoiceEvent(
+        connection,
+        invoice.id,
+        options.eventType || 'invoice_paygate_callback',
+        nextStatus === 'paid'
+          ? 'Paiement PayGate validé.'
+          : 'Paiement PayGate partiel validé.',
+        {
+          previousStatus: invoice.status,
+          nextStatus,
+          paidCoin: payment.coin,
+          paidValue: nextPaidValue,
+          txidIn: payment.txidIn || null,
+          txidOut: payment.txidOut,
+          minimumPaidAmount,
+          source: options.source || 'callback'
+        },
+        options.actorType || 'gateway',
+        options.actorId || 'paygate'
+      );
+      shouldDeliver = nextStatus === 'paid';
+      await connection.commit();
+    }
   } catch (error) {
     await connection.rollback();
+    if (error?.code === 'ER_DUP_ENTRY' || Number(error?.errno) === 1062) {
+      throw createPaygateCallbackError('PAYGATE_TXID_ALREADY_USED', 409);
+    }
     throw error;
   } finally {
     connection.release();
   }
 
-  const refreshedInvoice = await fetchInvoiceByPublicId(pool, publicId);
-  if (refreshedInvoice?.status === 'paid') {
-    return deliverInvoiceIfReady(pool, refreshedInvoice.id, 'gateway', 'paygate', 'paygate_callback');
+  const refreshed = await fetchInvoiceById(pool, invoiceId);
+  if (shouldDeliver && refreshed?.status === 'paid') {
+    const deliver = options.deliverInvoice || deliverInvoiceIfReady;
+    return deliver(
+      pool,
+      invoiceId,
+      options.actorType || 'gateway',
+      options.actorId || 'paygate',
+      options.reason || 'paygate_callback'
+    );
   }
-
-  return refreshedInvoice;
+  return refreshed;
 }
 
-// Marque une invoice PayGate payée depuis un poll payment-status.php confirmé.
-// Même seuil (min ratio USD) et mêmes colonnes que handlePaygateCallback, mais
-// sans nonce : l'ipn_token stocké en DB authentifie déjà la requête sortante.
-async function markPaygateInvoicePaidFromStatusPoll(pool, invoiceInput, statusPayload, options = {}) {
-  const baseInvoice = invoiceInput?.id ? invoiceInput : await fetchInvoiceById(pool, invoiceInput);
-  if (!baseInvoice) return null;
-  if (FINAL_STATUSES.has(baseInvoice.status)) return baseInvoice;
-  if (!isPaygatePaymentMethod(getInvoicePaymentMethod(baseInvoice))) return baseInvoice;
+async function handlePaygateCallback(pool, payload = {}, deps = {}) {
+  const callback = vipPaygate.parsePaygateCallbackPayload(payload);
+  const invoice = await fetchPaygateInvoiceForCallback(pool, callback);
+  assertPaygateCallbackBinding(invoice, callback);
 
-  const paidCoin = String(statusPayload?.coin || '').trim().toLowerCase() || null;
-  const paidTxid = String(statusPayload?.txid_out || '').trim() || null;
-  const paidValue = await normalizePaygatePaidUsdValue(paidCoin, statusPayload?.value_coin);
-  const minimumPaidAmount = roundFiat(parseNumber(baseInvoice.amount_usd) * getPaygateMinPaidRatio());
-  const nextStatus = paidValue >= minimumPaidAmount && paidValue > 0 ? 'paid' : 'partial_payment';
-
-  // Idempotence: poll répété sans changement → pas d'UPDATE ni d'event spam.
-  if (
-    baseInvoice.status === nextStatus
-    && roundFiat(parseNumber(baseInvoice.paygate_paid_value)) === paidValue
-    && (paidTxid || null) === (baseInvoice.paygate_paid_txid || null)
-  ) {
-    return baseInvoice;
+  const payment = {
+    coin: callback.coin,
+    valueCoin: callback.valueCoin,
+    txidIn: callback.txidIn,
+    txidOut: callback.txidOut
+  };
+  const options = {
+    source: 'callback',
+    eventType: 'invoice_paygate_callback',
+    actorType: 'gateway',
+    actorId: 'paygate',
+    reason: 'paygate_callback',
+    validateInvoice: (lockedInvoice) => {
+      assertPaygateCallbackBinding(lockedInvoice, callback);
+    },
+    deliverInvoice: deps.deliverInvoice
+  };
+  const preflight = await applyPaygatePaymentObservation(
+    pool,
+    invoice.id,
+    payment,
+    options
+  );
+  if (preflight !== PAYGATE_PAYMENT_NEEDS_PRICING) {
+    return preflight;
   }
 
-  const connection = await pool.getConnection();
+  const paygateClient = getPaygateClient(deps);
+  let paidUsd;
   try {
-    await connection.beginTransaction();
-
-    const [rows] = await connection.execute(
-      'SELECT * FROM vip_invoices WHERE id = ? FOR UPDATE',
-      [baseInvoice.id]
-    );
-    const invoice = rows[0];
-    if (!invoice || FINAL_STATUSES.has(invoice.status)) {
-      await connection.commit();
-      return invoice || null;
-    }
-
-    const shouldMarkPaidAt = nextStatus === 'paid' && !invoice.paid_at;
-
-    await connection.execute(
-      `UPDATE vip_invoices
-        SET status = ?,
-            tx_hash = COALESCE(?, tx_hash),
-            paid_at = CASE WHEN ? THEN COALESCE(paid_at, NOW()) ELSE paid_at END,
-            paygate_paid_coin = COALESCE(?, paygate_paid_coin),
-            paygate_paid_value = ?,
-            paygate_paid_txid = COALESCE(?, paygate_paid_txid),
-            next_check_at = DATE_ADD(NOW(), INTERVAL 25 SECOND),
-            updated_at = NOW()
-        WHERE id = ?`,
-      [
-        nextStatus,
-        paidTxid,
-        shouldMarkPaidAt ? 1 : 0,
-        paidCoin,
-        paidValue,
-        paidTxid,
-        invoice.id
-      ]
-    );
-
-    await logVipInvoiceEvent(
-      connection,
-      invoice.id,
-      'invoice_paygate_status_poll',
-      nextStatus === 'paid'
-        ? 'Paiement PayGate confirmé via payment-status.php (callback manqué).'
-        : 'Poll payment-status.php PayGate: montant insuffisant.',
-      {
-        previousStatus: invoice.status,
-        nextStatus,
-        paidCoin,
-        paidValue,
-        paidTxid,
-        minimumPaidAmount
-      },
-      options.actorType || 'system',
-      options.actorId || null
-    );
-
-    await connection.commit();
+    paidUsd = await paygateClient.convertPaymentToUsd({
+      coin: callback.coin,
+      valueCoin: callback.valueCoin
+    });
   } catch (error) {
-    await connection.rollback();
+    try {
+      const recovered = await applyPaygatePaymentObservation(
+        pool,
+        invoice.id,
+        payment,
+        options
+      );
+      if (recovered !== PAYGATE_PAYMENT_NEEDS_PRICING) {
+        return recovered;
+      }
+    } catch {
+      // The pricing failure remains the authoritative fail-closed result.
+    }
     throw error;
-  } finally {
-    connection.release();
   }
 
-  const refreshed = await fetchInvoiceById(pool, baseInvoice.id);
-  if (refreshed?.status === 'paid') {
-    return deliverInvoiceIfReady(
-      pool,
-      refreshed.id,
-      options.actorType || 'system',
-      options.actorId || null,
-      'paygate_status_poll'
-    );
-  }
-
-  return refreshed;
+  return applyPaygatePaymentObservation(
+    pool,
+    invoice.id,
+    {
+      ...payment,
+      paidUsd
+    },
+    options
+  );
 }
 
 async function handlePayblisIpn(pool, { publicId, body, sourceIp, headerSignature }) {
@@ -2207,6 +2284,9 @@ async function forceValidateInvoice(pool, invoiceId, admin) {
 
     const invoice = rows[0];
     const paymentMethod = getInvoicePaymentMethod(invoice);
+    if (isPaygatePaymentMethod(paymentMethod)) {
+      requireValidPaygateInvoiceAmountUsd(invoice);
+    }
     if (invoice.status === 'cancelled') {
       throw new Error('Cette invoice est annulée');
     }
@@ -2285,18 +2365,27 @@ async function cancelInvoice(pool, invoiceId, admin) {
     }
 
     const invoice = rows[0];
-    if (invoice.status === 'delivered') {
-      throw new Error('Impossible d\'annuler une invoice déjà livrée');
+    if (invoice.status === 'paid' || invoice.status === 'delivered') {
+      throw new Error('Impossible d\'annuler une invoice déjà payée ou livrée');
     }
 
     if (invoice.status !== 'cancelled') {
-      await connection.execute(
+      const [cancelResult] = await connection.execute(
         `UPDATE vip_invoices
           SET status = 'cancelled',
               updated_at = NOW()
-          WHERE id = ?`,
+          WHERE id = ?
+            AND status IN (
+              'awaiting_payment',
+              'partial_payment',
+              'confirming',
+              'expired'
+            )`,
         [invoiceId]
       );
+      if (parseNumber(cancelResult?.affectedRows, 0) !== 1) {
+        throw new Error('Invoice modifiée pendant l\'annulation');
+      }
 
       await logVipInvoiceEvent(
         connection,
@@ -2414,6 +2503,37 @@ async function ensureIndexExists(pool, tableName, indexName, definitionSql) {
   }
 }
 
+async function ensureUniqueSingleColumnIndex(
+  pool,
+  tableName,
+  indexName,
+  columnName,
+  definitionSql
+) {
+  const [rows] = await pool.execute(
+    `SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX
+      FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND INDEX_NAME = ?
+      ORDER BY SEQ_IN_INDEX`,
+    [tableName, indexName]
+  );
+
+  if (rows.length === 0) {
+    await pool.execute(`ALTER TABLE \`${tableName}\` ADD ${definitionSql}`);
+    return;
+  }
+
+  const valid = rows.length === 1
+    && Number(rows[0].NON_UNIQUE) === 0
+    && rows[0].COLUMN_NAME === columnName
+    && Number(rows[0].SEQ_IN_INDEX) === 1;
+  if (!valid) {
+    throw new Error(`Index de sécurité invalide: ${tableName}.${indexName}`);
+  }
+}
+
 async function normalizeVipInvoicePaymentMethods(pool) {
   await pool.execute(`
     ALTER TABLE vip_invoices
@@ -2498,11 +2618,14 @@ async function normalizeVipInvoicePaymentMethods(pool) {
         OR NULLIF(paygate_temporary_wallet_address, '') IS NOT NULL
         OR NULLIF(paygate_callback_url, '') IS NOT NULL
         OR NULLIF(paygate_callback_nonce, '') IS NOT NULL
+        OR NULLIF(paygate_callback_reference, '') IS NOT NULL
+        OR NULLIF(paygate_ipn_token, '') IS NOT NULL
         OR NULLIF(paygate_checkout_url, '') IS NOT NULL
         OR NULLIF(paygate_payer_email, '') IS NOT NULL
         OR NULLIF(paygate_paid_coin, '') IS NOT NULL
         OR paygate_paid_value IS NOT NULL
         OR NULLIF(paygate_paid_txid, '') IS NOT NULL
+        OR NULLIF(paygate_paid_txid_in, '') IS NOT NULL
       )
   `);
 
@@ -2539,11 +2662,14 @@ async function normalizeVipInvoicePaymentMethods(pool) {
         OR NULLIF(paygate_temporary_wallet_address, '') IS NOT NULL
         OR NULLIF(paygate_callback_url, '') IS NOT NULL
         OR NULLIF(paygate_callback_nonce, '') IS NOT NULL
+        OR NULLIF(paygate_callback_reference, '') IS NOT NULL
+        OR NULLIF(paygate_ipn_token, '') IS NOT NULL
         OR NULLIF(paygate_checkout_url, '') IS NOT NULL
         OR NULLIF(paygate_payer_email, '') IS NOT NULL
         OR NULLIF(paygate_paid_coin, '') IS NOT NULL
         OR paygate_paid_value IS NOT NULL
         OR NULLIF(paygate_paid_txid, '') IS NOT NULL
+        OR NULLIF(paygate_paid_txid_in, '') IS NOT NULL
       ) THEN 'paygate_hosted'
       ELSE 'autobuy'
     END
@@ -2596,6 +2722,7 @@ async function ensureVipDonationsTables(pool) {
       paid_at DATETIME DEFAULT NULL,
       delivered_at DATETIME DEFAULT NULL,
       next_check_at DATETIME DEFAULT NULL,
+      paygate_callback_reference VARCHAR(64) DEFAULT NULL,
       paygate_tracking_address VARCHAR(255) DEFAULT NULL,
       paygate_temporary_wallet_address VARCHAR(255) DEFAULT NULL,
       paygate_callback_url TEXT DEFAULT NULL,
@@ -2605,6 +2732,7 @@ async function ensureVipDonationsTables(pool) {
       paygate_ipn_token VARCHAR(512) DEFAULT NULL,
       paygate_paid_coin VARCHAR(64) DEFAULT NULL,
       paygate_paid_value DECIMAL(18,8) DEFAULT NULL,
+      paygate_paid_txid_in VARCHAR(255) DEFAULT NULL,
       paygate_paid_txid VARCHAR(255) DEFAULT NULL,
       autobuy_order_id VARCHAR(128) DEFAULT NULL,
       autobuy_product_id VARCHAR(128) DEFAULT NULL,
@@ -2623,6 +2751,10 @@ async function ensureVipDonationsTables(pool) {
       INDEX idx_vip_invoices_payment_address (payment_address),
       INDEX idx_vip_invoices_vip_key (vip_key_value),
       INDEX idx_vip_invoices_paygate_paid_txid (paygate_paid_txid),
+      UNIQUE KEY uniq_vip_invoices_paygate_callback_reference
+        (paygate_callback_reference),
+      UNIQUE KEY uniq_vip_invoices_paygate_paid_txid_in
+        (paygate_paid_txid_in),
       UNIQUE KEY uniq_vip_invoices_autobuy_order_id (autobuy_order_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
@@ -2654,6 +2786,12 @@ async function ensureVipDonationsTables(pool) {
     'vip_invoices',
     'payment_method',
     `\`payment_method\` ${VIP_PAYMENT_METHOD_ENUM_SQL} NULL AFTER \`public_id\``
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'paygate_callback_reference',
+    "`paygate_callback_reference` VARCHAR(64) DEFAULT NULL AFTER `next_check_at`"
   );
   await ensureColumnExists(
     pool,
@@ -2708,6 +2846,12 @@ async function ensureVipDonationsTables(pool) {
     'vip_invoices',
     'paygate_paid_value',
     "`paygate_paid_value` DECIMAL(18,8) DEFAULT NULL AFTER `paygate_paid_coin`"
+  );
+  await ensureColumnExists(
+    pool,
+    'vip_invoices',
+    'paygate_paid_txid_in',
+    "`paygate_paid_txid_in` VARCHAR(255) DEFAULT NULL AFTER `paygate_paid_value`"
   );
   await ensureColumnExists(
     pool,
@@ -2894,6 +3038,32 @@ async function ensureVipDonationsTables(pool) {
     'vip_invoices',
     'idx_vip_invoices_payment_method',
     'INDEX `idx_vip_invoices_payment_method` (`payment_method`)'
+  );
+  await pool.execute(
+    `UPDATE vip_invoices
+      SET paygate_callback_reference = NULL
+      WHERE paygate_callback_reference IS NOT NULL
+        AND TRIM(paygate_callback_reference) = ''`
+  );
+  await pool.execute(
+    `UPDATE vip_invoices
+      SET paygate_paid_txid_in = NULL
+      WHERE paygate_paid_txid_in IS NOT NULL
+        AND TRIM(paygate_paid_txid_in) = ''`
+  );
+  await ensureUniqueSingleColumnIndex(
+    pool,
+    'vip_invoices',
+    'uniq_vip_invoices_paygate_callback_reference',
+    'paygate_callback_reference',
+    'UNIQUE INDEX `uniq_vip_invoices_paygate_callback_reference` (`paygate_callback_reference`)'
+  );
+  await ensureUniqueSingleColumnIndex(
+    pool,
+    'vip_invoices',
+    'uniq_vip_invoices_paygate_paid_txid_in',
+    'paygate_paid_txid_in',
+    'UNIQUE INDEX `uniq_vip_invoices_paygate_paid_txid_in` (`paygate_paid_txid_in`)'
   );
   await ensureIndexExists(
     pool,

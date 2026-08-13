@@ -55,7 +55,7 @@ let deps = {
   incrementFstreamRequestCounter: () => {}
 };
 
-const WIFLIX_BASE_URL = 'https://flemmix.golf';
+const WIFLIX_BASE_URL = 'https://flemmix.men';
 
 const truncateForLog = (value, maxLength = 300) => {
   if (typeof value !== 'string') return value;
@@ -1020,6 +1020,11 @@ function formatCoflixError(error, context = '') {
     const msg = error && error.message
       ? error.message
       : (typeof error === 'string' ? error : JSON.stringify(error));
+    // Payloads HTML entiers (ex: le domaine Coflix redirige vers une page Telegram) :
+    // ne jamais dumper des pages completes dans les logs.
+    if (typeof msg === 'string' && msg.length > 300) {
+      return `${msg.slice(0, 300).replace(/\s+/g, ' ')}… [tronqué, ${msg.length} chars]`;
+    }
     return msg;
   }
 }

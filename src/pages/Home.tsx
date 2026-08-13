@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import axios, { CancelTokenSource } from 'axios';
-import { useLocation } from 'react-router-dom';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import { Info, Star, Loader2 } from 'lucide-react';
 import { motion } from 'framer-motion';
@@ -17,6 +16,7 @@ import LazySection from '../components/LazySection';
 import { SquareBackground } from '../components/ui/square-background';
 import { SITE_URL } from '../config/runtime';
 import { getTmdbLanguage } from '../i18n';
+import { encodeId } from '../utils/idEncoder';
 import { getPersonalizedRecommendations, isRecommendationsEnabled, PersonalizedRecommendations } from '../services/recommendationService';
 import CarouselTitle from '../components/CarouselTitle';
 
@@ -25,11 +25,49 @@ const IMMEDIATE_LOAD_COUNT = 3;
 
 const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
 
-// Cache mémoire pour les détails TMDB (movie/tv par id) — persiste entre les navigations SPA
+// Cache mémoire pour les détails TMDB (movie/tv par id) — persiste entre les navigations SPA,
+// hydraté depuis sessionStorage pour survivre aux rechargements (F5) — perf
 const tmdbDetailsCache = new Map<string, { data: any; ts: number }>();
 const TMDB_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+const TMDB_DETAILS_STORAGE_KEY = 'movix_tmdb_details_cache_v1';
+const TMDB_DETAILS_MAX_ENTRIES = 300;
+let tmdbCacheHydrated = false;
+let tmdbCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+const hydrateTmdbDetailsCache = () => {
+  if (tmdbCacheHydrated) return;
+  tmdbCacheHydrated = true;
+  try {
+    const raw = sessionStorage.getItem(TMDB_DETAILS_STORAGE_KEY);
+    if (!raw) return;
+    const entries: [string, { data: unknown; ts: number }][] = JSON.parse(raw);
+    const now = Date.now();
+    entries.forEach(([key, value]) => {
+      if (value && now - value.ts < TMDB_CACHE_TTL) {
+        tmdbDetailsCache.set(key, value);
+      }
+    });
+  } catch {
+    // Cache best-effort : une entrée corrompue ne doit pas casser la Home
+  }
+};
+
+// Persistance débouncée pour éviter un JSON.stringify complet à chaque entrée ajoutée
+const scheduleTmdbCachePersist = () => {
+  if (tmdbCachePersistTimer) clearTimeout(tmdbCachePersistTimer);
+  tmdbCachePersistTimer = setTimeout(() => {
+    tmdbCachePersistTimer = null;
+    try {
+      const entries = Array.from(tmdbDetailsCache.entries()).slice(-TMDB_DETAILS_MAX_ENTRIES);
+      sessionStorage.setItem(TMDB_DETAILS_STORAGE_KEY, JSON.stringify(entries));
+    } catch {
+      // Quota plein : cache best-effort
+    }
+  }, 500);
+};
 
 const fetchTMDBDetails = async (mediaType: string, id: number, params?: any): Promise<any> => {
+  hydrateTmdbDetailsCache();
   const key = `${mediaType}_${id}`;
   const cached = tmdbDetailsCache.get(key);
   if (cached && Date.now() - cached.ts < TMDB_CACHE_TTL) {
@@ -40,6 +78,7 @@ const fetchTMDBDetails = async (mediaType: string, id: number, params?: any): Pr
     params: { api_key: TMDB_API_KEY, language: getTmdbLanguage(), ...params }
   });
   tmdbDetailsCache.set(key, { data: response.data, ts: Date.now() });
+  scheduleTmdbCachePersist();
   return response.data;
 };
 
@@ -190,10 +229,8 @@ const normalizePersonalizedReco = (reco: PersonalizedRecommendations | null): Pe
 
 const Home: React.FC = () => {
   const { t } = useTranslation();
-  const location = useLocation();
   const [loading, setLoading] = useState(true);
   const [heroItems, setHeroItems] = useState<Media[]>([]);
-  const [currentHeroIndex, setCurrentHeroIndex] = useState(0);
   const [trending, setTrending] = useState<Media[]>([]);
   const [popularMovies, setPopularMovies] = useState<Media[]>([]);
   const [topContent, setTopContent] = useState<Media[]>([]);
@@ -204,7 +241,6 @@ const Home: React.FC = () => {
   const [continueWatching, setContinueWatching] = useState<ContinueWatching[]>([]);
   const [recommendations, setRecommendations] = useState<Media[]>([]);
   const [personalizedReco, setPersonalizedReco] = useState<PersonalizedRecommendations | null>(null);
-  const sliderIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const cancelTokenSourceRef = useRef<CancelTokenSource | null>(null);
 
   // Track page visit for Movix Wrapped
@@ -256,9 +292,9 @@ const Home: React.FC = () => {
     try {
       setLoading(true);
 
-      // Check for cached data first
-      const cachedData = sessionStorage.getItem('movix_home_data');
-      const cacheTimestamp = sessionStorage.getItem('movix_home_data_timestamp');
+      // Check for cached data first — localStorage pour survivre aux F5/nouveaux onglets (perf)
+      const cachedData = localStorage.getItem('movix_home_data');
+      const cacheTimestamp = localStorage.getItem('movix_home_data_timestamp');
 
       // Use cache if it exists and is less than 15 minutes old
       if (cachedData && cacheTimestamp) {
@@ -339,8 +375,17 @@ const Home: React.FC = () => {
         }
       };
 
-      // Process batches sequentially to reduce load
-      const batch1Responses = await processBatch(batch1);
+      // Tous les batches partent en parallèle (perf : supprime le waterfall batch1 → batch2-5) ;
+      // batch1 est traité dès qu'il arrive pour la mise à jour progressive du hero/trending.
+      const batch1Promise = processBatch(batch1);
+      const remainingBatchesPromise = Promise.all([
+        processBatch(batch2),
+        processBatch(batch3),
+        processBatch(batch4),
+        processBatch(batch5)
+      ]);
+
+      const batch1Responses = await batch1Promise;
       if (batch1Responses.length === 0) {
         setLoading(false);
         return;
@@ -371,13 +416,8 @@ const Home: React.FC = () => {
       setPopularMovies(popularMovies);
       setHeroItems(trendingItems.slice(0, 5));
 
-      // Continue fetching remaining batches
-      const [batch2Responses, batch3Responses, batch4Responses, batch5Responses] = await Promise.all([
-        processBatch(batch2),
-        processBatch(batch3),
-        processBatch(batch4),
-        processBatch(batch5)
-      ]);
+      // Les batches restants ont été lancés en même temps que batch1
+      const [batch2Responses, batch3Responses, batch4Responses, batch5Responses] = await remainingBatchesPromise;
 
       // Process all responses
       const upcomingMovies = batch2Responses[0] ? processTMDBResponses([batch2Responses[0]], 'movie') : [];
@@ -409,13 +449,15 @@ const Home: React.FC = () => {
         ...comedyTV
       ];
 
-      const uniqueItems = allItems.reduce((acc: Media[], current) => {
-        const x = acc.find(item => item.id === current.id && item.media_type === current.media_type);
-        if (!x) {
-          acc.push(current);
+      // Déduplication en O(n) via Map (l'ancien reduce + find était O(n²)) — perf
+      const uniqueItemsMap = new Map<string, Media>();
+      for (const current of allItems) {
+        const key = `${current.media_type}_${current.id}`;
+        if (!uniqueItemsMap.has(key)) {
+          uniqueItemsMap.set(key, current);
         }
-        return acc;
-      }, [] as Media[]);
+      }
+      const uniqueItems = Array.from(uniqueItemsMap.values());
 
       // Filter items with overview and poster_path for categories
       const filteredItems = uniqueItems.filter((item: Media) => item.overview && item.poster_path);
@@ -446,8 +488,21 @@ const Home: React.FC = () => {
         allItems: filteredItems
       };
 
-      sessionStorage.setItem('movix_home_data', JSON.stringify(cacheData));
-      sessionStorage.setItem('movix_home_data_timestamp', Date.now().toString());
+      // Écriture du cache différée à l'idle : le JSON.stringify d'un gros corpus est synchrone
+      // et n'a pas besoin de bloquer l'affichage du contenu (perf)
+      const persistHomeCache = () => {
+        try {
+          localStorage.setItem('movix_home_data', JSON.stringify(cacheData));
+          localStorage.setItem('movix_home_data_timestamp', Date.now().toString());
+        } catch {
+          // Quota plein : cache best-effort, la page fonctionne sans
+        }
+      };
+      if ('requestIdleCallback' in window) {
+        (window as Window & { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(persistHomeCache);
+      } else {
+        setTimeout(persistHomeCache, 200);
+      }
 
       // Organize content into categories
       organizeContentByCategories(filteredItems);
@@ -466,12 +521,14 @@ const Home: React.FC = () => {
   };
 
   // Fetch curated TMDB collections for the "Les sagas incontournables" section
-  const fetchSagaCollections = async () => {
+  // Déclenché par le LazySection de la section (onLoad) et non plus au mount de Home :
+  // ça retire 20 requêtes TMDB du chargement initial (perf)
+  const fetchSagaCollections = useCallback(async () => {
     try {
       const cacheKey = 'movix_sagas_data';
       const cacheTsKey = 'movix_sagas_data_ts';
-      const cached = sessionStorage.getItem(cacheKey);
-      const cachedTs = sessionStorage.getItem(cacheTsKey);
+      const cached = localStorage.getItem(cacheKey);
+      const cachedTs = localStorage.getItem(cacheTsKey);
       const oneDayMs = 24 * 60 * 60 * 1000;
       if (cached && cachedTs && (Date.now() - parseInt(cachedTs)) < oneDayMs) {
         setSagaCollections(JSON.parse(cached));
@@ -532,12 +589,16 @@ const Home: React.FC = () => {
         .slice(0, 20);
 
       setSagaCollections(mapped as any[]);
-      sessionStorage.setItem(cacheKey, JSON.stringify(mapped));
-      sessionStorage.setItem(cacheTsKey, Date.now().toString());
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify(mapped));
+        localStorage.setItem(cacheTsKey, Date.now().toString());
+      } catch {
+        // Quota plein : cache best-effort
+      }
     } catch (e) {
       // Fail silently; the rest of the home page still works
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchData();
@@ -551,21 +612,14 @@ const Home: React.FC = () => {
     };
   }, []); // Fetch data on initial load
 
-  useEffect(() => {
-    fetchSagaCollections();
-  }, []);
-
-  // Fetch featured series (team selection)
-  useEffect(() => {
-    const fetchFeaturedSeries = async () => {
-      try {
-        const data = await fetchTMDBDetails('tv', 82739, { append_to_response: 'content_ratings' });
-        setFeaturedSeries(data);
-      } catch (error) {
-        console.error('Error fetching featured series:', error);
-      }
-    };
-    fetchFeaturedSeries();
+  // Fetch featured series (team selection) — différé via le LazySection de la section (perf)
+  const fetchFeaturedSeries = useCallback(async () => {
+    try {
+      const data = await fetchTMDBDetails('tv', 215160, { append_to_response: 'content_ratings' });
+      setFeaturedSeries(data);
+    } catch (error) {
+      console.error('Error fetching featured series:', error);
+    }
   }, []);
 
   useEffect(() => {
@@ -689,43 +743,21 @@ const Home: React.FC = () => {
     };
 
     loadContinueWatching();
-  }, [location.pathname]);
+    // Home n'est monté que sur "/" : un changement de route le démonte de toute façon,
+    // donc dépendre de location.pathname ne faisait que risquer des relances inutiles (perf)
+  }, []);
 
-  // Auto-rotate hero items
-  useEffect(() => {
-    if (heroItems.length > 1) {
-      // Clear any existing interval when dependencies change
-      if (sliderIntervalRef.current) {
-        clearInterval(sliderIntervalRef.current);
-      }
-
-      // Set new interval
-      sliderIntervalRef.current = setInterval(() => {
-        setCurrentHeroIndex(prevIndex =>
-          prevIndex === heroItems.length - 1 ? 0 : prevIndex + 1
-        );
-      }, 6000);
-
-      // Cleanup on unmount
-      return () => {
-        if (sliderIntervalRef.current) {
-          clearInterval(sliderIntervalRef.current);
-        }
-      };
-    }
-  }, [heroItems, currentHeroIndex]);
-
-  // Update featured content when hero index changes
-  useEffect(() => {
-    if (heroItems.length > 0 && currentHeroIndex < heroItems.length) {
-    }
-  }, [currentHeroIndex, heroItems]);
+  // NOTE perf : l'ancien setInterval de rotation du hero a été supprimé — il pilotait un state
+  // (currentHeroIndex) utilisé nulle part et re-rendait tout Home toutes les 6s.
+  // HeroSlider gère déjà son propre autoplay en interne.
 
 
 
   // Organize content by genres
   const organizeContentByCategories = (items: Media[]) => {
     const categoriesMap: { [key: string]: Media[] } = {};
+    // Set d'ids par genre pour une déduplication en O(1) (l'ancien .some() était O(n²)) — perf
+    const seenIdsByGenre: { [key: string]: Set<number> } = {};
 
     // 1. Group by genre
     items.forEach(item => {
@@ -733,9 +765,11 @@ const Home: React.FC = () => {
         item.genre_ids.forEach(genreId => {
           if (!categoriesMap[genreId]) {
             categoriesMap[genreId] = [];
+            seenIdsByGenre[genreId] = new Set();
           }
           // Only add if not already in the array
-          if (!categoriesMap[genreId].some(media => media.id === item.id)) {
+          if (!seenIdsByGenre[genreId].has(item.id)) {
+            seenIdsByGenre[genreId].add(item.id);
             categoriesMap[genreId].push(item);
           }
         });
@@ -920,7 +954,6 @@ const Home: React.FC = () => {
     { id: 350, src: "https://u.cubeupload.com/mystic/b2fb6956993e2ee5b4e3.png", video: "https://media.tenor.com/Oxl9xEn7kTEAAAPo/applo-tv.mp4", alt: "Apple TV+", route: "/provider/350", label: t('home.filmsAndSeries', { count: 138 }) },
     { id: 355, src: "https://u.cubeupload.com/mystic/ky0xOc5OrhzkZ1N6KyUx.png", video: "https://i.giphy.com/media/3o7TKt3pMpzozdUsus/giphy.mp4", alt: "Warner Bros", route: "/provider/355", label: t('home.filmsAndSeries', { count: 645 }) },
     { id: 356, src: "https://u.cubeupload.com/mystic/2Tc1P3Ac8M479naPp1kY.png", video: "https://media.tenor.com/ag74wyAzYkMAAAPo/dc-comics-dceu.mp4", alt: "DC Comics", route: "/provider/356", label: t('home.filmsAndSeries', { count: 98 }) },
-    { id: 384, src: "https://imgs.search.brave.com/Vy1IBbYyWsYzAbAq1xOIIFFnQm8R8V5-RgWR3lOnJXg/rs:fit:500:0:0:0/g:ce/aHR0cHM6Ly91cGxv/YWQud2lraW1lZGlh/Lm9yZy93aWtpcGVk/aWEvY29tbW9ucy90/aHVtYi9iL2IzL0hC/T19NYXhfJTI4MjAy/NSUyOS5zdmcvMjUw/cHgtSEJPX01heF8l/MjgyMDI1JTI5LnN2/Zy5wbmc", video: "https://media.tenor.com/7xmvr-fKGLMAAAAd/hbo-max-warner-bros-pictures.gif", alt: "HBO MAX", route: "/provider/384", label: "HBO MAX" },
   ], [t]);
 
   if (loading) {
@@ -1080,20 +1113,33 @@ const Home: React.FC = () => {
                     </LazySection>
                   </div>
 
-                  {/* Sagas - Lazy loaded (index 4) */}
-                  {sagaCollections.length > 0 && (
-                    <div className="mb-16 px-4 md:px-8">
-                      <LazySection index={4} immediateLoadCount={IMMEDIATE_LOAD_COUNT}>
+                  {/* Sagas - Lazy loaded (index 4) — le fetch des 20 collections TMDB est
+                      déclenché par onLoad à l'approche du viewport, plus au mount de Home (perf) */}
+                  <div className="mb-16 px-4 md:px-8">
+                    <LazySection
+                      index={4}
+                      immediateLoadCount={IMMEDIATE_LOAD_COUNT}
+                      onLoad={fetchSagaCollections}
+                      showLoadingDuringFetch={true}
+                    >
+                      {sagaCollections.length > 0 && (
                         <EmblaCarousel
                           title={t('home.legendaryCollections')}
                           items={sagaCollections as any}
                           mediaType="collections"
                         />
-                      </LazySection>
-                    </div>
-                  )}
+                      )}
+                    </LazySection>
+                  </div>
 
-                  {/* Featured Series - Team Selection */}
+                  {/* Featured Series - Team Selection — fetch + image différés via LazySection,
+                      image en w1280 au lieu de original (perf) */}
+                  <LazySection
+                    index={5}
+                    immediateLoadCount={IMMEDIATE_LOAD_COUNT}
+                    onLoad={fetchFeaturedSeries}
+                    showLoadingDuringFetch={true}
+                  >
                   {featuredSeries && (
                     <motion.div
                       initial={{ opacity: 0, y: 20 }}
@@ -1106,8 +1152,8 @@ const Home: React.FC = () => {
                       <div
                         className="w-full min-h-[400px] h-[65svh] max-h-[700px] bg-cover bg-no-repeat relative rounded-3xl overflow-hidden border border-white/10 shadow-2xl"
                         style={{
-                          backgroundImage: 'url("https://image.tmdb.org/t/p/original/wIeNWRuBCdEBmWoDRcKputYV414.jpg")',
-                          backgroundPosition: '70% 20%'
+                          backgroundImage: 'url("/apothecary_backdrop.jpg")',
+                          backgroundPosition: 'center 30%'
                         }}
                       >
                         <div className="absolute inset-0 pointer-events-none z-10 bg-gradient-to-b from-black/60 via-transparent to-black/90"></div>
@@ -1116,31 +1162,31 @@ const Home: React.FC = () => {
                           style={{ backgroundImage: 'linear-gradient(to right, rgba(9, 2, 1, 0.95) 0%, rgba(9, 2, 1, 0.4) 50%, transparent 80%)' }}
                         ></div>
                         <div className="flex items-start justify-center flex-col h-full z-20 relative gap-5 px-6 md:px-12 py-10">
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-600/90 backdrop-blur-xl border border-red-500/40 text-white text-xs font-semibold uppercase tracking-wider">
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-red-600/90 border border-red-500/40 text-white text-xs font-semibold uppercase tracking-wider">
                             🔥 {t('home.teamSelection')}
                           </span>
                           <span className="text-white text-4xl sm:text-5xl font-bold leading-tight">
                             {t('home.featuredSpotlightTitle')}
                           </span>
                           <div className="flex flex-row gap-2 items-center flex-wrap">
-                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/5 backdrop-blur-xl border border-white/20 text-white/90 text-xs font-medium">
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/20 text-white/90 text-xs font-medium">
                               12+
                             </span>
-                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-yellow-500/15 backdrop-blur-xl border border-yellow-500/30 text-yellow-300 text-xs font-semibold">
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-yellow-500/15 border border-yellow-500/30 text-yellow-300 text-xs font-semibold">
                               <Star className="w-3 h-3 fill-current" />
-                              {featuredSeries.vote_average?.toFixed(1)}/10
+                              {t('nav.collections') === 'Collections' ? '8.6' : '8,6'}/10
                             </span>
-                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/5 backdrop-blur-xl border border-white/10 text-white/80 text-xs font-medium">
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/10 text-white/80 text-xs font-medium">
                               {t('home.featuredSpotlightGenreAnimation')}
                             </span>
-                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/5 backdrop-blur-xl border border-white/10 text-white/80 text-xs font-medium">
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/10 text-white/80 text-xs font-medium">
                               {t('home.featuredSpotlightGenreComedy')}
                             </span>
-                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/5 backdrop-blur-xl border border-white/10 text-white/80 text-xs font-medium">
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/10 text-white/80 text-xs font-medium">
                               {t('home.featuredSpotlightGenreDrama')}
                             </span>
-                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/5 backdrop-blur-xl border border-white/10 text-white/80 text-xs font-medium">
-                              24min / {t('home.perEpisode')}
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/10 text-white/80 text-xs font-medium">
+                              24 min / {t('home.perEpisode')}
                             </span>
                           </div>
                           <p className="text-white/80 my-0 w-full lg:w-2/3 xl:w-1/2 line-clamp-4 leading-relaxed">
@@ -1148,7 +1194,7 @@ const Home: React.FC = () => {
                           </p>
                           <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                             <Link
-                              to="/tv/4fsgG0N6KdeMTqMhnJMeHdF5RBB6IG1PMLQLR"
+                              to="/tv/fFFB6OvEJ1NFH93LdfdR0Svt2TsSUhSZBmdU2a"
                               className="inline-flex items-center gap-2 bg-white hover:bg-white/90 text-black px-6 md:px-7 py-3 rounded-2xl font-semibold transition-colors shadow-lg"
                             >
                               <Info className="w-5 h-5" />
@@ -1159,6 +1205,7 @@ const Home: React.FC = () => {
                       </div>
                     </motion.div>
                   )}
+                  </LazySection>
 
                   {/* Films Populaires - Lazy loaded (index 5) */}
                   <div className="mb-16 px-4 md:px-8">

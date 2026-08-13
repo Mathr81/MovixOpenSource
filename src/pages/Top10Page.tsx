@@ -6,7 +6,7 @@ import { PrefetchLink as Link } from '@/routing/PrefetchLink';
 import {
   ArrowLeft, Trophy, Film, Tv, Sparkles, Users, Clock, Eye,
   BarChart3, ChevronDown, TrendingUp, Timer, Star, Hash,
-  Activity, Flame
+  Activity, Flame, CalendarDays
 } from 'lucide-react';
 import { SquareBackground } from '../components/ui/square-background';
 import BlurText from '../components/ui/blur-text';
@@ -83,6 +83,23 @@ const tabs: { id: TabType; labelKey: string; icon: React.ReactNode; color: strin
   { id: 'anime', labelKey: 'top10.anime', icon: <Sparkles className="w-4 h-4" />, color: '#ec4899' },
 ];
 
+type PeriodType = 'day' | 'week' | 'month' | 'year' | 'all';
+type AlgoType = 'viewers' | 'hours' | 'sessions';
+
+const periodOptions: { id: PeriodType; labelKey: string }[] = [
+  { id: 'day', labelKey: 'top10.filters.day' },
+  { id: 'week', labelKey: 'top10.filters.week' },
+  { id: 'month', labelKey: 'top10.filters.month' },
+  { id: 'year', labelKey: 'top10.filters.year' },
+  { id: 'all', labelKey: 'top10.filters.all' },
+];
+
+const algoOptions: { id: AlgoType; labelKey: string; icon: React.ReactNode }[] = [
+  { id: 'viewers', labelKey: 'top10.filters.algoViewers', icon: <Users className="w-3.5 h-3.5" /> },
+  { id: 'hours', labelKey: 'top10.filters.algoHours', icon: <Clock className="w-3.5 h-3.5" /> },
+  { id: 'sessions', labelKey: 'top10.filters.algoSessions', icon: <Eye className="w-3.5 h-3.5" /> },
+];
+
 const tabIds: TabType[] = ['movies', 'tv', 'anime'];
 const emptyTop10ByTab: Record<TabType, Top10Entry[]> = { movies: [], tv: [], anime: [] };
 const emptyStatsByTab: Record<TabType, GlobalStats | null> = { movies: null, tv: null, anime: null };
@@ -110,6 +127,8 @@ const methodologyItems = [
 const Top10Page: React.FC = () => {
   const { t, i18n } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabType>('movies');
+  const [period, setPeriod] = useState<PeriodType>('all');
+  const [algo, setAlgo] = useState<AlgoType>('viewers');
   const [top10Data, setTop10Data] = useState<Record<TabType, Top10Entry[]>>(emptyTop10ByTab);
   const [statsByTab, setStatsByTab] = useState<Record<TabType, GlobalStats | null>>(emptyStatsByTab);
   const [loadingTabs, setLoadingTabs] = useState<Record<TabType, boolean>>(emptyBooleanByTab);
@@ -122,6 +141,26 @@ const Top10Page: React.FC = () => {
   const top10RequestsRef = useRef<Set<TabType>>(new Set());
   const statsRequestsRef = useRef<Set<TabType>>(new Set());
   const overviewRequestsRef = useRef<Set<TabType>>(new Set());
+  // Current filters key: responses from an older filter combo are dropped.
+  const filtersKeyRef = useRef('all:viewers');
+
+  const applyFilters = useCallback((nextPeriod: PeriodType, nextAlgo: AlgoType) => {
+    if (filtersKeyRef.current === `${nextPeriod}:${nextAlgo}`) return;
+    filtersKeyRef.current = `${nextPeriod}:${nextAlgo}`;
+    loadedTabsRef.current = emptyBooleanByTab;
+    statsByTabRef.current = emptyStatsByTab;
+    top10RequestsRef.current.clear();
+    statsRequestsRef.current.clear();
+    overviewRequestsRef.current.clear();
+    setPeriod(nextPeriod);
+    setAlgo(nextAlgo);
+    setTop10Data(emptyTop10ByTab);
+    setStatsByTab(emptyStatsByTab);
+    setLoadedTabs(emptyBooleanByTab);
+    setLoadingTabs(emptyBooleanByTab);
+    setErrorsByTab(emptyErrorByTab);
+    setUpdatedAtByTab(emptyUpdatedAtByTab);
+  }, []);
 
   // Hide footer.
   // The previous implementation also ran a `setInterval(..., 100)` polling
@@ -181,14 +220,15 @@ const Top10Page: React.FC = () => {
   const fetchTop10 = useCallback(async (type: TabType, options?: { background?: boolean; signal?: AbortSignal }) => {
     if (loadedTabsRef.current[type] || top10RequestsRef.current.has(type)) return;
 
+    const requestKey = `${period}:${algo}`;
     top10RequestsRef.current.add(type);
     setLoadingTabs(prev => ({ ...prev, [type]: true }));
 
     try {
-      const response = await fetch(`${MAIN_API}/api/top10/${type}`, { signal: options?.signal });
+      const response = await fetch(`${MAIN_API}/api/top10/${type}?period=${period}&algo=${algo}`, { signal: options?.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      if (data.success) {
+      if (data.success && filtersKeyRef.current === requestKey) {
         applyOverviewPayload(
           type,
           { top10: data.top10, updatedAt: data.updatedAt ?? null },
@@ -198,23 +238,26 @@ const Top10Page: React.FC = () => {
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error(`[Top10] Error fetching ${type}:`, err);
-      setErrorsByTab(prev => ({ ...prev, [type]: 'top10.loadError' }));
+      if (filtersKeyRef.current === requestKey) {
+        setErrorsByTab(prev => ({ ...prev, [type]: 'top10.loadError' }));
+      }
     } finally {
       top10RequestsRef.current.delete(type);
       setLoadingTabs(prev => ({ ...prev, [type]: false }));
     }
-  }, [applyOverviewPayload]);
+  }, [applyOverviewPayload, period, algo]);
 
   const fetchStats = useCallback(async (type: TabType, options?: { background?: boolean; signal?: AbortSignal }) => {
     if (statsByTabRef.current[type] || statsRequestsRef.current.has(type)) return;
 
+    const requestKey = `${period}:${algo}`;
     statsRequestsRef.current.add(type);
 
     try {
-      const response = await fetch(`${MAIN_API}/api/top10/stats?type=${type}`, { signal: options?.signal });
+      const response = await fetch(`${MAIN_API}/api/top10/stats?type=${type}&period=${period}`, { signal: options?.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      if (data.success) {
+      if (data.success && filtersKeyRef.current === requestKey) {
         applyOverviewPayload(
           type,
           { stats: data.stats ?? null },
@@ -227,19 +270,20 @@ const Top10Page: React.FC = () => {
     } finally {
       statsRequestsRef.current.delete(type);
     }
-  }, [applyOverviewPayload]);
+  }, [applyOverviewPayload, period, algo]);
 
   const fetchOverview = useCallback(async (type: TabType, options?: { background?: boolean; signal?: AbortSignal }) => {
     if (loadedTabsRef.current[type] || overviewRequestsRef.current.has(type)) return;
 
+    const requestKey = `${period}:${algo}`;
     overviewRequestsRef.current.add(type);
     setLoadingTabs(prev => ({ ...prev, [type]: true }));
 
     try {
-      const response = await fetch(`${MAIN_API}/api/top10/overview?type=${type}`, { signal: options?.signal });
+      const response = await fetch(`${MAIN_API}/api/top10/overview?type=${type}&period=${period}&algo=${algo}`, { signal: options?.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data: Top10OverviewResponse = await response.json();
-      if (data.success) {
+      if (data.success && filtersKeyRef.current === requestKey) {
         applyOverviewPayload(
           type,
           {
@@ -253,14 +297,22 @@ const Top10Page: React.FC = () => {
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error(`[Top10] Error fetching overview ${type}:`, err);
-      setErrorsByTab(prev => ({ ...prev, [type]: 'top10.loadError' }));
+      if (filtersKeyRef.current === requestKey) {
+        setErrorsByTab(prev => ({ ...prev, [type]: 'top10.loadError' }));
+      }
     } finally {
       overviewRequestsRef.current.delete(type);
       setLoadingTabs(prev => ({ ...prev, [type]: false }));
     }
-  }, [applyOverviewPayload]);
+  }, [applyOverviewPayload, period, algo]);
 
+  // Chargement initial uniquement — au changement de filtre c'est l'effect
+  // ci-dessous qui refetch l'onglet actif (sinon on relançait movies à chaque
+  // changement même depuis un autre onglet = agrégat SQL lourd gaspillé).
+  const didInitRef = useRef(false);
   useEffect(() => {
+    if (didInitRef.current) return;
+    didInitRef.current = true;
     const controller = new AbortController();
     void fetchTop10('movies', { signal: controller.signal });
     void fetchStats('movies', { background: true, signal: controller.signal });
@@ -281,6 +333,10 @@ const Top10Page: React.FC = () => {
 
   useEffect(() => {
     if (!loadedTabs[activeTab]) return;
+    // Prefetch des autres onglets seulement sur le combo par défaut (cache
+    // serveur chaud). Avec des filtres actifs, chaque combo est potentiellement
+    // froid : précharger 2 onglets = 2 gros agrégats SQL en plus pour rien.
+    if (period !== 'all' || algo !== 'viewers') return;
 
     const remainingTabs = tabIds.filter(tab => tab !== activeTab && !loadedTabs[tab]);
     if (remainingTabs.length === 0) return;
@@ -296,7 +352,7 @@ const Top10Page: React.FC = () => {
     return () => {
       timers.forEach(timer => window.clearTimeout(timer));
     };
-  }, [activeTab, loadedTabs, fetchOverview]);
+  }, [activeTab, loadedTabs, fetchOverview, period, algo]);
 
   const activeTabConfig = tabs.find(t => t.id === activeTab)!;
   const currentData = top10Data[activeTab];
@@ -422,6 +478,45 @@ const Top10Page: React.FC = () => {
                   {tab.icon}
                   {t(tab.labelKey)}
                 </span>
+              </button>
+            ))}
+          </div>
+        </motion.div>
+
+        {/* Filters: period + ranking algorithm */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.55 }}
+          className="max-w-4xl mx-auto mb-10 flex flex-col sm:flex-row items-center justify-center gap-3"
+        >
+          <div className="flex items-center gap-1 p-1 pl-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] flex-wrap justify-center">
+                              <CalendarDays className="w-3.5 h-3.5 text-white opacity-30 mr-1" />
+            {periodOptions.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => applyFilters(p.id, algo)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  period === p.id ? 'bg-white/10 text-white' : 'text-white/40 hover:text-white/70'
+                }`}
+              >
+                {t(p.labelKey)}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1 p-1 pl-2.5 rounded-xl bg-white/[0.04] border border-white/[0.08] flex-wrap justify-center">
+                              <BarChart3 className="w-3.5 h-3.5 text-white opacity-30 mr-1" />
+            {algoOptions.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => applyFilters(period, a.id)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  algo === a.id ? '' : 'text-white/40 hover:text-white/70'
+                }`}
+                style={algo === a.id ? { color: activeTabConfig.color, backgroundColor: `${activeTabConfig.color}15` } : undefined}
+              >
+                {a.icon}
+                {t(a.labelKey)}
               </button>
             ))}
           </div>

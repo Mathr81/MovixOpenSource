@@ -1,8 +1,9 @@
+import 'bootstrap-icons/font/bootstrap-icons.min.css';
 import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, memo } from 'react';
 import ReactCountryFlag from 'react-country-flag';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
-import { Tv, Loader2, Radio, Search, Crown, Puzzle, ChevronDown, Lock, Zap, Wifi, Star } from 'lucide-react';
+import { Tv, Loader2, Radio, Search, Crown, Puzzle, ChevronDown, Lock, Globe, Wifi, Star, Smartphone } from 'lucide-react';
 import { toast } from 'sonner';
 
 
@@ -21,6 +22,7 @@ import { isUserVip } from '../utils/authUtils';
 import { getVipHeaders } from '../utils/vipUtils';
 import { cn } from '../lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
+import { groupVavooChannels, type VavooChannelVariant } from '../utils/vavooChannelGroups';
 
 interface Catalog {
   type: string;
@@ -65,6 +67,7 @@ interface Channel {
     siteType?: number;
     sportType?: number;
   }>;
+  _vavooVariants?: VavooChannelVariant[];
 }
 
 interface IptvCategory {
@@ -154,6 +157,29 @@ const categoryEmojis: { [key: string]: string } = {
   'linkzy_generaliste': '📺',
   'linkzy_sport': '⚽',
   'linkzy_cinema': '🎬',
+
+};
+
+// Vavoo country groups → ISO 3166-1 alpha-2 code for <ReactCountryFlag> (unicode
+// flag emojis don't render on Windows, so we draw SVG flags instead). Groups with
+// no single country (All, Balkans) fall back to a Globe icon in getCatalogIcon.
+const vavooGroupCountry: { [key: string]: string } = {
+  'vavoo_france': 'FR',
+  'vavoo_france-sport': 'FR',
+  'vavoo_united-kingdom': 'GB',
+  'vavoo_germany': 'DE',
+  'vavoo_italy': 'IT',
+  'vavoo_spain': 'ES',
+  'vavoo_portugal': 'PT',
+  'vavoo_netherlands': 'NL',
+  'vavoo_poland': 'PL',
+  'vavoo_romania': 'RO',
+  'vavoo_bulgaria': 'BG',
+  'vavoo_croatia': 'HR',
+  'vavoo_albania': 'AL',
+  'vavoo_turkey': 'TR',
+  'vavoo_arabia': 'SA',
+  'vavoo_russia': 'RU',
 };
 
 const livetvSportEmojis: { [key: string]: string } = {
@@ -196,7 +222,8 @@ const livetvStatusOptions = [
 
 // Source display names for dropdown
 const sourceDisplayNames: { [key: string]: string } = {
-  'linkzy': 'liveTV.freeSource',
+  'northlive': 'Northlive',
+  'vavoo': 'Vavoo',
   'fctv': 'FCTV33',
   'wiflix': 'Landscape',
   'sosplay': 'Bolaloca',
@@ -207,7 +234,8 @@ const sourceDisplayNames: { [key: string]: string } = {
 
 // Get source key from catalog ID
 const getSourceKey = (catalogId: string): string => {
-  if (catalogId.startsWith('linkzy_')) return 'linkzy';
+  if (catalogId.startsWith('northlive_')) return 'northlive';
+  if (catalogId.startsWith('vavoo_')) return 'vavoo';
   if (catalogId.startsWith('matches_')) return 'fctv';
   if (catalogId.startsWith('wiflix_')) return 'wiflix';
   if (catalogId.startsWith('sosplay_')) return 'sosplay';
@@ -484,7 +512,7 @@ const LiveTV: React.FC = () => {
   const [catalogs, setCatalogs] = useState<Catalog[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [selectedCatalog, setSelectedCatalog] = useState<string>('');
-  const [selectedSource, setSelectedSource] = useState<string>('fctv'); // Default source
+  const [selectedSource, setSelectedSource] = useState<string>('northlive'); // Default: free source (no extension/VIP)
   const [loadingCatalogs, setLoadingCatalogs] = useState(true);
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -543,23 +571,39 @@ const LiveTV: React.FC = () => {
     .filter(s => s !== 'other')
     .filter(s => isLiveTvSourceEnabled(s as LiveTvSourceKey));
 
-  // Check access: VIP OR Extension (Linkzy is always accessible)
+  // Access model:
+  // - northlive is FREE (iframe embed, no extension/VIP) — always accessible.
+  // - iptv is VIP-only.
+  // - every other source needs full access (VIP OR extension).
   const isVip = isUserVip();
   const hasExtension = isExtensionAvailable();
   const hasFullAccess = isVip || hasExtension;
-  
-  // IPTV requires VIP specifically. Matches (fctv) now works for free users via
-  // the extension/userscript (local resolution) or the embed player, so it only
-  // needs full access (VIP OR extension), not VIP.
-  const isVipOnlySource = selectedSource === 'iptv';
-  const hasAccess = isVipOnlySource ? isVip : hasFullAccess;
 
-  const filteredChannels = channels.filter(channel => {
-    // Exclure les chaînes désactivées (nom contenant # au début et à la fin)
-    const name = channel.name.trim();
-    if (name.startsWith('#') && name.endsWith('#')) return false;
-    return name.toLowerCase().includes(searchQuery.toLowerCase());
-  });
+  const isSourceFree = (source: string) => source === 'northlive' || source === 'vavoo';
+  const isSourceAccessible = (source: string) =>
+    isSourceFree(source) ? true : source === 'iptv' ? isVip : hasFullAccess;
+  const hasAccess = isSourceAccessible(selectedSource);
+
+  const groupedChannels = useMemo(
+    () => selectedSource === 'vavoo' ? groupVavooChannels(channels) : channels,
+    [channels, selectedSource]
+  );
+
+  const filteredChannels = useMemo(() => {
+    const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
+
+    return groupedChannels.filter((channel) => {
+      // Exclure les chaînes désactivées (nom contenant # au début et à la fin)
+      const name = channel.name.trim();
+      if (name.startsWith('#') && name.endsWith('#')) return false;
+      if (!normalizedSearch) return true;
+
+      return name.toLocaleLowerCase().includes(normalizedSearch)
+        || channel._vavooVariants?.some((variant) => (
+          variant.originalName.toLocaleLowerCase().includes(normalizedSearch)
+        ));
+    });
+  }, [groupedChannels, searchQuery]);
 
   const favoriteChannelKeys = useMemo(
     () => new Set(favoriteChannels.map((favorite) => favorite.key)),
@@ -634,6 +678,15 @@ const LiveTV: React.FC = () => {
   const isFavoriteChannel = useCallback((source: string, id: string | number) => {
     return favoriteChannelKeys.has(buildLiveTvFavoriteKey(source, id));
   }, [favoriteChannelKeys]);
+
+  const getFavoriteVariantId = useCallback((source: string, channel: Channel): string | null => {
+    const channelIds = channel._vavooVariants?.map((variant) => variant.id) || [channel.id];
+    return channelIds.find((id) => favoriteChannelKeys.has(buildLiveTvFavoriteKey(source, id))) || null;
+  }, [favoriteChannelKeys]);
+
+  const isFavoriteDisplayChannel = useCallback((source: string, channel: Channel): boolean => (
+    getFavoriteVariantId(source, channel) !== null
+  ), [getFavoriteVariantId]);
 
   const toggleFavoriteChannel = useCallback((
     event: React.MouseEvent<HTMLButtonElement>,
@@ -758,7 +811,8 @@ const LiveTV: React.FC = () => {
     }
     let data;
 
-    if (isExtensionAvailable()) {
+    // northlive and vavoo are served only by our API (the extension doesn't know them).
+    if (isExtensionAvailable() && !catalogId.startsWith('northlive_') && !catalogId.startsWith('vavoo_')) {
       data = await fetchFromExtension('GET_CATALOG', { type: 'tv', id: catalogId });
     } else {
       const response = await fetch(`${API_BASE}/api/livetv/catalog/tv/${catalogId}`);
@@ -813,24 +867,18 @@ const LiveTV: React.FC = () => {
 
         setCatalogs(filteredCatalogs);
 
-        // Auto-select source and catalog
+        // Auto-select source and catalog. northlive (free) wins for everyone so
+        // the page works with no extension/VIP; extension users otherwise land
+        // on sosplay; else the first available catalog.
         if (filteredCatalogs.length > 0) {
-          if (isExtensionAvailable()) {
-            // Avec extension, auto-sélectionner sosplay
-            const sosplayCatalog = filteredCatalogs.find(c => getSourceKey(c.id) === 'sosplay');
-            if (sosplayCatalog) {
-              setSelectedCatalog(sosplayCatalog.id);
-              setSelectedSource('sosplay');
-            } else {
-              const first = filteredCatalogs[0];
-              setSelectedCatalog(first.id);
-              setSelectedSource(getSourceKey(first.id));
-            }
-          } else {
-            const first = filteredCatalogs[0];
-            setSelectedCatalog(first.id);
-            setSelectedSource(getSourceKey(first.id));
-          }
+          const preferred =
+            filteredCatalogs.find(c => getSourceKey(c.id) === 'northlive') ||
+            (isExtensionAvailable()
+              ? filteredCatalogs.find(c => getSourceKey(c.id) === 'sosplay')
+              : null) ||
+            filteredCatalogs[0];
+          setSelectedCatalog(preferred.id);
+          setSelectedSource(getSourceKey(preferred.id));
         }
       } catch (err) {
         console.error('Error fetching manifest:', err);
@@ -851,8 +899,7 @@ const LiveTV: React.FC = () => {
       return;
     }
 
-    const sourceNeedsVip = launchTarget.source === 'iptv';
-    const sourceAccessible = sourceNeedsVip ? isVip : hasFullAccess;
+    const sourceAccessible = isSourceAccessible(launchTarget.source);
     if (!sourceAccessible) {
       return;
     }
@@ -891,7 +938,7 @@ const LiveTV: React.FC = () => {
         setError(null);
         let data;
 
-        if (isExtensionAvailable()) {
+        if (isExtensionAvailable() && !selectedCatalog.startsWith('northlive_') && !selectedCatalog.startsWith('vavoo_')) {
           data = await fetchFromExtension('GET_CATALOG', { type: 'tv', id: selectedCatalog });
         } else {
           const response = await fetch(`${API_BASE}/api/livetv/catalog/tv/${selectedCatalog}`);
@@ -1051,13 +1098,13 @@ const LiveTV: React.FC = () => {
   }, [filteredChannels, selectedSource, livetvStatusFilter, livetvSportFilter]);
 
   const favoriteDisplayedChannels = useMemo(
-    () => displayedChannels.filter((channel) => isFavoriteChannel(selectedSource, channel.id)),
-    [displayedChannels, isFavoriteChannel, selectedSource]
+    () => displayedChannels.filter((channel) => isFavoriteDisplayChannel(selectedSource, channel)),
+    [displayedChannels, isFavoriteDisplayChannel, selectedSource]
   );
 
   const regularDisplayedChannels = useMemo(
-    () => displayedChannels.filter((channel) => !isFavoriteChannel(selectedSource, channel.id)),
-    [displayedChannels, isFavoriteChannel, selectedSource]
+    () => displayedChannels.filter((channel) => !isFavoriteDisplayChannel(selectedSource, channel)),
+    [displayedChannels, isFavoriteDisplayChannel, selectedSource]
   );
 
   const handleChannelClick = useCallback((channel: Channel) => {
@@ -1196,8 +1243,7 @@ const LiveTV: React.FC = () => {
       return;
     }
 
-    const sourceNeedsVip = launchTarget.source === 'iptv';
-    const sourceAccessible = sourceNeedsVip ? isVip : hasFullAccess;
+    const sourceAccessible = isSourceAccessible(launchTarget.source);
 
     if (!sourceAccessible) {
       setLaunchTarget(null);
@@ -1267,6 +1313,11 @@ const LiveTV: React.FC = () => {
   // Helper pour formater le nom du catalogue proprement
   const formatCatalogName = (catalog: Catalog) => {
 
+    // Vavoo categories are country/region groups (proper nouns) — keep them
+    // verbatim (the generic keyword translation below would mangle e.g.
+    // "France Sport" → "Sport"). The emoji comes from categoryEmojis.
+    if (catalog.id === 'vavoo_all') return t('common.all');
+    if (catalog.id.startsWith('vavoo_')) return catalog.name;
 
     let name = catalog.name;
 
@@ -1326,6 +1377,20 @@ const LiveTV: React.FC = () => {
 
   // Catalog icon: daddylive country catalogs render a flag via react-country-flag.
   const getCatalogIcon = (catalog: Catalog): React.ReactNode => {
+    if (catalog.id.startsWith('vavoo_')) {
+      const code = vavooGroupCountry[catalog.id];
+      if (code) {
+        return (
+          <ReactCountryFlag
+            countryCode={code}
+            svg
+            style={{ width: '1.15em', height: '1.15em', borderRadius: '2px' }}
+            aria-label={code}
+          />
+        );
+      }
+      return <Globe className="w-3.5 h-3.5" />; // All, Balkans — no single country
+    }
     if (catalog.id.startsWith('daddylive_')) {
       const code = catalog.id.slice('daddylive_'.length);
       if (code.length === 2) {
@@ -1345,7 +1410,7 @@ const LiveTV: React.FC = () => {
 
   // Source icons mapping
   const sourceIcons: Record<string, React.ReactNode> = {
-    'linkzy': <Zap className="w-3.5 h-3.5" />,
+    'vavoo': <Radio className="w-3.5 h-3.5" />,
     'fctv': <span className="text-sm leading-none">⚽</span>,
     'wiflix': <Tv className="w-3.5 h-3.5" />,
     'sosplay': <Radio className="w-3.5 h-3.5" />,
@@ -1361,9 +1426,7 @@ const LiveTV: React.FC = () => {
   }, [availableSources, isVip]);
 
   const handleSourceChange = (newSource: string) => {
-    const srcIsVipOnly = newSource === 'iptv';
-    if (srcIsVipOnly && !isVip) return;
-    if (!srcIsVipOnly && !hasFullAccess) return;
+    if (!isSourceAccessible(newSource)) return;
 
     setSelectedSource(newSource);
     if (newSource === 'iptv') {
@@ -1566,7 +1629,8 @@ const LiveTV: React.FC = () => {
 
   const renderMatchAccordion = (channel: Channel, index: number) => {
     const isExpanded = !collapsedMatches[channel.id];
-    const isFavorite = isFavoriteChannel(selectedSource, channel.id);
+    const favoriteVariantId = getFavoriteVariantId(selectedSource, channel);
+    const isFavorite = favoriteVariantId !== null;
     const isLive = Boolean(channel._isLive);
     const hasServers = (channel._servers && channel._servers.length > 0) || (channel._serverCount || 0) > 0;
 
@@ -1727,14 +1791,21 @@ const LiveTV: React.FC = () => {
     const isSosplay = selectedCatalog.startsWith('sosplay_');
     const isLivetv = selectedCatalog.startsWith('livetv_');
     const isMatch = selectedCatalog.startsWith('matches_');
+    const isNorthlive = selectedCatalog.startsWith('northlive_');
+    const isVavoo = selectedCatalog.startsWith('vavoo_');
+    const vavooServers = Array.from(new Set(
+      channel._vavooVariants?.map((variant) => variant.server).filter(Boolean) || []
+    ));
     const isEventCard = isMatch || isLivetv;
-    const isNoImage = isWiflix || isSosplay || isEventCard;
+    // northlive + vavoo render as name-only landscape cards (no poster loaded).
+    const isNoImage = isWiflix || isSosplay || isEventCard || isNorthlive || isVavoo;
     const isMatchLive = Boolean(channel._isLive);
     const matchCompetition = channel._competition || channel._sport;
     // timeRemaining display is rendered via <TimeRemaining/> below.
     const isClickableMatch = !isEventCard || isPlayableEventChannel(channel);
     const livetvEmoji = channel._emoji || livetvSportEmojis[channel._sportKey || ''] || '📺';
-    const isFavorite = isFavoriteChannel(selectedSource, channel.id);
+    const favoriteVariantId = getFavoriteVariantId(selectedSource, channel);
+    const isFavorite = favoriteVariantId !== null;
     const eventStatusLabel = !isEventCard
       ? t('liveTV.liveTag')
       : isClickableMatch
@@ -1764,7 +1835,7 @@ const LiveTV: React.FC = () => {
             inactiveLabel={t('liveTV.addToFavorites')}
             onToggle={(event) => toggleFavoriteChannel(event, {
               source: selectedSource,
-              id: channel.id,
+              id: favoriteVariantId || channel.id,
               name: channel.name,
               poster: channel.poster,
               kind: 'channel',
@@ -1801,10 +1872,18 @@ const LiveTV: React.FC = () => {
                 </>
               ) : (
                 <>
-                  <Tv className={cn('w-6 h-6 mb-1', isSosplay ? 'text-emerald-500 opacity-40' : isLivetv ? 'text-amber-500 opacity-40' : isWiflix ? 'text-red-500 opacity-40' : 'text-white opacity-10')} />
-                  <h3 className="text-xs font-medium text-white/60 line-clamp-2 leading-tight">{channel.name}</h3>
-                </>
-              )}
+                   <Tv className={cn('w-6 h-6 mb-1', isSosplay ? 'text-emerald-500 opacity-40' : isLivetv ? 'text-amber-500 opacity-40' : isWiflix ? 'text-red-500 opacity-40' : 'text-white opacity-10')} />
+                   <h3 className="text-xs font-medium text-white/60 line-clamp-2 leading-tight">{channel.name}</h3>
+                   {isVavoo && channel._vavooVariants && channel._vavooVariants.length > 1 && vavooServers.length > 0 && (
+                     <div className="mt-1.5 flex max-w-full items-center gap-1 rounded-full border border-white/[0.06] bg-white/[0.03] px-2 py-1 text-[9px] font-medium text-white/35">
+                       <Wifi className="h-3 w-3 shrink-0" />
+                       <span className="truncate">
+                         {t('liveTV.vavooServers')}: {vavooServers.join(' · ')}
+                       </span>
+                     </div>
+                   )}
+                 </>
+               )}
             </div>
           )}
 
@@ -1876,16 +1955,15 @@ const LiveTV: React.FC = () => {
 
             {/* ── STREAM DISCLAIMER ── */}
             <div className="flex items-start gap-2.5 px-3.5 py-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl">
-              <Wifi className="w-4 h-4 text-white/35 shrink-0 mt-0.5" />
+                    <Wifi className="w-4 h-4 text-white opacity-[0.35] shrink-0 mt-0.5" />
               <p className="text-white/45 text-xs sm:text-sm leading-snug">{t('liveTV.streamDisclaimer')}</p>
             </div>
 
             {/* ── SOURCE PILL TABS ── */}
-            {!loadingCatalogs && hasFullAccess && allSources.length > 0 && (
+            {!loadingCatalogs && allSources.length > 0 && (
               <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none -mx-1 px-1">
                 {allSources.map((source) => {
-                  const srcIsVipOnly = source === 'iptv';
-                  const isLocked = srcIsVipOnly ? !isVip : !hasFullAccess;
+                  const isLocked = !isSourceAccessible(source);
                   const isActive = selectedSource === source;
                   const label = sourceDisplayNames[source]?.startsWith('liveTV.') ? t(sourceDisplayNames[source]) : (sourceDisplayNames[source] || source);
 
@@ -1915,29 +1993,45 @@ const LiveTV: React.FC = () => {
               </div>
             )}
 
-            {/* ── VIP UPSELL (extension users) ── */}
-            {hasExtension && !isVip && !loadingCatalogs && (
+            {/* ── FREE MODE NOTICE (other players need VIP / extension / mobile app) ── */}
+            {!loadingCatalogs && !hasFullAccess && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="flex items-center justify-between gap-4 px-4 py-3 bg-gradient-to-r from-amber-500/[0.06] to-transparent border border-amber-500/10 rounded-xl"
+                className="flex flex-col gap-3 px-4 py-3 bg-gradient-to-r from-amber-500/[0.06] to-transparent border border-amber-500/10 rounded-xl sm:flex-row sm:items-center sm:justify-between"
               >
                 <div className="flex items-center gap-3 min-w-0">
                   <Crown className="w-4 h-4 text-amber-400 shrink-0" />
-                  <p className="text-amber-300/80 text-xs sm:text-sm truncate">{t('liveTV.vipUnlockMore')}</p>
+                  <p className="text-amber-300/80 text-xs sm:text-sm">{t('liveTV.freeModeOtherSources')}</p>
                 </div>
-                <Link to="/vip">
-                  <Button size="sm" className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/20 text-xs h-7 px-3">
-                    {t('liveTV.becomeVip')}
-                  </Button>
-                </Link>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Link to="/vip">
+                    <Button size="sm" className="h-7 gap-1.5 border border-amber-500/20 bg-amber-500/20 px-3 text-xs text-amber-300 hover:bg-amber-500/30">
+                      <Crown className="w-3.5 h-3.5" />
+                      {t('common.vip')}
+                    </Button>
+                  </Link>
+                  <Link to="/extension">
+                    <Button size="sm" variant="outline" className="h-7 gap-1.5 border-emerald-500/20 px-3 text-xs text-emerald-400 hover:bg-emerald-500/5">
+                      <Puzzle className="w-3.5 h-3.5" />
+                      {t('common.extension')}
+                    </Button>
+                  </Link>
+                  <Link to="/app">
+                    <Button size="sm" variant="outline" className="h-7 gap-1.5 border-white/15 px-3 text-xs text-white/70 hover:bg-white/5">
+                      <Smartphone className="w-3.5 h-3.5" />
+                      {t('liveTV.mobileApp')}
+                    </Button>
+                  </Link>
+                </div>
               </motion.div>
             )}
+
           </div>
         </motion.div>
 
         {/* ── CATEGORY BAR + IPTV DROPDOWN ── */}
-        {!loadingCatalogs && hasFullAccess && (
+        {!loadingCatalogs && hasAccess && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -2105,7 +2199,7 @@ const LiveTV: React.FC = () => {
         )}
 
         {/* ── LOADING STATE ── */}
-        {!loadingCatalogs && hasFullAccess && selectedSource === 'livetv' && (
+        {!loadingCatalogs && hasAccess && selectedSource === 'livetv' && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -2177,7 +2271,7 @@ const LiveTV: React.FC = () => {
         )}
 
         {/* ── NO ACCESS ── */}
-        {!loadingCatalogs && !hasFullAccess && (
+        {!loadingCatalogs && !hasAccess && (
           <motion.div
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
@@ -2213,7 +2307,7 @@ const LiveTV: React.FC = () => {
         )}
 
         {/* ── IPTV GRID ── */}
-        {!loadingCatalogs && hasFullAccess && selectedSource === 'iptv' && (
+        {!loadingCatalogs && hasAccess && selectedSource === 'iptv' && (
           <div className="pb-12">
             {loadingIptvStreams ? (
               <ChannelSkeleton />
@@ -2271,7 +2365,7 @@ const LiveTV: React.FC = () => {
         )}
 
         {/* ── CHANNELS GRID (non-IPTV) ── */}
-        {!loadingCatalogs && hasFullAccess && selectedSource !== 'iptv' && (
+        {!loadingCatalogs && hasAccess && selectedSource !== 'iptv' && (
           <div className="pb-12">
             {loadingChannels ? (
               <ChannelSkeleton />
@@ -2327,9 +2421,20 @@ const LiveTV: React.FC = () => {
                         {favoriteDisplayedChannels.length > 0 && (
                           <LiveTVSectionDivider title={t('liveTV.otherChannels')} count={regularDisplayedChannels.length} />
                         )}
-                        <div className={channelGridClassName}>
-                          {regularDisplayedChannels.map((channel, index) => renderChannelCard(channel, favoriteDisplayedChannels.length + index))}
-                        </div>
+                        {selectedSource === 'vavoo' ? (
+                          /* Vavoo groups (esp. "All") can be thousands of channels —
+                             virtualize like the IPTV grid to avoid a DOM blow-up. */
+                          <VirtualizedIptvGrid
+                            items={regularDisplayedChannels}
+                            columns={iptvColumns}
+                            getKey={(channel) => channel.id}
+                            renderItem={(channel, index) => renderChannelCard(channel, index)}
+                          />
+                        ) : (
+                          <div className={channelGridClassName}>
+                            {regularDisplayedChannels.map((channel, index) => renderChannelCard(channel, favoriteDisplayedChannels.length + index))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </>
@@ -2347,6 +2452,14 @@ const LiveTV: React.FC = () => {
             channelId={selectedChannel.id}
             channelName={selectedChannel.name}
             channelPoster={selectedChannel.poster}
+            vavooVariants={selectedChannel._vavooVariants}
+            onSelectVavooVariant={(variantId) => {
+              // Swap the played variant while keeping the grouped channel's
+              // display name and variant list — the player refetches on id change.
+              setSelectedChannel((prev) => (
+                prev && prev.id !== variantId ? { ...prev, id: variantId } : prev
+              ));
+            }}
             onClose={handleClosePlayer}
           />
         )}

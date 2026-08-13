@@ -1,8 +1,9 @@
 import { Platform } from 'react-native';
-import { buildAndroidPipShim } from './android-pip-shim';
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
 import { buildMediaSession } from './media-session';
+import { buildPictureInPictureShim } from './picture-in-picture-shim';
+import { buildPlaybackAwakeShim } from './playback-awake-shim';
 import { USERSCRIPT_SOURCE } from './userscript-source';
 
 export interface InjectOptions {
@@ -23,12 +24,24 @@ export interface InjectOptions {
    * relais pour router vers Chromecast.
    */
   castMode?: 'airplay' | 'chromecast';
+  /**
+   * Android uniquement : expose une surface Web Picture-in-Picture adossée au
+   * PiP natif de l'Activity (le WebView système n'implémente pas l'API Web).
+   * Sur iOS, WebKit fournit déjà `requestPictureInPicture()`.
+   */
+  pictureInPictureEnabled?: boolean;
 }
 
 export function buildInjectedJavaScript(options: InjectOptions = {}): string {
-  const { proxyEnabled = true, castMode = 'airplay' } = options;
+  const {
+    proxyEnabled = true,
+    castMode = 'airplay',
+    pictureInPictureEnabled = false,
+  } = options;
   const bridge = buildBridgeRuntime();
   const mediaSession = buildMediaSession();
+  const pipShim = buildPictureInPictureShim(pictureInPictureEnabled === true);
+  const playbackAwakeShim = buildPlaybackAwakeShim();
 
   const userscript = proxyEnabled
     ? `// --- Userscript Movix ---\n${USERSCRIPT_SOURCE}`
@@ -40,17 +53,15 @@ export function buildInjectedJavaScript(options: InjectOptions = {}): string {
   const injectCastShim = Platform.OS !== 'ios' || castMode === 'chromecast';
   const castShimBlock = injectCastShim ? buildCastShim() : '// Cast shim omis (AirPlay mode)';
 
-  // Android : shim PiP (le WebView système n'a pas l'API Web PiP).
-  const androidPipShim =
-    Platform.OS === 'android' ? buildAndroidPipShim() : '// PiP shim natif iOS (WebKit)';
-
   // Cast shim FIRST — must be on window before any page JS runs.
   // Media Session : toujours injecté (jaquette notif + contrôles écran
-  // verrouillé + auto-PiP), indépendant du proxy.
+  // verrouillé + auto-PiP iOS), indépendant du proxy.
   return `
 ${castShimBlock}
 
-${androidPipShim}
+${pipShim}
+
+${playbackAwakeShim}
 
 ${bridge}
 

@@ -138,6 +138,15 @@ cp API/proxiesembed/.env.example API/proxiesembed/.env
 cp API/miscs/.env.example API/miscs/.env
 ```
 
+Initialise ensuite le schéma de l'API principale avant de démarrer les services :
+
+```bash
+cd API/Mainapi
+npm run db:init
+```
+
+Sur une base existante, la commande demande confirmation ; elle en demande une seconde pour les modifications des tables Wrapped, qui peuvent être longues si elles sont volumineuses.
+
 ### Lancer le minimum utile en local
 
 ```bash

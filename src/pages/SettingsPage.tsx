@@ -7,7 +7,7 @@ import {
   ArrowLeft, Settings, Shield, Monitor, Smartphone, Tablet,
   Copy, X, Snowflake, Activity, Trash2, Crown, Volume2,
   Database, Key, Lock, Palette, Eye, Download, Upload, Globe, AlertTriangle, History, CalendarClock, FlaskConical, Link2, MessageCircle, BellOff, Sparkles,
-  Zap, RefreshCw, ChevronDown, ListOrdered, Gauge, Megaphone
+  Zap, RefreshCw, ChevronDown, ListOrdered, Gauge, Megaphone, Square
 } from 'lucide-react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
@@ -513,6 +513,17 @@ const SettingsPage: React.FC = () => {
     setBgForceSquareSize(next);
     localStorage.setItem(BG_STORAGE_KEYS.forceSquareSize, next ? '1' : '0');
     notifyBgPrefsChanged();
+  };
+
+  const [squareCornersEnabled, setSquareCornersEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('square_corners_enabled') === '1';
+  });
+
+  const handleSquareCornersToggle = () => {
+    const next = !squareCornersEnabled;
+    setSquareCornersEnabled(next);
+    localStorage.setItem('square_corners_enabled', next ? '1' : '0');
+    document.documentElement.classList.toggle('square-corners', next);
   };
 
   const [introEnabled, setIntroEnabled] = useState(() => {
@@ -1932,6 +1943,25 @@ const SettingsPage: React.FC = () => {
                     </p>
                   </div>
                   {renderToggle(isSnowfallActive, handleSnowfallToggle, 'blue')}
+                </motion.div>
+
+                {/* Coins carrés */}
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.175 }}
+                  className="flex items-center justify-between p-4 bg-gray-800/30 rounded-xl border border-gray-700/40 hover:border-gray-600/50 transition-colors group"
+                >
+                  <div className="flex-1 mr-4">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <Square className="w-3.5 h-3.5 text-purple-400" />
+                      <h4 className="font-medium text-white text-sm">{t('settings.squareCorners', 'Coins carrés')}</h4>
+                    </div>
+                    <p className="text-xs text-gray-500 leading-relaxed">
+                      {t('settings.squareCornersDesc', 'Supprime tous les coins arrondis de l\'interface (cartes, carrousels, boutons, avatars…).')}
+                    </p>
+                  </div>
+                  {renderToggle(squareCornersEnabled, handleSquareCornersToggle, 'purple')}
                 </motion.div>
 
                 {/* Style de fond */}

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState, useMemo } from 'react';
+import React, { useCallback, useEffect, useRef, useState, useMemo } from 'react';
 import useEmblaCarousel from 'embla-carousel-react';
 import { Star, Calendar, Trash, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { PrefetchLink as Link } from '@/routing/PrefetchLink';
@@ -234,7 +234,7 @@ const CarouselCard = React.memo<{
     <div className="embla-slide flex-none relative w-[144px] md:w-[192px]">
       <div
         style={{ animationDelay: `${Math.min(index * 0.03, 0.5)}s` }}
-        className="relative group rounded-xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/20 hover:scale-105 transition-transform duration-200 ease-out animate-card-enter"
+        className="relative group rounded-xl overflow-hidden bg-white/5 border border-white/10 hover:border-white/20 hover:scale-105 transform-gpu will-change-transform transition-transform duration-200 ease-out animate-card-enter"
       >
         {/* Type badge */}
         <span className="absolute top-2 left-2 z-10 px-2 py-1 rounded-lg bg-black/75 text-[10px] font-semibold uppercase tracking-wider text-white/80">
@@ -273,10 +273,11 @@ const CarouselCard = React.memo<{
             aria-label={starred ? t('profile.removeFromWatchlist') : t('profile.addToWatchlist')}
             className={`absolute top-2 right-2 z-20 p-2 rounded-full active:scale-[0.7] transition-[opacity,background-color,transform] duration-200 md:opacity-0 md:group-hover:opacity-100 ${starred ? 'bg-yellow-500/40 border border-yellow-400/50' : 'bg-black/65 hover:bg-black/80'}`}
           >
+            {/* initial={false} : pas de spring au mount (jusqu'à 30 cards par row révélée
+                au scroll) ; le pop ne joue qu'au passage à starred via les keyframes */}
             <motion.div
-              key={starred ? 'on' : 'off'}
-              initial={{ scale: 0.3, rotate: -45 }}
-              animate={{ scale: 1, rotate: 0 }}
+              initial={false}
+              animate={starred ? { scale: [0.3, 1], rotate: [-45, 0] } : { scale: 1, rotate: 0 }}
               transition={{ type: 'spring', stiffness: 500, damping: 15 }}
             >
               <Star
@@ -332,7 +333,7 @@ const CarouselCard = React.memo<{
             ) : null}
             {year && (
               <div className="flex items-center gap-1">
-                <Calendar className="w-3 h-3 text-white/60" />
+            <Calendar className="w-3 h-3 text-white opacity-60" />
                 <span className="text-xs text-white/60">{year}</span>
               </div>
             )}
@@ -405,10 +406,12 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     // saccadé sur trackpad/molette, remonter à 20.
     duration: 15,
     startIndex: 0,
-    loop: false
+    loop: false,
+    slides: '.embla-slide'
   });
   const [canScrollPrev, setCanScrollPrev] = useState(false);
   const [canScrollNext, setCanScrollNext] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
 
   // Cache watchlists once using useMemo to avoid repeated localStorage access
   const watchlistMovies = useMemo(() => {
@@ -490,6 +493,30 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     };
   }, [limitedItems]);
 
+  // Pause l'animation `peephole-zoom` (CSS `.ranking-number`, cf.
+  // EmblaCarousel.css) quand la row Top 10 est hors écran — sans ça les 10
+  // digits animent `background-size` en boucle infinie 8s même hors
+  // viewport, donc repaint continu. Gated sur `showRanking` (= mediaType
+  // "top10" côté appelant) : les autres carousels n'ont pas de
+  // `.ranking-number`, pas besoin d'observer. IntersectionObserver léger, un
+  // seul par row, toggle juste une classe CSS (`.embla--offscreen`) — 0
+  // impact sur le rendu visible pendant que la row est dans le viewport.
+  useEffect(() => {
+    if (!showRanking) return;
+    if (typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') return;
+    const node = rowRef.current;
+    if (!node) return;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        node.classList.toggle('embla--offscreen', !entry.isIntersecting);
+      },
+      { rootMargin: '200px' }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [showRanking]);
+
   // `priority` cap statique : les N premières cards reçoivent
   // `loading="eager"` + `fetchpriority="high"` pour aider le LCP. Calculé une
   // fois au mount selon le viewport (= getStep + 2 buffer pour couvrir les
@@ -505,13 +532,33 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
     return 4;                 // sm/xs
   }, []);
 
+  const checkIfScrollable = useCallback(() => {
+    if (!emblaApi) return false;
+    if (emblaApi.scrollSnapList().length <= 1) return false;
+    const container = emblaApi.containerNode();
+    if (container) {
+      const scrollWidth = container.scrollWidth;
+      const clientWidth = container.clientWidth;
+      if (scrollWidth <= clientWidth + 5) {
+        return false;
+      }
+    }
+    return true;
+  }, [emblaApi]);
+
   // Effect 2: track arrow-button state via 'select' + 'reInit' only.
   useEffect(() => {
     if (!emblaApi) return;
     const updateArrows = () => {
       try {
-        setCanScrollPrev(emblaApi.canScrollPrev());
-        setCanScrollNext(emblaApi.canScrollNext());
+        const runUpdate = () => {
+          if (!emblaApi) return;
+          const isScrollable = checkIfScrollable();
+          setCanScrollPrev(isScrollable && emblaApi.canScrollPrev());
+          setCanScrollNext(isScrollable && emblaApi.canScrollNext());
+        };
+        runUpdate();
+        requestAnimationFrame(runUpdate);
       } catch (_) {
         // no-op
       }
@@ -523,7 +570,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
       emblaApi.off('select', updateArrows);
       emblaApi.off('reInit', updateArrows);
     };
-  }, [emblaApi]);
+  }, [emblaApi, checkIfScrollable, limitedItems]);
 
   // Support molette horizontale (tilt wheel / trackpad) -> scroll du carousel
   useEffect(() => {
@@ -682,7 +729,7 @@ const EmblaCarousel: React.FC<EmblaCarouselProps> = ({
   }, [limitedItems, isHistory, getEpisodeProgress, getMovieProgress]);
 
   return (
-    <div className="mb-4 content-row-container select-none -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
+    <div ref={rowRef} className="mb-4 content-row-container select-none -mx-3 md:-mx-4 group/carousel" style={{ position: 'relative' }}>
         <div className="flex justify-between items-center mb-2 px-4 md:px-6 relative">
           <div className="flex items-center gap-3">
             <h2 className="section-title">{title}</h2>

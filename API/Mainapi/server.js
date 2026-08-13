@@ -153,7 +153,7 @@ if (cluster.isPrimary ?? cluster.isMaster) {
 // === WORKER PROCESS ONLY (below) =============================================
 // =============================================================================
 
-process.env.UV_THREADPOOL_SIZE = 8; // 8 threads libuv par worker (6 workers x 8 = 48 threads total)
+process.env.UV_THREADPOOL_SIZE ||= "8"; // 8 threads libuv par worker (6 workers x 8 = 48 threads total)
 
 const http = require('http');
 const https = require('https');
@@ -164,7 +164,7 @@ const { redis } = require('./config/redis');
 const { shutdownCycleTLS, refreshProxyScrapeProxies } = require('./utils/proxyManager');
 const { getPool } = require('./mysqlPool');
 
-const PORT = 25565;
+const PORT = parseInt(process.env.PORT, 10) || 25565;
 
 // ===========================================================================
 // === MEMORY DIAGNOSTICS (worker) ===========================================
