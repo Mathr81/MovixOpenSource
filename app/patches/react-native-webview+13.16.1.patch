@@ -1,5 +1,5 @@
 diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
-index 80c6803..f70b87d 100644
+index 80c6803..a24523c 100644
 --- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
 +++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
 @@ -253,7 +253,11 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
@@ -15,7 +15,7 @@ index 80c6803..f70b87d 100644
                }
              };
              WebViewCompat.addWebMessageListener(
-@@ -324,7 +324,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+@@ -324,7 +328,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
        injectJavascriptObject();
      }
  
@@ -24,7 +24,7 @@ index 80c6803..f70b87d 100644
          ThemedReactContext reactContext = getThemedReactContext();
          RNCWebView mWebView = this;
  
-@@ -338,6 +338,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+@@ -338,6 +342,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
                      }
                      WritableMap data = mRNCWebViewClient.createWebViewEvent(webView, sourceUrl);
                      data.putString("data", message);
@@ -32,7 +32,7 @@ index 80c6803..f70b87d 100644
  
                      if (mMessagingJSModule != null) {
                          dispatchDirectMessage(data);
-@@ -349,6 +350,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+@@ -349,6 +354,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
          } else {
              WritableMap eventData = Arguments.createMap();
              eventData.putString("data", message);
@@ -40,7 +40,7 @@ index 80c6803..f70b87d 100644
  
              if (mMessagingJSModule != null) {
                  dispatchDirectMessage(eventData);
-@@ -446,7 +448,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+@@ -446,7 +452,7 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
          public void postMessage(String message) {
              if (mWebView.getMessagingEnabled()) {
                  // Post to main thread because `mWebView.getUrl()` requires to be executed on main.
@@ -49,6 +49,67 @@ index 80c6803..f70b87d 100644
              } else {
                  FLog.w(TAG, "ReactNativeWebView.postMessage method was called but messaging is disabled. Pass an onMessage handler to the WebView.");
              }
+diff --git a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+index 0287e1c..7df710f 100644
+--- a/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
++++ b/node_modules/react-native-webview/android/src/main/java/com/reactnativecommunity/webview/RNCWebViewClient.java
+@@ -42,6 +42,11 @@ public class RNCWebViewClient extends WebViewClient {
+     protected static final int SHOULD_OVERRIDE_URL_LOADING_TIMEOUT = 250;
+ 
+     protected boolean mLastLoadFailed = false;
++    // Frame de la navigation en cours d'arbitrage. Renseigné par la surcharge
++    // WebResourceRequest de shouldOverrideUrlLoading, qui est appelée par le
++    // framework pour TOUTES les frames (y compris les iframes d'embed), puis lu
++    // par la surcharge String où l'information n'est plus disponible.
++    protected boolean mIsForMainFrame = true;
+     protected RNCWebView.ProgressChangedFilter progressChangedFilter = null;
+     protected @Nullable RNCBasicAuthCredential basicAuthCredential = null;
+ 
+@@ -90,9 +95,23 @@ public class RNCWebViewClient extends WebViewClient {
+       reactWebView.callInjectedJavaScriptBeforeContentLoaded();
+     }
+ 
++    // Surcharge WebResourceRequest (API 24+, soit le minSdk du projet) : c'est la
++    // seule qui expose la frame visée. Elle délègue à la surcharge String, qui
++    // porte toute la logique existante.
++    @Override
++    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
++        mIsForMainFrame = request.isForMainFrame();
++        try {
++            return shouldOverrideUrlLoading(view, request.getUrl().toString());
++        } finally {
++            mIsForMainFrame = true;
++        }
++    }
++
+     @Override
+     public boolean shouldOverrideUrlLoading(WebView view, String url) {
+         final RNCWebView rncWebView = (RNCWebView) view;
++        final boolean isForMainFrame = mIsForMainFrame;
+         final boolean isJsDebugging = rncWebView.getReactApplicationContext().getJavaScriptContextHolder().get() == 0;
+ 
+         if (!isJsDebugging && rncWebView.mMessagingJSModule != null) {
+@@ -102,6 +121,7 @@ public class RNCWebViewClient extends WebViewClient {
+ 
+             final WritableMap event = createWebViewEvent(view, url);
+             event.putDouble("lockIdentifier", lockIdentifier);
++            event.putBoolean("isTopFrame", isForMainFrame);
+             rncWebView.dispatchDirectShouldStartLoadWithRequest(event);
+ 
+             try {
+@@ -132,9 +152,11 @@ public class RNCWebViewClient extends WebViewClient {
+             progressChangedFilter.setWaitingForCommandLoadUrl(true);
+ 
+             int reactTag = RNCWebViewWrapper.getReactTagFromWebView(view);
++            final WritableMap fallbackEvent = createWebViewEvent(view, url);
++            fallbackEvent.putBoolean("isTopFrame", isForMainFrame);
+             UIManagerHelper.getEventDispatcherForReactTag((ReactContext) view.getContext(), reactTag).dispatchEvent(new TopShouldStartLoadWithRequestEvent(
+                     reactTag,
+-                    createWebViewEvent(view, url)));
++                    fallbackEvent));
+             return true;
+         }
+     }
 diff --git a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts b/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts
 index 8dd6cef..25f86ea 100644
 --- a/node_modules/react-native-webview/lib/RNCWebViewNativeComponent.d.ts

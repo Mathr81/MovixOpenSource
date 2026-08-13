@@ -126,14 +126,29 @@ export function buildPopupRedirectScript(): string {
     }
   };
 
-  // Au retour au premier plan (l'utilisateur a fini de regarder la pub dans le
-  // navigateur système), marque les faux windows comme fermés : satisfait les
-  // gates qui débloquent quand le popup de pub se referme.
-  document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) {
-      for (var i = 0; i < fakeWindows.length; i++) fakeWindows[i].closed = true;
-      fakeWindows = [];
+  // Retour au premier plan : l'utilisateur a fini de regarder la pub dans le
+  // navigateur système. On marque les faux popups comme fermés — c'est le
+  // signal sur lequel débloquent les gates qui attendent la fermeture de la
+  // pub — puis on rejoue focus/visibilité pour celles qui écoutent plutôt le
+  // retour de l'onglet. Aucune navigation n'est déclenchée : la page garde son
+  // état, ce qui évite le rechargement qui ramenait la gate publicitaire.
+  function notifyExternalReturn() {
+    for (var i = 0; i < fakeWindows.length; i++) {
+      try { fakeWindows[i].closed = true; } catch (e) {}
     }
+    fakeWindows = [];
+    try { window.dispatchEvent(new Event('focus')); } catch (e) {}
+    try { document.dispatchEvent(new Event('visibilitychange')); } catch (e) {}
+    try { window.dispatchEvent(new Event('pageshow')); } catch (e) {}
+  }
+
+  // Appelé par le natif (AppState -> active) après l'ouverture d'une pub dans
+  // le navigateur système : le WebView en arrière-plan ne reçoit pas toujours
+  // visibilitychange de façon fiable selon la plateforme et la version d'OS.
+  window.__movixNotifyExternalReturn = notifyExternalReturn;
+
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) notifyExternalReturn();
   });
 })();
 true;

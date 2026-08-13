@@ -7,7 +7,7 @@
  */
 
 import { type RefObject } from 'react';
-import { Linking, NativeModules, Platform } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 import type WebView from 'react-native-webview';
 import {
   type CastLoadMetadata,
@@ -989,6 +989,12 @@ export type BridgeMessageContext = {
   onMediaPlayback?: (playing: boolean) => void;
   /** Instantané localStorage du site, à persister côté natif. */
   onStorageSnapshot?: (data: Record<string, string>) => void;
+  /**
+   * Ouverture d'une URL hors site (pub interceptée par le shim window.open).
+   * L'ouverture elle-même est faite par WebViewBrowser, qui centralise la
+   * politique d'externalisation et le suivi du retour dans l'app.
+   */
+  onExternalOpen?: (url: string) => void;
 };
 
 export function isTrustedMovixBridgeUrl(
@@ -1109,9 +1115,7 @@ export async function handleBridgeMessage(
     // sa gate publicitaire.
     if (p.type === 'OPEN_EXTERNAL') {
       const target = typeof p.url === 'string' ? p.url : '';
-      if (/^https?:\/\//i.test(target)) {
-        Linking.openURL(target).catch(() => {});
-      }
+      if (/^https?:\/\//i.test(target)) context?.onExternalOpen?.(target);
       return;
     }
     // Instantané localStorage du site (cf. site-storage-sync) — persisté

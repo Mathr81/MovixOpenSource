@@ -5,7 +5,7 @@ import React, {
   useMemo,
   useRef,
 } from 'react';
-import { Linking, Platform } from 'react-native';
+import { AppState, Linking, Platform } from 'react-native';
 import { WebView, type WebViewNavigation } from 'react-native-webview';
 import type {
   WebViewErrorEvent,
@@ -118,6 +118,33 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
       topLevelUrlRef.current = url;
     }, [url]);
 
+    // Une pub a été ouverte dans le navigateur système : au retour dans l'app,
+    // on prévient la page pour qu'elle débloque sa gate publicitaire, au lieu
+    // de la laisser redemander « regarde une pub » (ou pire, de recharger).
+    const externalAdPendingRef = useRef(false);
+
+    const openExternal = useCallback((target: string) => {
+      if (!isUsableHttpUrl(target)) return;
+      externalAdPendingRef.current = true;
+      Linking.openURL(target).catch(() => {
+        externalAdPendingRef.current = false;
+      });
+    }, []);
+
+    React.useEffect(() => {
+      const subscription = AppState.addEventListener('change', next => {
+        if (next !== 'active' || !externalAdPendingRef.current) return;
+        externalAdPendingRef.current = false;
+        // `__movixNotifyExternalReturn` est posé par le shim popup-redirect :
+        // il marque les faux popups comme fermés et rejoue focus/visibilité,
+        // les deux signaux sur lesquels les gates publicitaires débloquent.
+        webViewRef.current?.injectJavaScript(
+          'try{window.__movixNotifyExternalReturn&&window.__movixNotifyExternalReturn();}catch(e){} true;',
+        );
+      });
+      return () => subscription.remove();
+    }, []);
+
     React.useEffect(() => {
       const stopCastStatusForwarding = startCastShimEventForwarding(webViewRef);
       const stopPictureInPictureForwarding = startPictureInPictureEventForwarding(
@@ -180,8 +207,9 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         isTopFrame: event.nativeEvent.isTopFrame === true,
         onMediaPlayback,
         onStorageSnapshot,
+        onExternalOpen: openExternal,
       });
-    }, [url, onMediaPlayback, onStorageSnapshot]);
+    }, [url, onMediaPlayback, onStorageSnapshot, openExternal]);
 
     const onHttpError = useCallback(
       (event: any) => {
@@ -207,17 +235,22 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
           } catch {
             return true;
           }
-          // isTopFrame n'est fiable que sur iOS (Android le force toujours à
-          // true) — y laisser passer les sous-frames hors site (captcha,
-          // embeds) sans les bloquer ; sur Android cette distinction n'existe
-          // pas, on s'appuie alors uniquement sur l'allowlist d'hôtes.
-          if (!hostname || !isTopFrame || isAllowedHost(hostname, allowedHosts)) {
+          // Les sous-frames (embeds du lecteur, captchas, iframes de pub
+          // internes à la page) ne sont JAMAIS externalisées : seule une
+          // navigation qui remplace le document principal piège l'utilisateur.
+          //
+          // `isTopFrame` est fourni nativement sur iOS et, sur Android, par le
+          // patch react-native-webview du dépôt. S'il manque (build sans le
+          // patch), on retombe sur `true` : mieux vaut externaliser une pub de
+          // trop que de laisser la WebView partir sur la pub sans retour.
+          const topFrame = isTopFrame !== false;
+          if (!hostname || !topFrame || isAllowedHost(hostname, allowedHosts)) {
             return true;
           }
           // Hôte hors site (pub, redirection tierce) : ouvert dans le
           // navigateur système plutôt que dans la WebView, qui sinon piège
           // l'utilisateur sans moyen fiable de revenir en arrière.
-          Linking.openURL(url).catch(() => {});
+          openExternal(url);
           return false;
         }
         // Ouvre uniquement les deep links déclenchés par un vrai clic utilisateur.
@@ -227,7 +260,35 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         }
         return false;
       },
-      [allowedHosts],
+      [allowedHosts, openExternal],
+    );
+
+    // iOS : une cible `_blank` (le cas des pubs Movix) n'atteint JAMAIS
+    // onShouldStartLoadWithRequest — WebKit annule la navigation et appelle
+    // onOpenWindow à la place. Sans ce handler la pub disparaissait purement et
+    // simplement, alors que le shim popup-redirect avait déjà renvoyé au site un
+    // faux popup : le site croyait la pub ouverte, l'utilisateur ne voyait rien.
+    const onOpenWindow = useCallback(
+      (event: { nativeEvent: { targetUrl: string } }) => {
+        const target = event.nativeEvent?.targetUrl ?? '';
+        if (!isUsableHttpUrl(target)) return;
+        let hostname = '';
+        try {
+          hostname = new URL(target).hostname;
+        } catch {
+          return;
+        }
+        if (isAllowedHost(hostname, allowedHosts)) {
+          // OAuth, captcha, site lui-même : on reproduit le comportement par
+          // défaut de react-native-webview (charger dans la WebView courante).
+          webViewRef.current?.injectJavaScript(
+            `window.location.href = ${JSON.stringify(target)}; true;`,
+          );
+          return;
+        }
+        openExternal(target);
+      },
+      [allowedHosts, openExternal],
     );
 
     const onWebViewError = useCallback(
@@ -291,7 +352,7 @@ const WebViewBrowser = forwardRef<WebViewBrowserRef, WebViewBrowserProps>(
         scalesPageToFit={true}
         // Android — bloque les fenêtres popup (window.open())
         setSupportMultipleWindows={false}
-        onOpenWindow={() => {}}
+        onOpenWindow={onOpenWindow}
         overScrollMode="never"
         thirdPartyCookiesEnabled={true}
         // iOS
