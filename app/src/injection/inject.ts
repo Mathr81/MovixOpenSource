@@ -1,5 +1,6 @@
 import { buildBridgeRuntime } from './bridge-runtime';
 import { buildCastShim } from './cast-shim';
+import { buildMediaSession } from './media-session';
 import {
   buildPictureInPictureShim,
   type PictureInPictureShimMode,
@@ -22,6 +23,7 @@ export function buildInjectedJavaScript(
     options.pictureInPictureMode ?? 'disabled',
   );
   const playbackAwakeShim = buildPlaybackAwakeShim();
+  const mediaSession = buildMediaSession();
   const bridge = buildBridgeRuntime({
     mediaProxyRoutingEnabled: options.mediaProxyRoutingEnabled,
     mediaProxyCapabilityEnabled: options.mediaProxyCapabilityEnabled,
@@ -37,6 +39,8 @@ ${castShim}
 ${pipShim}
 
 ${playbackAwakeShim}
+
+${mediaSession}
 
 ${bridge}
 

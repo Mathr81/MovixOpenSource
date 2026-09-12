@@ -33,6 +33,7 @@ async function loadInjectedJavaScriptBuilder() {
     if (id === './cast-shim') return { buildCastShim: () => 'CAST_SHIM' };
     if (id === './picture-in-picture-shim') return { buildPictureInPictureShim: mode => mode === 'android' ? 'PIP_SHIM' : 'PIP_DISABLED' };
     if (id === './playback-awake-shim') return { buildPlaybackAwakeShim: () => 'PLAYBACK_AWAKE_SHIM' };
+    if (id === './media-session') return { buildMediaSession: () => 'MEDIA_SESSION' };
     if (id === './bridge-runtime') return { buildBridgeRuntime: () => 'BRIDGE_RUNTIME' };
     if (id === './userscript-source') return { USERSCRIPT_SOURCE: 'USERSCRIPT_SOURCE' };
     throw new Error(`Unexpected injection dependency: ${id}`);
