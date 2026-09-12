@@ -701,6 +701,7 @@ final class AVNativePlaybackRuntime: NSObject, NativePlaybackRuntime,
 
   private let audioSession: NativePlaybackAudioSession
   private let surfaceHost: NativePlaybackSurfaceHosting
+  private let nowPlaying: NowPlayingInfoPublisher
   private var callbacks = NativePlaybackRuntimeCallbacks()
   private var generation: UInt64 = 0
   private var player: AVPlayer?
@@ -723,10 +724,12 @@ final class AVNativePlaybackRuntime: NSObject, NativePlaybackRuntime,
   // de parametre, evaluee en contexte nonisolated.
   init(
     audioSession: NativePlaybackAudioSession? = nil,
-    surfaceHost: NativePlaybackSurfaceHosting? = nil
+    surfaceHost: NativePlaybackSurfaceHosting? = nil,
+    nowPlaying: NowPlayingInfoPublisher? = nil
   ) {
     self.audioSession = audioSession ?? AVNativePlaybackAudioSession()
     self.surfaceHost = surfaceHost ?? ApplicationNativePlaybackSurfaceHost()
+    self.nowPlaying = nowPlaying ?? NowPlayingInfoPublisher()
     super.init()
   }
 
@@ -823,6 +826,19 @@ final class AVNativePlaybackRuntime: NSObject, NativePlaybackRuntime,
     }
     player.pause()
     hasCompletedPreparation = true
+
+    // La fiche part dès que l'élément est prêt : le relais enchaîne sur le
+    // Picture-in-Picture, et une fiche posée seulement au premier `play`
+    // laisserait l'écran verrouillé sur les informations de la WebView, que
+    // WebKit vient d'abandonner en mettant sa vidéo en pause.
+    let itemDuration = item.duration.seconds
+    nowPlaying.begin(
+      title: source.title,
+      posterURL: source.posterURL,
+      duration: itemDuration.isFinite && itemDuration > 0 ? itemDuration : nil,
+      position: source.positionSec,
+      rate: 0
+    )
   }
 
   func activateAudioSession() throws {
@@ -830,11 +846,14 @@ final class AVNativePlaybackRuntime: NSObject, NativePlaybackRuntime,
   }
 
   func play(rate: Float) {
-    player?.playImmediately(atRate: min(max(rate, 0.25), 4))
+    let bounded = min(max(rate, 0.25), 4)
+    player?.playImmediately(atRate: bounded)
+    nowPlaying.update(position: currentPosition, rate: bounded)
   }
 
   func pause() {
     player?.pause()
+    nowPlaying.update(position: currentPosition, rate: 0)
   }
 
   func startPictureInPicture(
@@ -871,6 +890,9 @@ final class AVNativePlaybackRuntime: NSObject, NativePlaybackRuntime,
 
   private func resetMediaResources(clearCallbacks: Bool) {
     generation &+= 1
+    // Rendre la fiche avant de démonter le lecteur : la lecture repart dans la
+    // WebView, dont WebKit republiera les informations à son tour.
+    nowPlaying.end()
     phaseCleanupObservers()
     pictureInPictureController?.delegate = nil
     pictureInPictureController?.stopPictureInPicture()

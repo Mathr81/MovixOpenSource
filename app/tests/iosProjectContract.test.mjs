@@ -386,6 +386,45 @@ test('iOS loopback media proxy transport and server are securely wired', async (
   }
 });
 
+test('iOS now playing info and its XCTest suite are compiled by their targets', async () => {
+  const [project, publisher, controller, tests] = await Promise.all([
+    text('../ios/Movix.xcodeproj/project.pbxproj'),
+    text('../ios/Movix/Playback/NowPlayingInfo.swift'),
+    text('../ios/Movix/Playback/NativePlaybackController.swift'),
+    text('../ios/MovixTests/NowPlayingInfoTests.swift'),
+  ]);
+
+  for (const source of ['NowPlayingInfo.swift', 'NowPlayingInfoTests.swift']) {
+    assert.match(project, new RegExp(`${source.replace('.', '\\.')} in Sources`));
+    assert.equal(project.match(new RegExp(`${source.replace('.', '\\.')} in Sources`, 'g'))?.length, 2);
+  }
+
+  // Le centre d'informations est pris derriere un protocole : c'est ce qui rend
+  // la fiche verifiable sans ecran verrouille, et ce que la suite XCTest injecte.
+  assert.match(publisher, /protocol NowPlayingInfoSink: AnyObject/);
+  assert.match(publisher, /extension MPNowPlayingInfoCenter: NowPlayingInfoSink \{\}/);
+  assert.match(publisher, /protocol NowPlayingArtworkLoading/);
+  assert.match(publisher, /^import MediaPlayer$/m);
+  // La jaquette est un ornement : bornee en taille comme en duree, jamais un
+  // telechargement libre declenche par une page.
+  assert.match(publisher, /maximumArtworkBytes\s*=\s*4 \* 1_024 \* 1_024/);
+  assert.match(publisher, /timeout: TimeInterval = 5/);
+  // `end()` ne doit effacer que la fiche que ce producteur a posee.
+  assert.match(publisher, /guard isPublishing else \{ return \}/);
+
+  // La fiche suit le relais natif de bout en bout : posee des que l'element est
+  // pret, deplacee a chaque transport, rendue au demontage du lecteur.
+  assert.match(controller, /nowPlaying\.begin\(/);
+  assert.match(controller, /nowPlaying\.update\(position: currentPosition, rate: bounded\)/);
+  assert.match(controller, /nowPlaying\.update\(position: currentPosition, rate: 0\)/);
+  assert.match(controller, /nowPlaying\.end\(\)/);
+
+  assert.match(tests, /func testBeginPublishesTitleDurationAndPosition/);
+  assert.match(tests, /func testNonFiniteDurationIsOmitted/);
+  assert.match(tests, /func testEndClearsTheCardExactlyOnce/);
+  assert.match(tests, /func testArtworkJoinsTheCardOnceLoaded/);
+});
+
 test('the app icon catalog is compiled into the Movix bundle', async () => {
   const project = await text('../ios/Movix.xcodeproj/project.pbxproj');
   const catalog = JSON.parse(

@@ -26,6 +26,8 @@
 		D1A700000000000000000003 /* PictureInPictureModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A700000000000000000013 /* PictureInPictureModule.swift */; };
 		D1A700000000000000000004 /* PictureInPictureModule.m in Sources */ = {isa = PBXBuildFile; fileRef = D1A700000000000000000014 /* PictureInPictureModule.m */; };
 		D1A700000000000000000005 /* NativePlaybackControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A700000000000000000015 /* NativePlaybackControllerTests.swift */; };
+		D1A700000000000000000006 /* NowPlayingInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A700000000000000000016 /* NowPlayingInfo.swift */; };
+		D1A700000000000000000007 /* NowPlayingInfoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A700000000000000000017 /* NowPlayingInfoTests.swift */; };
 		E1A700000000000000000001 /* MovixGlassEffectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A700000000000000000011 /* MovixGlassEffectView.swift */; };
 		E1A700000000000000000002 /* MovixGlassEffectViewManager.m in Sources */ = {isa = PBXBuildFile; fileRef = E1A700000000000000000012 /* MovixGlassEffectViewManager.m */; };
 		E1A700000000000000000003 /* MovixBrowserChromeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A700000000000000000013 /* MovixBrowserChromeView.swift */; };
@@ -99,6 +101,8 @@
 		D1A700000000000000000013 /* PictureInPictureModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PictureInPictureModule.swift; sourceTree = "<group>"; };
 		D1A700000000000000000014 /* PictureInPictureModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = PictureInPictureModule.m; sourceTree = "<group>"; };
 		D1A700000000000000000015 /* NativePlaybackControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePlaybackControllerTests.swift; sourceTree = "<group>"; };
+		D1A700000000000000000016 /* NowPlayingInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingInfo.swift; sourceTree = "<group>"; };
+		D1A700000000000000000017 /* NowPlayingInfoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingInfoTests.swift; sourceTree = "<group>"; };
 		E1A700000000000000000011 /* MovixGlassEffectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MovixGlassEffectView.swift; sourceTree = "<group>"; };
 		E1A700000000000000000012 /* MovixGlassEffectViewManager.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = MovixGlassEffectViewManager.m; sourceTree = "<group>"; };
 		E1A700000000000000000013 /* MovixBrowserChromeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MovixBrowserChromeView.swift; sourceTree = "<group>"; };
@@ -167,6 +171,7 @@
 				C20000000000000000000007 /* CastMediaPreparerTests.swift */,
 				B1A700000000000000000013 /* PlaybackAwakeModuleTests.swift */,
 				D1A700000000000000000015 /* NativePlaybackControllerTests.swift */,
+				D1A700000000000000000017 /* NowPlayingInfoTests.swift */,
 				E1A700000000000000000015 /* MovixGlassEffectViewTests.swift */,
 			);
 			path = MovixTests;
@@ -244,6 +249,7 @@
 				D1A700000000000000000012 /* NativePlaybackController.swift */,
 				D1A700000000000000000013 /* PictureInPictureModule.swift */,
 				D1A700000000000000000014 /* PictureInPictureModule.m */,
+				D1A700000000000000000016 /* NowPlayingInfo.swift */,
 			);
 			path = Movix/Playback;
 			sourceTree = "<group>";
@@ -559,6 +565,7 @@
 				C10000000000000000000007 /* CastMediaPreparerTests.swift in Sources */,
 				B1A700000000000000000003 /* PlaybackAwakeModuleTests.swift in Sources */,
 				D1A700000000000000000005 /* NativePlaybackControllerTests.swift in Sources */,
+				D1A700000000000000000007 /* NowPlayingInfoTests.swift in Sources */,
 				E1A700000000000000000005 /* MovixGlassEffectViewTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -578,6 +585,7 @@
 				D1A700000000000000000002 /* NativePlaybackController.swift in Sources */,
 				D1A700000000000000000003 /* PictureInPictureModule.swift in Sources */,
 				D1A700000000000000000004 /* PictureInPictureModule.m in Sources */,
+				D1A700000000000000000006 /* NowPlayingInfo.swift in Sources */,
 				E1A700000000000000000001 /* MovixGlassEffectView.swift in Sources */,
 				E1A700000000000000000002 /* MovixGlassEffectViewManager.m in Sources */,
 				E1A700000000000000000003 /* MovixBrowserChromeView.swift in Sources */,
