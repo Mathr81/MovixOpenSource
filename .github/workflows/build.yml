@@ -1,14 +1,19 @@
-name: iOS unsigned IPA
+name: Build Applications
+
+# Copie a usage unique du workflow `ios-unsigned.yml`, portant le seul nom de
+# fichier que ce fork ait enregistre aupres de GitHub Actions : un dispatch
+# vise un workflow par son chemin sur la branche par defaut, et
+# `ios-unsigned.yml` n'y figure pas. Cette copie ne sert qu'a declencher le
+# build IPA sur le code d'une branche de travail ; elle n'a pas vocation a
+# etre fusionnee, et `ios-unsigned.yml` reste la version de reference.
+#
+# Deux differences volontaires avec l'original :
+#   - seul `workflow_dispatch` declenche (ni `pull_request`, ni tag) ;
+#   - le job `release` est absent, pour qu'aucune execution depuis cette
+#     branche ne puisse commiter une IPA ni creer une release.
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'app/**'
-      - '.github/workflows/ios-unsigned.yml'
-  push:
-    tags:
-      - 'ios-v*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -213,101 +218,3 @@ jobs:
             app/build/unsigned-ipa/Movix-unsigned.ipa.sha256
           if-no-files-found: error
 
-  # Seul ce job ecrit dans le depot, et il ne consomme que l'artefact produit
-  # au-dessus : rien de ce qui est compile ne tourne avec un jeton en ecriture.
-  release:
-    name: Publish the tagged unsigned IPA
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/ios-v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
-      # Checkout avant le téléchargement : actions/checkout nettoie le workspace
-      # et effacerait dist/. La branche par défaut, pas le tag, parce que ce job
-      # y ajoute un commit.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: Movix-unsigned-${{ needs.build.outputs.version }}-${{ github.run_number }}
-          path: dist
-
-      - name: Verify the checksum before publishing
-        working-directory: dist
-        run: shasum -a 256 -c Movix-unsigned.ipa.sha256
-
-      # Les sources des stores sont régénérées à chaque publication : une pour
-      # AltStore et SideStore (même format JSON pour les deux), une pour
-      # Scarlet, qui a le sien. L'URL de téléchargement pointe sur l'IPA
-      # commitée dans le dépôt : IPA et sources partent dans le même commit,
-      # donc tous les fichiers servis par raw.githubusercontent restent
-      # toujours cohérents entre eux, taille comprise.
-      - name: Generate the AltStore, SideStore and Scarlet sources
-        env:
-          IOS_SOURCE_VERSION: ${{ needs.build.outputs.version }}
-          IOS_SOURCE_BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
-          IOS_SOURCE_MIN_OS: ${{ needs.build.outputs.min_os }}
-          IOS_SOURCE_IPA_PATH: dist/Movix-unsigned.ipa
-          IOS_SOURCE_DATE: ${{ github.event.head_commit.timestamp }}
-          IOS_SOURCE_DOWNLOAD_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-unsigner.ipa
-          IOS_SOURCE_ICON_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/ios/Movix/Images.xcassets/AppIcon.appiconset/icon-1024.png
-          IOS_SOURCE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
-          IOS_SOURCE_OUTPUT: app/movix-ios-source.json
-          IOS_SCARLET_OUTPUT: app/movix-scarlet-source.json
-        run: node app/scripts/generate-ios-source.mjs
-
-      # L'IPA vit dans le dépôt à côté de movix-android.apk, pour être
-      # téléchargeable en direct depuis raw.githubusercontent comme l'APK.
-      # Seuls ces chemins sont indexés : dist/ reste non suivi.
-      - name: Commit the IPA next to the Android build
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          install -m 644 dist/Movix-unsigned.ipa app/movix-ios-unsigner.ipa
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- app/movix-ios-unsigner.ipa app/movix-ios-source.json app/movix-scarlet-source.json
-          if git diff --cached --quiet; then
-            echo "IPA et sources identiques à celles déjà publiées, rien à committer."
-            exit 0
-          fi
-          git commit -F - <<EOF
-          build(ios): publier l'IPA non signée ${{ needs.build.outputs.version }}
-
-          Générée par le workflow ios-unsigned depuis le tag ${GITHUB_REF_NAME}.
-          L'archive est identique à celle attachée à la release et a été
-          vérifiée par son empreinte SHA-256 avant d'être indexée.
-
-          Les sources des stores (app/movix-ios-source.json pour AltStore et
-          SideStore, app/movix-scarlet-source.json pour Scarlet) sont
-          régénérées dans le même commit : version, taille et URL restent
-          cohérentes avec l'IPA servie par raw.githubusercontent.
-
-          Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
-          EOF
-          # Une autre exécution peut avoir avancé la branche entre le checkout
-          # et le push : on rejoue le commit sur la nouvelle tête.
-          for attempt in 1 2 3; do
-            if git push origin "HEAD:${DEFAULT_BRANCH}"; then
-              exit 0
-            fi
-            git pull --rebase origin "${DEFAULT_BRANCH}"
-          done
-          echo "Impossible de pousser l'IPA sur ${DEFAULT_BRANCH}" >&2
-          exit 1
-
-      - name: Create the release
-        working-directory: dist
-        run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            Movix-unsigned.ipa \
-            Movix-unsigned.ipa.sha256 \
-            --title "Movix ${{ needs.build.outputs.version }} (iOS, non signee)" \
-            --notes "IPA non signee. Son installation est impossible tant qu'un utilisateur ne l'a pas signee par ses propres moyens. Verifiez l'archive avec: shasum -a 256 -c Movix-unsigned.ipa.sha256 — Source AltStore/SideStore : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-ios-source.json — Source Scarlet : https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/app/movix-scarlet-source.json"
